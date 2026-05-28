@@ -411,8 +411,10 @@ def main() -> None:
     port_entry.insert(0, PORT_DEFAULT)
     port_entry.grid(row=0, column=1, padx=4, pady=6, sticky="w")
 
-    for i in range(4):
-        tk.Label(root, text=f"CH{i + 1}").grid(row=1, column=i + 1, padx=4)
+    tk.Label(root, text=f"Roll").grid(row=1, column=0 + 1, padx=4)
+    tk.Label(root, text=f"Pitch").grid(row=1, column=1 + 1, padx=4)
+    tk.Label(root, text=f"Throttle").grid(row=1, column=2 + 1, padx=4)
+    tk.Label(root, text=f"Yaw").grid(row=1, column=3 + 1, padx=4)
 
     ch_entries = make_row(root, 2, "Channels", CHANNEL_DEFAULTS)
     off_entries = make_row(root, 3, "Offsets", OFFSET_DEFAULTS)
