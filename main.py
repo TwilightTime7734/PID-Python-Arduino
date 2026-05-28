@@ -408,6 +408,9 @@ class MainUi:
     off_entries: list[tk.Entry]
     target_entries: list[tk.Entry]
     dur_entries: list[tk.Entry]
+    angle_entries: list[tk.Entry]
+    channel_output_canvases: list[tk.Canvas]
+    channel_output_fill_ids: list[int]
     hold_send_buttons: list[tk.Button]
     hold_end_buttons: list[tk.Button]
     start_button: tk.Button
@@ -441,34 +444,54 @@ def build_main_gui(root: tk.Tk) -> MainUi:
     target_entries = make_row(root, 4, "Targets", PULSE_TARGET_DEFAULTS)
     dur_entries = make_row(root, 5, "Duration", PULSE_DURATION_DEFAULTS)
 
-    tk.Label(root, text="Hold").grid(row=6, column=0, padx=6, pady=2, sticky="e")
+    tk.Label(root, text="Angle").grid(row=6, column=0, padx=6, pady=(0, 4), sticky="e")
+    angle_entries: list[tk.Entry] = []
+    for i in range(1, 5):
+        entry = tk.Entry(root, width=8)
+        entry.insert(0, "0")
+        entry.grid(row=6, column=i, padx=4, pady=(0, 4))
+        angle_entries.append(entry)
+
+    tk.Label(root, text="Output").grid(row=7, column=0, padx=6, pady=(0, 4), sticky="e")
+    channel_output_canvases: list[tk.Canvas] = []
+    channel_output_fill_ids: list[int] = []
+    for i in range(1, 5):
+        canvas = tk.Canvas(root, width=96, height=16, bg="#F0F0F0", highlightthickness=0)
+        canvas.create_rectangle(1, 2, 95, 14, fill="#E6EBF0", outline="#B4BEC8")
+        canvas.create_line(48, 2, 48, 14, fill="#8F98A3")
+        fill_id = canvas.create_rectangle(48, 3, 48, 13, fill="#94D98F", outline="")
+        canvas.grid(row=7, column=i, padx=4, pady=(0, 4))
+        channel_output_canvases.append(canvas)
+        channel_output_fill_ids.append(fill_id)
+
+    tk.Label(root, text="Hold").grid(row=8, column=0, padx=6, pady=2, sticky="e")
     hold_send_buttons: list[tk.Button] = []
     for i in range(4):
         button = tk.Button(root, text="Send", width=8)
-        button.grid(row=6, column=i + 1, pady=2)
+        button.grid(row=8, column=i + 1, pady=2)
         hold_send_buttons.append(button)
 
-    tk.Label(root, text="End").grid(row=7, column=0, padx=6, pady=2, sticky="e")
+    tk.Label(root, text="End").grid(row=9, column=0, padx=6, pady=2, sticky="e")
     hold_end_buttons: list[tk.Button] = []
     for i in range(4):
         button = tk.Button(root, text="End", width=8)
-        button.grid(row=7, column=i + 1, pady=2)
+        button.grid(row=9, column=i + 1, pady=2)
         hold_end_buttons.append(button)
 
     start_button = tk.Button(root, text="Start", width=12)
-    start_button.grid(row=8, column=1, columnspan=2, pady=4)
+    start_button.grid(row=10, column=1, columnspan=2, pady=4)
     stop_button = tk.Button(root, text="Stop", width=12)
-    stop_button.grid(row=8, column=3, columnspan=2, pady=4)
+    stop_button.grid(row=10, column=3, columnspan=2, pady=4)
 
     status = tk.StringVar(value="Idle")
-    tk.Label(root, textvariable=status, anchor="w").grid(row=9, column=0, columnspan=5, sticky="we", padx=6, pady=(0, 6))
+    tk.Label(root, textvariable=status, anchor="w").grid(row=11, column=0, columnspan=5, sticky="we", padx=6, pady=(0, 6))
 
-    tk.Label(root, text="Links").grid(row=10, column=0, padx=6, pady=(0, 6), sticky="e")
+    tk.Label(root, text="Links").grid(row=12, column=0, padx=6, pady=(0, 6), sticky="e")
     pc_link_box = tk.Label(root, width=18, relief="groove", bd=2)
-    pc_link_box.grid(row=10, column=1, columnspan=4, padx=4, pady=(0, 6), sticky="we")
+    pc_link_box.grid(row=12, column=1, columnspan=4, padx=4, pady=(0, 6), sticky="we")
 
     fc_frame = tk.LabelFrame(root, text="FC / INAV", padx=8, pady=8)
-    fc_frame.grid(row=0, column=5, rowspan=11, padx=(12, 6), pady=6, sticky="ns")
+    fc_frame.grid(row=0, column=5, rowspan=13, padx=(12, 6), pady=6, sticky="ns")
     horizon = ArtificialHorizon(fc_frame, size=180)
     horizon.grid(row=0, column=0, columnspan=3, pady=(0, 8))
     attitude_text = tk.StringVar(value="Roll: 0.0 deg  Pitch: 0.0 deg  Yaw: 0")
@@ -502,6 +525,9 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         off_entries=off_entries,
         target_entries=target_entries,
         dur_entries=dur_entries,
+        angle_entries=angle_entries,
+        channel_output_canvases=channel_output_canvases,
+        channel_output_fill_ids=channel_output_fill_ids,
         hold_send_buttons=hold_send_buttons,
         hold_end_buttons=hold_end_buttons,
         start_button=start_button,
@@ -527,6 +553,9 @@ def main() -> None:
     off_entries = ui.off_entries
     target_entries = ui.target_entries
     dur_entries = ui.dur_entries
+    angle_entries = ui.angle_entries
+    channel_output_canvases = ui.channel_output_canvases
+    channel_output_fill_ids = ui.channel_output_fill_ids
     hold_send_buttons = ui.hold_send_buttons
     hold_end_buttons = ui.hold_end_buttons
     start_button = ui.start_button
@@ -550,6 +579,8 @@ def main() -> None:
     run_quant: int | None = None
     run_max_count: int | None = None
     hold_timeout_after_id: str | None = None
+    base_channel_outputs = CHANNEL_DEFAULTS.copy()
+    live_channel_outputs = CHANNEL_DEFAULTS.copy()
     worker = SerialWorker()
     fc_service = InavSerialService()
     fc_poll_after_id: str | None = None
@@ -568,6 +599,57 @@ def main() -> None:
         if value <= 0:
             raise RuntimeError("FC baud must be > 0.")
         return value
+
+    def draw_channel_output(index: int, value: int) -> None:
+        clamped = max(1000, min(2000, value))
+        canvas = channel_output_canvases[index]
+        fill_id = channel_output_fill_ids[index]
+
+        left = 2.0
+        right = 94.0
+        center = (left + right) / 2.0
+        y1 = 3.0
+        y2 = 13.0
+
+        if clamped < 1500:
+            ratio = (1500 - clamped) / 500.0
+            x = center - (center - left) * ratio
+            canvas.coords(fill_id, x, y1, center, y2)
+            canvas.itemconfig(fill_id, fill="#E38C8C")
+        elif clamped > 1500:
+            ratio = (clamped - 1500) / 500.0
+            x = center + (right - center) * ratio
+            canvas.coords(fill_id, center, y1, x, y2)
+            canvas.itemconfig(fill_id, fill="#94D98F")
+        else:
+            canvas.coords(fill_id, center, y1, center, y2)
+            canvas.itemconfig(fill_id, fill="#94D98F")
+
+    def parse_channel_values_with_defaults() -> list[int]:
+        values: list[int] = []
+        for i, entry in enumerate(ch_entries):
+            try:
+                values.append(int(entry.get().strip()))
+            except ValueError:
+                values.append(CHANNEL_DEFAULTS[i])
+        return values
+
+    def compute_base_outputs(channels: list[int], offsets: list[int]) -> list[int]:
+        return [channel - offset for channel, offset in zip(channels, offsets)]
+
+    def set_live_channel_outputs(values: list[int]) -> None:
+        nonlocal live_channel_outputs
+        live_channel_outputs = values.copy()
+        refresh_channel_outputs()
+
+    def refresh_channel_outputs() -> None:
+        for i, value in enumerate(live_channel_outputs):
+            draw_channel_output(i, value)
+
+    def on_output_inputs_changed() -> None:
+        if run_active:
+            return
+        set_live_channel_outputs(parse_channel_values_with_defaults())
 
     def select_fc_port(port_infos: Sequence[object]) -> str:
         target_id = FC_DEVICE_ID.upper()
@@ -618,6 +700,9 @@ def main() -> None:
             fc_link_box.config(text="FC-INAV CLOSED", bg="#8B1E1E", fg="white")
         connect_fc_button.config(state="disabled" if fc_connected else "normal")
         disconnect_fc_button.config(state="normal" if fc_connected else "disabled")
+        angle_state = "normal" if fc_connected else "disabled"
+        for entry in angle_entries:
+            entry.config(state=angle_state)
 
     def cancel_hold_timeout() -> None:
         nonlocal hold_timeout_after_id
@@ -759,7 +844,7 @@ def main() -> None:
         root.after(50, poll_results)
 
     def do_start() -> None:
-        nonlocal run_active, run_port, run_ser, run_quant, run_max_count, start_pending
+        nonlocal run_active, run_port, run_ser, run_quant, run_max_count, start_pending, base_channel_outputs
         try:
             if start_pending:
                 raise RuntimeError("Start is already in progress.")
@@ -771,7 +856,7 @@ def main() -> None:
             selected_port = port()
 
             def on_start_done(ok: bool, res: object) -> None:
-                nonlocal run_active, run_port, run_ser, run_quant, run_max_count, start_pending
+                nonlocal run_active, run_port, run_ser, run_quant, run_max_count, start_pending, base_channel_outputs
                 start_pending = False
                 if not ok:
                     set_error("Start error", res if isinstance(res, Exception) else RuntimeError(res))
@@ -791,6 +876,8 @@ def main() -> None:
                 run_max_count = res[1]
                 run_ser = worker.ser
                 run_active = True
+                base_channel_outputs = compute_base_outputs(channels, offsets)
+                set_live_channel_outputs(base_channel_outputs)
                 update_link_indicators()
                 version_warning = res[2]
                 if version_warning:
@@ -827,6 +914,7 @@ def main() -> None:
                 run_quant = None
                 run_max_count = None
                 run_active = False
+                set_live_channel_outputs(parse_channel_values_with_defaults())
                 update_link_indicators()
                 status.set("PPM output stopped.")
 
@@ -861,6 +949,9 @@ def main() -> None:
                 if pulse_status == PULSE_STATUS_REJECTED:
                     set_error("Hold error", RuntimeError("Firmware rejected hold command"))
                     return
+                active_outputs = base_channel_outputs.copy()
+                active_outputs[i] = targets[i] - offsets[i]
+                set_live_channel_outputs(active_outputs)
 
                 timeout_ms = max(1, round(timeout_s * 1000))
                 chan_label = i + 1
@@ -881,6 +972,7 @@ def main() -> None:
                             hold_timeout_after_id = root.after(20, schedule_check)
                             return
                         hold_timeout_after_id = None
+                        set_live_channel_outputs(base_channel_outputs)
                         if pulse_status_now == PULSE_STATUS_TIMEOUT_RESTORED:
                             status.set(f"CH{chan_label} hold timed out; channel restored.")
                         else:
@@ -913,6 +1005,7 @@ def main() -> None:
                     set_error("Hold end error", RuntimeError("Firmware rejected hold-end command"))
                     return
                 cancel_hold_timeout()
+                set_live_channel_outputs(base_channel_outputs)
                 status.set(f"CH{i + 1} hold ended; channel restored.")
 
             worker.submit(_task_hold_end, i, callback=on_hold_end_done)
@@ -961,6 +1054,10 @@ def main() -> None:
         button.config(command=lambda i=i: do_hold_end(i))
     start_button.config(command=do_start)
     stop_button.config(command=do_stop)
+    for entry in ch_entries:
+        entry.bind("<KeyRelease>", lambda _event: on_output_inputs_changed())
+        entry.bind("<FocusOut>", lambda _event: on_output_inputs_changed())
+    set_live_channel_outputs(parse_channel_values_with_defaults())
     update_link_indicators()
     root.after(50, poll_results)
     fc_poll_after_id = root.after(60, poll_fc_attitude)
