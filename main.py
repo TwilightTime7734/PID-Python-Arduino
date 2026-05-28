@@ -404,6 +404,7 @@ class ArtificialHorizon(tk.Canvas):
 @dataclass
 class MainUi:
     port_entry: tk.Entry
+    channel_adjust_canvases: list[tk.Canvas]
     ch_entries: list[tk.Entry]
     off_entries: list[tk.Entry]
     target_entries: list[tk.Entry]
@@ -439,20 +440,34 @@ def build_main_gui(root: tk.Tk) -> MainUi:
     for i, channel_name in enumerate(("Roll", "Pitch", "Throttle", "Yaw"), start=1):
         tk.Label(root, text=channel_name).grid(row=1, column=i, padx=4)
 
-    ch_entries = make_row(root, 2, "Channels", CHANNEL_DEFAULTS)
-    off_entries = make_row(root, 3, "Offsets", OFFSET_DEFAULTS)
-    target_entries = make_row(root, 4, "Targets", PULSE_TARGET_DEFAULTS)
-    dur_entries = make_row(root, 5, "Duration", PULSE_DURATION_DEFAULTS)
+    tk.Label(root, text="Adjust").grid(row=2, column=0, padx=6, pady=(0, 4), sticky="e")
+    channel_adjust_canvases: list[tk.Canvas] = []
+    for i in range(1, 5):
+        width = 44
+        height = 20
+        canvas = tk.Canvas(root, width=width, height=height, bg="#F0F0F0", highlightthickness=0)
+        canvas.create_polygon(1, 1, 1, height - 1, width - 1, 1, fill="#C94B4B", outline="")
+        canvas.create_polygon(1, height - 1, width - 1, height - 1, width - 1, 1, fill="#4CAF50", outline="")
+        canvas.create_line(1, height - 1, width - 1, 1, fill="white", width=2)
+        canvas.create_text(12, 7, text="-", fill="white", font=("Segoe UI", 11, "bold"))
+        canvas.create_text(width - 12, height - 7, text="+", fill="white", font=("Segoe UI", 11, "bold"))
+        canvas.grid(row=2, column=i, padx=4, pady=(0, 4))
+        channel_adjust_canvases.append(canvas)
 
-    tk.Label(root, text="Angle").grid(row=6, column=0, padx=6, pady=(0, 4), sticky="e")
+    ch_entries = make_row(root, 3, "Channels", CHANNEL_DEFAULTS)
+    off_entries = make_row(root, 4, "Offsets", OFFSET_DEFAULTS)
+    target_entries = make_row(root, 5, "Targets", PULSE_TARGET_DEFAULTS)
+    dur_entries = make_row(root, 6, "Duration", PULSE_DURATION_DEFAULTS)
+
+    tk.Label(root, text="Angle").grid(row=7, column=0, padx=6, pady=(0, 4), sticky="e")
     angle_entries: list[tk.Entry] = []
     for i in range(1, 5):
         entry = tk.Entry(root, width=8)
         entry.insert(0, "0")
-        entry.grid(row=6, column=i, padx=4, pady=(0, 4))
+        entry.grid(row=7, column=i, padx=4, pady=(0, 4))
         angle_entries.append(entry)
 
-    tk.Label(root, text="Output").grid(row=7, column=0, padx=6, pady=(0, 4), sticky="e")
+    tk.Label(root, text="Idle").grid(row=8, column=0, padx=6, pady=(0, 4), sticky="e")
     channel_output_canvases: list[tk.Canvas] = []
     channel_output_fill_ids: list[int] = []
     for i in range(1, 5):
@@ -460,38 +475,38 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         canvas.create_rectangle(1, 2, 95, 14, fill="#E6EBF0", outline="#B4BEC8")
         canvas.create_line(48, 2, 48, 14, fill="#8F98A3")
         fill_id = canvas.create_rectangle(48, 3, 48, 13, fill="#94D98F", outline="")
-        canvas.grid(row=7, column=i, padx=4, pady=(0, 4))
+        canvas.grid(row=8, column=i, padx=4, pady=(0, 4))
         channel_output_canvases.append(canvas)
         channel_output_fill_ids.append(fill_id)
 
-    tk.Label(root, text="Hold").grid(row=8, column=0, padx=6, pady=2, sticky="e")
+    tk.Label(root, text="Hold").grid(row=9, column=0, padx=6, pady=2, sticky="e")
     hold_send_buttons: list[tk.Button] = []
     for i in range(4):
         button = tk.Button(root, text="Send", width=8)
-        button.grid(row=8, column=i + 1, pady=2)
+        button.grid(row=9, column=i + 1, pady=2)
         hold_send_buttons.append(button)
 
-    tk.Label(root, text="End").grid(row=9, column=0, padx=6, pady=2, sticky="e")
+    tk.Label(root, text="End").grid(row=10, column=0, padx=6, pady=2, sticky="e")
     hold_end_buttons: list[tk.Button] = []
     for i in range(4):
         button = tk.Button(root, text="End", width=8)
-        button.grid(row=9, column=i + 1, pady=2)
+        button.grid(row=10, column=i + 1, pady=2)
         hold_end_buttons.append(button)
 
     start_button = tk.Button(root, text="Start", width=12)
-    start_button.grid(row=10, column=1, columnspan=2, pady=4)
+    start_button.grid(row=11, column=1, columnspan=2, pady=4)
     stop_button = tk.Button(root, text="Stop", width=12)
-    stop_button.grid(row=10, column=3, columnspan=2, pady=4)
+    stop_button.grid(row=11, column=3, columnspan=2, pady=4)
 
     status = tk.StringVar(value="Idle")
-    tk.Label(root, textvariable=status, anchor="w").grid(row=11, column=0, columnspan=5, sticky="we", padx=6, pady=(0, 6))
+    tk.Label(root, textvariable=status, anchor="w").grid(row=12, column=0, columnspan=5, sticky="we", padx=6, pady=(0, 6))
 
-    tk.Label(root, text="Links").grid(row=12, column=0, padx=6, pady=(0, 6), sticky="e")
+    tk.Label(root, text="Links").grid(row=13, column=0, padx=6, pady=(0, 6), sticky="e")
     pc_link_box = tk.Label(root, width=18, relief="groove", bd=2)
-    pc_link_box.grid(row=12, column=1, columnspan=4, padx=4, pady=(0, 6), sticky="we")
+    pc_link_box.grid(row=13, column=1, columnspan=4, padx=4, pady=(0, 6), sticky="we")
 
     fc_frame = tk.LabelFrame(root, text="FC / INAV", padx=8, pady=8)
-    fc_frame.grid(row=0, column=5, rowspan=13, padx=(12, 6), pady=6, sticky="ns")
+    fc_frame.grid(row=0, column=5, rowspan=14, padx=(12, 6), pady=6, sticky="ns")
     horizon = ArtificialHorizon(fc_frame, size=180)
     horizon.grid(row=0, column=0, columnspan=3, pady=(0, 8))
     attitude_text = tk.StringVar(value="Roll: 0.0 deg  Pitch: 0.0 deg  Yaw: 0")
@@ -521,6 +536,7 @@ def build_main_gui(root: tk.Tk) -> MainUi:
 
     return MainUi(
         port_entry=port_entry,
+        channel_adjust_canvases=channel_adjust_canvases,
         ch_entries=ch_entries,
         off_entries=off_entries,
         target_entries=target_entries,
@@ -549,6 +565,7 @@ def main() -> None:
     root = tk.Tk()
     ui = build_main_gui(root)
     port_entry = ui.port_entry
+    channel_adjust_canvases = ui.channel_adjust_canvases
     ch_entries = ui.ch_entries
     off_entries = ui.off_entries
     target_entries = ui.target_entries
@@ -580,7 +597,7 @@ def main() -> None:
     run_max_count: int | None = None
     hold_timeout_after_id: str | None = None
     base_channel_outputs = CHANNEL_DEFAULTS.copy()
-    live_channel_outputs = CHANNEL_DEFAULTS.copy()
+    live_channel_outputs = base_channel_outputs.copy()
     worker = SerialWorker()
     fc_service = InavSerialService()
     fc_poll_after_id: str | None = None
@@ -634,8 +651,30 @@ def main() -> None:
                 values.append(CHANNEL_DEFAULTS[i])
         return values
 
-    def compute_base_outputs(channels: list[int], offsets: list[int]) -> list[int]:
-        return [channel - offset for channel, offset in zip(channels, offsets)]
+    def adjust_channel_value(index: int, delta: int) -> None:
+        try:
+            current = int(ch_entries[index].get().strip())
+        except ValueError:
+            current = CHANNEL_DEFAULTS[index]
+        updated = max(1000, min(2000, current + delta))
+        ch_entries[index].delete(0, tk.END)
+        ch_entries[index].insert(0, str(updated))
+        on_output_inputs_changed()
+
+    def on_channel_adjust_click(index: int, event: tk.Event) -> None:
+        width = int(event.widget.cget("width"))
+        height = int(event.widget.cget("height"))
+        x1 = 1.0
+        y1 = float(height - 1)
+        x2 = float(width - 1)
+        y2 = 1.0
+        if x2 == x1:
+            return
+        y_on_diag = y1 + (y2 - y1) * ((event.x - x1) / (x2 - x1))
+        if event.y <= y_on_diag:
+            adjust_channel_value(index, -5)
+        else:
+            adjust_channel_value(index, 5)
 
     def set_live_channel_outputs(values: list[int]) -> None:
         nonlocal live_channel_outputs
@@ -876,7 +915,7 @@ def main() -> None:
                 run_max_count = res[1]
                 run_ser = worker.ser
                 run_active = True
-                base_channel_outputs = compute_base_outputs(channels, offsets)
+                base_channel_outputs = channels.copy()
                 set_live_channel_outputs(base_channel_outputs)
                 update_link_indicators()
                 version_warning = res[2]
@@ -950,7 +989,7 @@ def main() -> None:
                     set_error("Hold error", RuntimeError("Firmware rejected hold command"))
                     return
                 active_outputs = base_channel_outputs.copy()
-                active_outputs[i] = targets[i] - offsets[i]
+                active_outputs[i] = targets[i]
                 set_live_channel_outputs(active_outputs)
 
                 timeout_ms = max(1, round(timeout_s * 1000))
@@ -1054,6 +1093,8 @@ def main() -> None:
         button.config(command=lambda i=i: do_hold_end(i))
     start_button.config(command=do_start)
     stop_button.config(command=do_stop)
+    for i, canvas in enumerate(channel_adjust_canvases):
+        canvas.bind("<Button-1>", lambda event, i=i: on_channel_adjust_click(i, event))
     for entry in ch_entries:
         entry.bind("<KeyRelease>", lambda _event: on_output_inputs_changed())
         entry.bind("<FocusOut>", lambda _event: on_output_inputs_changed())
