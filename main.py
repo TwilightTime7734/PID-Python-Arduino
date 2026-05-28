@@ -10,6 +10,7 @@ import math
 import struct
 import time
 import tkinter as tk
+from dataclasses import dataclass
 from collections.abc import Sequence
 from tkinter import messagebox
 
@@ -400,9 +401,30 @@ class ArtificialHorizon(tk.Canvas):
         self.coords(self._ground, x1, y1, x2, y2, gx2, gy2, gx1, gy1)
         self.coords(self._horizon_line, x1, y1, x2, y2)
 
+@dataclass
+class MainUi:
+    port_entry: tk.Entry
+    ch_entries: list[tk.Entry]
+    off_entries: list[tk.Entry]
+    target_entries: list[tk.Entry]
+    dur_entries: list[tk.Entry]
+    hold_send_buttons: list[tk.Button]
+    hold_end_buttons: list[tk.Button]
+    start_button: tk.Button
+    stop_button: tk.Button
+    status: tk.StringVar
+    pc_link_box: tk.Label
+    horizon: ArtificialHorizon
+    attitude_text: tk.StringVar
+    fc_port_entry: tk.Entry
+    fc_baud_entry: tk.Entry
+    fc_link_box: tk.Label
+    scan_fc_button: tk.Button
+    connect_fc_button: tk.Button
+    disconnect_fc_button: tk.Button
 
-def main() -> None:
-    root = tk.Tk()
+
+def build_main_gui(root: tk.Tk) -> MainUi:
     root.title("PPM Modbus")
     root.resizable(False, False)
 
@@ -411,29 +433,35 @@ def main() -> None:
     port_entry.insert(0, PORT_DEFAULT)
     port_entry.grid(row=0, column=1, padx=4, pady=6, sticky="w")
 
-    tk.Label(root, text=f"Roll").grid(row=1, column=0 + 1, padx=4)
-    tk.Label(root, text=f"Pitch").grid(row=1, column=1 + 1, padx=4)
-    tk.Label(root, text=f"Throttle").grid(row=1, column=2 + 1, padx=4)
-    tk.Label(root, text=f"Yaw").grid(row=1, column=3 + 1, padx=4)
+    for i, channel_name in enumerate(("Roll", "Pitch", "Throttle", "Yaw"), start=1):
+        tk.Label(root, text=channel_name).grid(row=1, column=i, padx=4)
 
     ch_entries = make_row(root, 2, "Channels", CHANNEL_DEFAULTS)
     off_entries = make_row(root, 3, "Offsets", OFFSET_DEFAULTS)
     target_entries = make_row(root, 4, "Targets", PULSE_TARGET_DEFAULTS)
     dur_entries = make_row(root, 5, "Duration", PULSE_DURATION_DEFAULTS)
 
+    tk.Label(root, text="Hold").grid(row=6, column=0, padx=6, pady=2, sticky="e")
+    hold_send_buttons: list[tk.Button] = []
+    for i in range(4):
+        button = tk.Button(root, text="Send", width=8)
+        button.grid(row=6, column=i + 1, pady=2)
+        hold_send_buttons.append(button)
+
+    tk.Label(root, text="End").grid(row=7, column=0, padx=6, pady=2, sticky="e")
+    hold_end_buttons: list[tk.Button] = []
+    for i in range(4):
+        button = tk.Button(root, text="End", width=8)
+        button.grid(row=7, column=i + 1, pady=2)
+        hold_end_buttons.append(button)
+
+    start_button = tk.Button(root, text="Start", width=12)
+    start_button.grid(row=8, column=1, columnspan=2, pady=4)
+    stop_button = tk.Button(root, text="Stop", width=12)
+    stop_button.grid(row=8, column=3, columnspan=2, pady=4)
+
     status = tk.StringVar(value="Idle")
     tk.Label(root, textvariable=status, anchor="w").grid(row=9, column=0, columnspan=5, sticky="we", padx=6, pady=(0, 6))
-    run_active = False
-    start_pending = False
-    is_closing = False
-    run_port = PORT_DEFAULT
-    run_ser: serial.Serial | None = None
-    run_quant: int | None = None
-    run_max_count: int | None = None
-    hold_timeout_after_id: str | None = None
-    worker = SerialWorker()
-    fc_service = InavSerialService()
-    fc_poll_after_id: str | None = None
 
     tk.Label(root, text="Links").grid(row=10, column=0, padx=6, pady=(0, 6), sticky="e")
     pc_link_box = tk.Label(root, width=18, relief="groove", bd=2)
@@ -467,6 +495,64 @@ def main() -> None:
     connect_fc_button.grid(row=5, column=0, pady=(2, 0))
     disconnect_fc_button = tk.Button(fc_frame, text="Disconnect FC", width=12)
     disconnect_fc_button.grid(row=5, column=1, columnspan=2, pady=(2, 0))
+
+    return MainUi(
+        port_entry=port_entry,
+        ch_entries=ch_entries,
+        off_entries=off_entries,
+        target_entries=target_entries,
+        dur_entries=dur_entries,
+        hold_send_buttons=hold_send_buttons,
+        hold_end_buttons=hold_end_buttons,
+        start_button=start_button,
+        stop_button=stop_button,
+        status=status,
+        pc_link_box=pc_link_box,
+        horizon=horizon,
+        attitude_text=attitude_text,
+        fc_port_entry=fc_port_entry,
+        fc_baud_entry=fc_baud_entry,
+        fc_link_box=fc_link_box,
+        scan_fc_button=scan_fc_button,
+        connect_fc_button=connect_fc_button,
+        disconnect_fc_button=disconnect_fc_button,
+    )
+
+
+def main() -> None:
+    root = tk.Tk()
+    ui = build_main_gui(root)
+    port_entry = ui.port_entry
+    ch_entries = ui.ch_entries
+    off_entries = ui.off_entries
+    target_entries = ui.target_entries
+    dur_entries = ui.dur_entries
+    hold_send_buttons = ui.hold_send_buttons
+    hold_end_buttons = ui.hold_end_buttons
+    start_button = ui.start_button
+    stop_button = ui.stop_button
+    status = ui.status
+    pc_link_box = ui.pc_link_box
+    horizon = ui.horizon
+    attitude_text = ui.attitude_text
+    fc_port_entry = ui.fc_port_entry
+    fc_baud_entry = ui.fc_baud_entry
+    fc_link_box = ui.fc_link_box
+    scan_fc_button = ui.scan_fc_button
+    connect_fc_button = ui.connect_fc_button
+    disconnect_fc_button = ui.disconnect_fc_button
+
+    run_active = False
+    start_pending = False
+    is_closing = False
+    run_port = PORT_DEFAULT
+    run_ser: serial.Serial | None = None
+    run_quant: int | None = None
+    run_max_count: int | None = None
+    hold_timeout_after_id: str | None = None
+    worker = SerialWorker()
+    fc_service = InavSerialService()
+    fc_poll_after_id: str | None = None
 
     def port() -> str:
         return port_entry.get().strip() or PORT_DEFAULT
@@ -869,20 +955,15 @@ def main() -> None:
     scan_fc_button.config(command=scan_fc_ports)
     connect_fc_button.config(command=do_fc_connect)
     disconnect_fc_button.config(command=do_fc_disconnect)
+    for i, button in enumerate(hold_send_buttons):
+        button.config(command=lambda i=i: do_hold_send(i))
+    for i, button in enumerate(hold_end_buttons):
+        button.config(command=lambda i=i: do_hold_end(i))
+    start_button.config(command=do_start)
+    stop_button.config(command=do_stop)
     update_link_indicators()
     root.after(50, poll_results)
     fc_poll_after_id = root.after(60, poll_fc_attitude)
-
-    tk.Label(root, text="Hold").grid(row=6, column=0, padx=6, pady=2, sticky="e")
-    for i in range(4):
-        tk.Button(root, text="Send", width=8, command=lambda i=i: do_hold_send(i)).grid(row=6, column=i + 1, pady=2)
-
-    tk.Label(root, text="End").grid(row=7, column=0, padx=6, pady=2, sticky="e")
-    for i in range(4):
-        tk.Button(root, text="End", width=8, command=lambda i=i: do_hold_end(i)).grid(row=7, column=i + 1, pady=2)
-
-    tk.Button(root, text="Start", width=12, command=do_start).grid(row=8, column=1, columnspan=2, pady=4)
-    tk.Button(root, text="Stop", width=12, command=do_stop).grid(row=8, column=3, columnspan=2, pady=4)
     root.protocol("WM_DELETE_WINDOW", on_close)
 
     root.mainloop()
