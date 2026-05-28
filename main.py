@@ -11,7 +11,7 @@ import struct
 import time
 import tkinter as tk
 from dataclasses import dataclass
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from tkinter import messagebox
 
 import serial
@@ -55,6 +55,10 @@ PULSE_STATUS_ACTIVE = 1
 PULSE_STATUS_REJECTED = 2
 PULSE_STATUS_TIMEOUT_RESTORED = 3
 PULSE_STATUS_HOLD_ENDED = 4
+ADJUST_REPEAT_INITIAL_MS = 800
+ADJUST_REPEAT_INTERVAL_MS = 94
+HOLD_TIMEOUT_POLL_MS = 20
+HOLD_ANGLE_CHECK_MS = 60
 
 
 def crc16(data: bytes) -> int:
@@ -405,6 +409,7 @@ class ArtificialHorizon(tk.Canvas):
 class MainUi:
     port_entry: tk.Entry
     channel_adjust_canvases: list[tk.Canvas]
+    target_adjust_canvases: list[tk.Canvas]
     ch_entries: list[tk.Entry]
     off_entries: list[tk.Entry]
     target_entries: list[tk.Entry]
@@ -443,31 +448,47 @@ def build_main_gui(root: tk.Tk) -> MainUi:
     tk.Label(root, text="Adjust").grid(row=2, column=0, padx=6, pady=(0, 4), sticky="e")
     channel_adjust_canvases: list[tk.Canvas] = []
     for i in range(1, 5):
-        width = 44
+        width = 52
         height = 20
         canvas = tk.Canvas(root, width=width, height=height, bg="#F0F0F0", highlightthickness=0)
-        canvas.create_polygon(1, 1, 1, height - 1, width - 1, 1, fill="#C94B4B", outline="")
-        canvas.create_polygon(1, height - 1, width - 1, height - 1, width - 1, 1, fill="#4CAF50", outline="")
-        canvas.create_line(1, height - 1, width - 1, 1, fill="white", width=2)
-        canvas.create_text(12, 7, text="-", fill="white", font=("Segoe UI", 11, "bold"))
-        canvas.create_text(width - 12, height - 7, text="+", fill="white", font=("Segoe UI", 11, "bold"))
+        mid_x = width // 2
+        canvas.create_rectangle(1, 1, mid_x, height - 1, fill="#C94B4B", outline="")
+        canvas.create_rectangle(mid_x, 1, width - 1, height - 1, fill="#4CAF50", outline="")
+        canvas.create_line(mid_x, 1, mid_x, height - 1, fill="white", width=2)
+        canvas.create_text(13, height // 2, text="-", fill="white", font=("Segoe UI", 11, "bold"))
+        canvas.create_text(width - 13, height // 2, text="+", fill="white", font=("Segoe UI", 11, "bold"))
         canvas.grid(row=2, column=i, padx=4, pady=(0, 4))
         channel_adjust_canvases.append(canvas)
 
     ch_entries = make_row(root, 3, "Channels", CHANNEL_DEFAULTS)
     off_entries = make_row(root, 4, "Offsets", OFFSET_DEFAULTS)
-    target_entries = make_row(root, 5, "Targets", PULSE_TARGET_DEFAULTS)
-    dur_entries = make_row(root, 6, "Duration", PULSE_DURATION_DEFAULTS)
+    tk.Label(root, text="Adjust Tgt").grid(row=5, column=0, padx=6, pady=(0, 4), sticky="e")
+    target_adjust_canvases: list[tk.Canvas] = []
+    for i in range(1, 5):
+        width = 52
+        height = 20
+        canvas = tk.Canvas(root, width=width, height=height, bg="#F0F0F0", highlightthickness=0)
+        mid_x = width // 2
+        canvas.create_rectangle(1, 1, mid_x, height - 1, fill="#C94B4B", outline="")
+        canvas.create_rectangle(mid_x, 1, width - 1, height - 1, fill="#4CAF50", outline="")
+        canvas.create_line(mid_x, 1, mid_x, height - 1, fill="white", width=2)
+        canvas.create_text(13, height // 2, text="-", fill="white", font=("Segoe UI", 11, "bold"))
+        canvas.create_text(width - 13, height // 2, text="+", fill="white", font=("Segoe UI", 11, "bold"))
+        canvas.grid(row=5, column=i, padx=4, pady=(0, 4))
+        target_adjust_canvases.append(canvas)
 
-    tk.Label(root, text="Angle").grid(row=7, column=0, padx=6, pady=(0, 4), sticky="e")
+    target_entries = make_row(root, 6, "Targets", PULSE_TARGET_DEFAULTS)
+    dur_entries = make_row(root, 7, "Duration", PULSE_DURATION_DEFAULTS)
+
+    tk.Label(root, text="Angle").grid(row=8, column=0, padx=6, pady=(0, 4), sticky="e")
     angle_entries: list[tk.Entry] = []
     for i in range(1, 5):
         entry = tk.Entry(root, width=8)
         entry.insert(0, "0")
-        entry.grid(row=7, column=i, padx=4, pady=(0, 4))
+        entry.grid(row=8, column=i, padx=4, pady=(0, 4))
         angle_entries.append(entry)
 
-    tk.Label(root, text="Idle").grid(row=8, column=0, padx=6, pady=(0, 4), sticky="e")
+    tk.Label(root, text="Idle").grid(row=9, column=0, padx=6, pady=(0, 4), sticky="e")
     channel_output_canvases: list[tk.Canvas] = []
     channel_output_fill_ids: list[int] = []
     for i in range(1, 5):
@@ -475,38 +496,38 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         canvas.create_rectangle(1, 2, 95, 14, fill="#E6EBF0", outline="#B4BEC8")
         canvas.create_line(48, 2, 48, 14, fill="#8F98A3")
         fill_id = canvas.create_rectangle(48, 3, 48, 13, fill="#94D98F", outline="")
-        canvas.grid(row=8, column=i, padx=4, pady=(0, 4))
+        canvas.grid(row=9, column=i, padx=4, pady=(0, 4))
         channel_output_canvases.append(canvas)
         channel_output_fill_ids.append(fill_id)
 
-    tk.Label(root, text="Hold").grid(row=9, column=0, padx=6, pady=2, sticky="e")
+    tk.Label(root, text="Hold").grid(row=10, column=0, padx=6, pady=2, sticky="e")
     hold_send_buttons: list[tk.Button] = []
     for i in range(4):
-        button = tk.Button(root, text="Send", width=8)
-        button.grid(row=9, column=i + 1, pady=2)
+        button = tk.Button(root, text="Pulse", width=8)
+        button.grid(row=10, column=i + 1, pady=2)
         hold_send_buttons.append(button)
 
-    tk.Label(root, text="End").grid(row=10, column=0, padx=6, pady=2, sticky="e")
+    tk.Label(root, text="End").grid(row=11, column=0, padx=6, pady=2, sticky="e")
     hold_end_buttons: list[tk.Button] = []
     for i in range(4):
         button = tk.Button(root, text="End", width=8)
-        button.grid(row=10, column=i + 1, pady=2)
+        button.grid(row=11, column=i + 1, pady=2)
         hold_end_buttons.append(button)
 
     start_button = tk.Button(root, text="Start", width=12)
-    start_button.grid(row=11, column=1, columnspan=2, pady=4)
+    start_button.grid(row=12, column=1, columnspan=2, pady=4)
     stop_button = tk.Button(root, text="Stop", width=12)
-    stop_button.grid(row=11, column=3, columnspan=2, pady=4)
+    stop_button.grid(row=12, column=3, columnspan=2, pady=4)
 
     status = tk.StringVar(value="Idle")
-    tk.Label(root, textvariable=status, anchor="w").grid(row=12, column=0, columnspan=5, sticky="we", padx=6, pady=(0, 6))
+    tk.Label(root, textvariable=status, anchor="w").grid(row=13, column=0, columnspan=5, sticky="we", padx=6, pady=(0, 6))
 
-    tk.Label(root, text="Links").grid(row=13, column=0, padx=6, pady=(0, 6), sticky="e")
+    tk.Label(root, text="Links").grid(row=14, column=0, padx=6, pady=(0, 6), sticky="e")
     pc_link_box = tk.Label(root, width=18, relief="groove", bd=2)
-    pc_link_box.grid(row=13, column=1, columnspan=4, padx=4, pady=(0, 6), sticky="we")
+    pc_link_box.grid(row=14, column=1, columnspan=4, padx=4, pady=(0, 6), sticky="we")
 
     fc_frame = tk.LabelFrame(root, text="FC / INAV", padx=8, pady=8)
-    fc_frame.grid(row=0, column=5, rowspan=14, padx=(12, 6), pady=6, sticky="ns")
+    fc_frame.grid(row=0, column=5, rowspan=15, padx=(12, 6), pady=6, sticky="ns")
     horizon = ArtificialHorizon(fc_frame, size=180)
     horizon.grid(row=0, column=0, columnspan=3, pady=(0, 8))
     attitude_text = tk.StringVar(value="Roll: 0.0 deg  Pitch: 0.0 deg  Yaw: 0")
@@ -537,6 +558,7 @@ def build_main_gui(root: tk.Tk) -> MainUi:
     return MainUi(
         port_entry=port_entry,
         channel_adjust_canvases=channel_adjust_canvases,
+        target_adjust_canvases=target_adjust_canvases,
         ch_entries=ch_entries,
         off_entries=off_entries,
         target_entries=target_entries,
@@ -566,6 +588,7 @@ def main() -> None:
     ui = build_main_gui(root)
     port_entry = ui.port_entry
     channel_adjust_canvases = ui.channel_adjust_canvases
+    target_adjust_canvases = ui.target_adjust_canvases
     ch_entries = ui.ch_entries
     off_entries = ui.off_entries
     target_entries = ui.target_entries
@@ -596,6 +619,13 @@ def main() -> None:
     run_quant: int | None = None
     run_max_count: int | None = None
     hold_timeout_after_id: str | None = None
+    channel_update_inflight = False
+    pending_channel_update_channels: list[int] | None = None
+    pending_channel_update_offsets: list[int] | None = None
+    adjust_repeat_after_id: str | None = None
+    adjust_repeat_handler: Callable[[int, int], None] | None = None
+    adjust_repeat_index: int | None = None
+    adjust_repeat_delta = 0
     base_channel_outputs = CHANNEL_DEFAULTS.copy()
     live_channel_outputs = base_channel_outputs.copy()
     worker = SerialWorker()
@@ -661,20 +691,53 @@ def main() -> None:
         ch_entries[index].insert(0, str(updated))
         on_output_inputs_changed()
 
-    def on_channel_adjust_click(index: int, event: tk.Event) -> None:
+    def adjust_target_value(index: int, delta: int) -> None:
+        try:
+            current = int(target_entries[index].get().strip())
+        except ValueError:
+            current = PULSE_TARGET_DEFAULTS[index]
+        updated = max(1000, min(2000, current + delta))
+        target_entries[index].delete(0, tk.END)
+        target_entries[index].insert(0, str(updated))
+
+    def get_adjust_delta(event: tk.Event) -> int:
         width = int(event.widget.cget("width"))
-        height = int(event.widget.cget("height"))
-        x1 = 1.0
-        y1 = float(height - 1)
-        x2 = float(width - 1)
-        y2 = 1.0
-        if x2 == x1:
+        mid_x = width / 2
+        return -5 if event.x <= mid_x else 5
+
+    def cancel_adjust_repeat() -> None:
+        nonlocal adjust_repeat_after_id, adjust_repeat_handler, adjust_repeat_index, adjust_repeat_delta
+        if adjust_repeat_after_id is not None:
+            try:
+                root.after_cancel(adjust_repeat_after_id)
+            except Exception:
+                pass
+            finally:
+                adjust_repeat_after_id = None
+        adjust_repeat_handler = None
+        adjust_repeat_index = None
+        adjust_repeat_delta = 0
+
+    def schedule_adjust_repeat() -> None:
+        nonlocal adjust_repeat_after_id
+        if adjust_repeat_handler is None or adjust_repeat_index is None or adjust_repeat_delta == 0:
+            adjust_repeat_after_id = None
             return
-        y_on_diag = y1 + (y2 - y1) * ((event.x - x1) / (x2 - x1))
-        if event.y <= y_on_diag:
-            adjust_channel_value(index, -5)
-        else:
-            adjust_channel_value(index, 5)
+        adjust_repeat_handler(adjust_repeat_index, adjust_repeat_delta)
+        adjust_repeat_after_id = root.after(ADJUST_REPEAT_INTERVAL_MS, schedule_adjust_repeat)
+
+    def on_adjust_press(adjust_handler: Callable[[int, int], None], index: int, event: tk.Event) -> None:
+        nonlocal adjust_repeat_after_id, adjust_repeat_handler, adjust_repeat_index, adjust_repeat_delta
+        cancel_adjust_repeat()
+        delta = get_adjust_delta(event)
+        adjust_handler(index, delta)
+        adjust_repeat_handler = adjust_handler
+        adjust_repeat_index = index
+        adjust_repeat_delta = delta
+        adjust_repeat_after_id = root.after(ADJUST_REPEAT_INITIAL_MS, schedule_adjust_repeat)
+
+    def on_adjust_release(_event: tk.Event) -> None:
+        cancel_adjust_repeat()
 
     def set_live_channel_outputs(values: list[int]) -> None:
         nonlocal live_channel_outputs
@@ -685,10 +748,94 @@ def main() -> None:
         for i, value in enumerate(live_channel_outputs):
             draw_channel_output(i, value)
 
-    def on_output_inputs_changed() -> None:
-        if run_active:
+    def queue_live_channel_update(channels: list[int], offsets: list[int]) -> None:
+        nonlocal channel_update_inflight, pending_channel_update_channels, pending_channel_update_offsets
+        if not run_active or run_ser is None:
             return
-        set_live_channel_outputs(parse_channel_values_with_defaults())
+        if channel_update_inflight:
+            pending_channel_update_channels = channels.copy()
+            pending_channel_update_offsets = offsets.copy()
+            return
+
+        channel_update_inflight = True
+
+        def on_live_update_done(ok: bool, res: object) -> None:
+            nonlocal channel_update_inflight, pending_channel_update_channels, pending_channel_update_offsets
+            nonlocal run_quant, run_max_count, base_channel_outputs
+            channel_update_inflight = False
+            if not ok:
+                set_error("Live update error", res if isinstance(res, Exception) else RuntimeError(res))
+            else:
+                if (
+                    not isinstance(res, tuple)
+                    or len(res) != 3
+                    or not isinstance(res[0], int)
+                    or not isinstance(res[1], int)
+                    or not isinstance(res[2], list)
+                ):
+                    set_error("Live update error", RuntimeError("Unexpected worker result from live update task"))
+                else:
+                    run_quant = res[0]
+                    run_max_count = res[1]
+                    sent_channels = [int(v) for v in res[2]]
+                    base_channel_outputs = sent_channels
+                    if hold_timeout_after_id is None:
+                        set_live_channel_outputs(sent_channels)
+
+            if not run_active or run_ser is None:
+                pending_channel_update_channels = None
+                pending_channel_update_offsets = None
+                return
+
+            if pending_channel_update_channels is None or pending_channel_update_offsets is None:
+                return
+
+            next_channels = pending_channel_update_channels
+            next_offsets = pending_channel_update_offsets
+            pending_channel_update_channels = None
+            pending_channel_update_offsets = None
+            queue_live_channel_update(next_channels, next_offsets)
+
+        worker.submit(_task_update_channels, channels.copy(), offsets.copy(), callback=on_live_update_done)
+
+    def on_output_inputs_changed() -> None:
+        nonlocal base_channel_outputs
+        if not run_active or run_ser is None:
+            set_live_channel_outputs(parse_channel_values_with_defaults())
+            return
+
+        try:
+            channels = parse_entries(ch_entries, int, "Channel")
+            require_range(channels, "Channel", 1000, 2000)
+            offsets = parse_entries(off_entries, int, "Offset")
+        except Exception:
+            return
+
+        set_live_channel_outputs(channels)
+        base_channel_outputs = channels.copy()
+        queue_live_channel_update(channels, offsets)
+
+    def channel_angle_value(channel_index: int) -> float | None:
+        sample = fc_service.latest_attitude()
+        if sample is None:
+            return None
+        if channel_index == 0:
+            return sample.roll_deg
+        if channel_index == 1:
+            return sample.pitch_deg
+        if channel_index == 3:
+            return sample.yaw_deg
+        return None
+
+    def is_angle_threshold_reached(channel_index: int, threshold_deg: float) -> bool:
+        if threshold_deg == 0:
+            return False
+        measured = channel_angle_value(channel_index)
+        if measured is None:
+            return False
+        if threshold_deg > 0:
+            return measured >= threshold_deg
+        return measured <= threshold_deg
 
     def select_fc_port(port_infos: Sequence[object]) -> str:
         target_id = FC_DEVICE_ID.upper()
@@ -755,6 +902,7 @@ def main() -> None:
 
     def close_run_connection() -> None:
         nonlocal run_ser, run_quant, run_max_count, run_active
+        nonlocal channel_update_inflight, pending_channel_update_channels, pending_channel_update_offsets
         if run_ser is not None:
             try:
                 run_ser.close()
@@ -765,6 +913,9 @@ def main() -> None:
                 run_quant = None
                 run_max_count = None
                 run_active = False
+                channel_update_inflight = False
+                pending_channel_update_channels = None
+                pending_channel_update_offsets = None
                 update_link_indicators()
 
     def do_fc_connect() -> None:
@@ -850,6 +1001,12 @@ def main() -> None:
             raise RuntimeError("Serial not open")
         return run_ppm_on_serial(worker_self.ser, channels, offsets)
 
+    def _task_update_channels(worker_self: SerialWorker, channels: list[int], offsets: list[int]):
+        if worker_self.ser is None:
+            raise RuntimeError("Serial not open")
+        quant, max_count, _ = run_ppm_on_serial(worker_self.ser, channels, offsets)
+        return (quant, max_count, channels)
+
     def _task_read_pulse_status(worker_self: SerialWorker, max_count: int):
         if worker_self.ser is None:
             raise RuntimeError("Serial not open")
@@ -884,6 +1041,7 @@ def main() -> None:
 
     def do_start() -> None:
         nonlocal run_active, run_port, run_ser, run_quant, run_max_count, start_pending, base_channel_outputs
+        nonlocal channel_update_inflight, pending_channel_update_channels, pending_channel_update_offsets
         try:
             if start_pending:
                 raise RuntimeError("Start is already in progress.")
@@ -896,6 +1054,7 @@ def main() -> None:
 
             def on_start_done(ok: bool, res: object) -> None:
                 nonlocal run_active, run_port, run_ser, run_quant, run_max_count, start_pending, base_channel_outputs
+                nonlocal channel_update_inflight, pending_channel_update_channels, pending_channel_update_offsets
                 start_pending = False
                 if not ok:
                     set_error("Start error", res if isinstance(res, Exception) else RuntimeError(res))
@@ -915,6 +1074,9 @@ def main() -> None:
                 run_max_count = res[1]
                 run_ser = worker.ser
                 run_active = True
+                channel_update_inflight = False
+                pending_channel_update_channels = None
+                pending_channel_update_offsets = None
                 base_channel_outputs = channels.copy()
                 set_live_channel_outputs(base_channel_outputs)
                 update_link_indicators()
@@ -943,6 +1105,7 @@ def main() -> None:
             cancel_hold_timeout()
             def on_stop_done(ok: bool, res: object) -> None:
                 nonlocal run_ser, run_quant, run_max_count, run_active
+                nonlocal channel_update_inflight, pending_channel_update_channels, pending_channel_update_offsets
                 if not ok:
                     set_error("Stop error", res if isinstance(res, Exception) else RuntimeError(res))
                     return
@@ -953,6 +1116,9 @@ def main() -> None:
                 run_quant = None
                 run_max_count = None
                 run_active = False
+                channel_update_inflight = False
+                pending_channel_update_channels = None
+                pending_channel_update_offsets = None
                 set_live_channel_outputs(parse_channel_values_with_defaults())
                 update_link_indicators()
                 status.set("PPM output stopped.")
@@ -975,6 +1141,15 @@ def main() -> None:
             durations = parse_entries(dur_entries, float, "Duration")
             require_duration_range(durations, 0.05, 60.0)
             timeout_s = durations[i]
+            angle_threshold = 0.0
+            angle_state = str(angle_entries[i].cget("state"))
+            if angle_state == "normal":
+                raw_threshold = angle_entries[i].get().strip()
+                if raw_threshold:
+                    try:
+                        angle_threshold = float(raw_threshold)
+                    except ValueError as exc:
+                        raise RuntimeError(f"Angle CH{i + 1} must be a number.") from exc
 
             def on_hold_done(ok: bool, res: object) -> None:
                 nonlocal hold_timeout_after_id, run_max_count
@@ -994,8 +1169,9 @@ def main() -> None:
 
                 timeout_ms = max(1, round(timeout_s * 1000))
                 chan_label = i + 1
+                deadline_s = time.monotonic() + timeout_s
 
-                def schedule_check() -> None:
+                def schedule_timeout_status_check() -> None:
                     def cb(ok2: bool, res2: object) -> None:
                         nonlocal hold_timeout_after_id
                         if not ok2:
@@ -1008,7 +1184,7 @@ def main() -> None:
                             return
                         pulse_status_now = res2
                         if pulse_status_now not in (PULSE_STATUS_TIMEOUT_RESTORED, PULSE_STATUS_HOLD_ENDED):
-                            hold_timeout_after_id = root.after(20, schedule_check)
+                            hold_timeout_after_id = root.after(HOLD_TIMEOUT_POLL_MS, schedule_timeout_status_check)
                             return
                         hold_timeout_after_id = None
                         set_live_channel_outputs(base_channel_outputs)
@@ -1019,7 +1195,42 @@ def main() -> None:
 
                     worker.submit(_task_read_pulse_status, run_max_count or 0, callback=cb)
 
-                hold_timeout_after_id = root.after(timeout_ms, schedule_check)
+                def on_angle_hold_end_done(ok3: bool, res3: object) -> None:
+                    nonlocal hold_timeout_after_id
+                    if not ok3:
+                        set_error("Hold end error", res3 if isinstance(res3, Exception) else RuntimeError(res3))
+                        hold_timeout_after_id = root.after(HOLD_ANGLE_CHECK_MS, schedule_angle_or_timeout_check)
+                        return
+                    if not isinstance(res3, int):
+                        set_error("Hold end error", RuntimeError("Unexpected worker result from hold-end task"))
+                        hold_timeout_after_id = root.after(HOLD_ANGLE_CHECK_MS, schedule_angle_or_timeout_check)
+                        return
+                    if res3 == PULSE_STATUS_REJECTED:
+                        set_error("Hold end error", RuntimeError("Firmware rejected hold-end command"))
+                        hold_timeout_after_id = root.after(HOLD_ANGLE_CHECK_MS, schedule_angle_or_timeout_check)
+                        return
+                    cancel_hold_timeout()
+                    set_live_channel_outputs(base_channel_outputs)
+                    status.set(f"CH{chan_label} hold ended on angle threshold; channel restored.")
+
+                def schedule_angle_or_timeout_check() -> None:
+                    nonlocal hold_timeout_after_id
+                    if hold_timeout_after_id is None:
+                        return
+
+                    angle_entry_enabled = str(angle_entries[i].cget("state")) == "normal"
+                    if angle_entry_enabled and angle_threshold != 0 and is_angle_threshold_reached(i, angle_threshold):
+                        worker.submit(_task_hold_end, i, callback=on_angle_hold_end_done)
+                        return
+
+                    if time.monotonic() >= deadline_s:
+                        schedule_timeout_status_check()
+                        return
+
+                    remaining_ms = max(1, round((deadline_s - time.monotonic()) * 1000))
+                    hold_timeout_after_id = root.after(min(HOLD_ANGLE_CHECK_MS, remaining_ms), schedule_angle_or_timeout_check)
+
+                hold_timeout_after_id = root.after(min(HOLD_ANGLE_CHECK_MS, timeout_ms), schedule_angle_or_timeout_check)
                 status.set(f"CH{chan_label} hold active. Press End for early restore (auto in {timeout_s:.3g}s).")
 
             worker.submit(_task_hold, i, targets[i], offsets[i], timeout_s, callback=on_hold_done)
@@ -1054,6 +1265,7 @@ def main() -> None:
     def on_close() -> None:
         nonlocal is_closing, fc_poll_after_id
         is_closing = True
+        cancel_adjust_repeat()
         cancel_hold_timeout()
         if fc_poll_after_id is not None:
             try:
@@ -1094,7 +1306,13 @@ def main() -> None:
     start_button.config(command=do_start)
     stop_button.config(command=do_stop)
     for i, canvas in enumerate(channel_adjust_canvases):
-        canvas.bind("<Button-1>", lambda event, i=i: on_channel_adjust_click(i, event))
+        canvas.bind("<ButtonPress-1>", lambda event, i=i: on_adjust_press(adjust_channel_value, i, event))
+        canvas.bind("<ButtonRelease-1>", on_adjust_release)
+        canvas.bind("<Leave>", on_adjust_release)
+    for i, canvas in enumerate(target_adjust_canvases):
+        canvas.bind("<ButtonPress-1>", lambda event, i=i: on_adjust_press(adjust_target_value, i, event))
+        canvas.bind("<ButtonRelease-1>", on_adjust_release)
+        canvas.bind("<Leave>", on_adjust_release)
     for entry in ch_entries:
         entry.bind("<KeyRelease>", lambda _event: on_output_inputs_changed())
         entry.bind("<FocusOut>", lambda _event: on_output_inputs_changed())
