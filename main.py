@@ -9,8 +9,9 @@ from __future__ import annotations
 import math
 import struct
 import time
+import io
 import tkinter as tk
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections.abc import Callable, Sequence
 from tkinter import messagebox
 
@@ -59,6 +60,8 @@ ADJUST_REPEAT_INITIAL_MS = 800
 ADJUST_REPEAT_INTERVAL_MS = 94
 HOLD_TIMEOUT_POLL_MS = 20
 HOLD_ANGLE_CHECK_MS = 60
+PULSE_CHART_SETTLE_S = 1.5
+PULSE_CHART_MAX_POINTS = 900
 
 
 def crc16(data: bytes) -> int:
@@ -341,7 +344,7 @@ def require_duration_range(values: Sequence[float], min_s: float, max_s: float) 
             raise RuntimeError(f"Duration CH{idx} must be between {min_s:.3g}s and {max_s:.3g}s")
 
 
-def make_row(root: tk.Tk, row: int, label: str, defaults: Sequence[int | float]) -> list[tk.Entry]:
+def make_row(root: tk.Misc, row: int, label: str, defaults: Sequence[int | float]) -> list[tk.Entry]:
     tk.Label(root, text=label).grid(row=row, column=0, padx=6, pady=(0, 4), sticky="e")
     out: list[tk.Entry] = []
     for i, value in enumerate(defaults, 1):
@@ -431,26 +434,48 @@ class MainUi:
     scan_fc_button: tk.Button
     connect_fc_button: tk.Button
     disconnect_fc_button: tk.Button
+    chart_status: tk.StringVar
+    chart_strip_canvas: tk.Canvas
+    chart_strip_frame: tk.Frame
+
+
+@dataclass
+class PulseChartCapture:
+    axis: str
+    channel_index: int
+    target_us: int
+    reference_us: int
+    command_delta_us: int
+    timeout_s: float
+    start_monotonic: float
+    samples: list[tuple[float, float]] = field(default_factory=list)
+    restore_monotonic: float | None = None
+    restore_reason: str = ""
 
 
 def build_main_gui(root: tk.Tk) -> MainUi:
     root.title("PPM Modbus")
     root.resizable(False, False)
+    for col in range(6):
+        root.grid_columnconfigure(col, weight=1)
 
-    tk.Label(root, text="Port").grid(row=0, column=0, padx=6, pady=6, sticky="e")
-    port_entry = tk.Entry(root, width=8)
+    main_frame = tk.LabelFrame(root, text="Main Controls", padx=6, pady=6)
+    main_frame.grid(row=0, column=0, columnspan=5, padx=(6, 6), pady=6, sticky="nsew")
+
+    tk.Label(main_frame, text="Port").grid(row=0, column=0, padx=6, pady=6, sticky="e")
+    port_entry = tk.Entry(main_frame, width=8)
     port_entry.insert(0, PORT_DEFAULT)
     port_entry.grid(row=0, column=1, padx=4, pady=6, sticky="w")
 
     for i, channel_name in enumerate(("Roll", "Pitch", "Throttle", "Yaw"), start=1):
-        tk.Label(root, text=channel_name).grid(row=1, column=i, padx=4)
+        tk.Label(main_frame, text=channel_name).grid(row=1, column=i, padx=4)
 
-    tk.Label(root, text="Adjust").grid(row=2, column=0, padx=6, pady=(0, 4), sticky="e")
+    tk.Label(main_frame, text="Adjust").grid(row=2, column=0, padx=6, pady=(0, 4), sticky="e")
     channel_adjust_canvases: list[tk.Canvas] = []
     for i in range(1, 5):
         width = 52
         height = 20
-        canvas = tk.Canvas(root, width=width, height=height, bg="#F0F0F0", highlightthickness=0)
+        canvas = tk.Canvas(main_frame, width=width, height=height, bg="#F0F0F0", highlightthickness=0)
         mid_x = width // 2
         canvas.create_rectangle(1, 1, mid_x, height - 1, fill="#C94B4B", outline="")
         canvas.create_rectangle(mid_x, 1, width - 1, height - 1, fill="#4CAF50", outline="")
@@ -460,14 +485,14 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         canvas.grid(row=2, column=i, padx=4, pady=(0, 4))
         channel_adjust_canvases.append(canvas)
 
-    ch_entries = make_row(root, 3, "Channels", CHANNEL_DEFAULTS)
-    off_entries = make_row(root, 4, "Offsets", OFFSET_DEFAULTS)
-    tk.Label(root, text="Adjust Tgt").grid(row=5, column=0, padx=6, pady=(0, 4), sticky="e")
+    ch_entries = make_row(main_frame, 3, "Channels", CHANNEL_DEFAULTS)
+    off_entries = make_row(main_frame, 4, "Offsets", OFFSET_DEFAULTS)
+    tk.Label(main_frame, text="Adjust Tgt").grid(row=5, column=0, padx=6, pady=(0, 4), sticky="e")
     target_adjust_canvases: list[tk.Canvas] = []
     for i in range(1, 5):
         width = 52
         height = 20
-        canvas = tk.Canvas(root, width=width, height=height, bg="#F0F0F0", highlightthickness=0)
+        canvas = tk.Canvas(main_frame, width=width, height=height, bg="#F0F0F0", highlightthickness=0)
         mid_x = width // 2
         canvas.create_rectangle(1, 1, mid_x, height - 1, fill="#C94B4B", outline="")
         canvas.create_rectangle(mid_x, 1, width - 1, height - 1, fill="#4CAF50", outline="")
@@ -477,22 +502,22 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         canvas.grid(row=5, column=i, padx=4, pady=(0, 4))
         target_adjust_canvases.append(canvas)
 
-    target_entries = make_row(root, 6, "Targets", PULSE_TARGET_DEFAULTS)
-    dur_entries = make_row(root, 7, "Duration", PULSE_DURATION_DEFAULTS)
+    target_entries = make_row(main_frame, 6, "Targets", PULSE_TARGET_DEFAULTS)
+    dur_entries = make_row(main_frame, 7, "Duration", PULSE_DURATION_DEFAULTS)
 
-    tk.Label(root, text="Angle").grid(row=8, column=0, padx=6, pady=(0, 4), sticky="e")
+    tk.Label(main_frame, text="Angle").grid(row=8, column=0, padx=6, pady=(0, 4), sticky="e")
     angle_entries: list[tk.Entry] = []
     for i in range(1, 5):
-        entry = tk.Entry(root, width=8)
+        entry = tk.Entry(main_frame, width=8)
         entry.insert(0, "0")
         entry.grid(row=8, column=i, padx=4, pady=(0, 4))
         angle_entries.append(entry)
 
-    tk.Label(root, text="Idle").grid(row=9, column=0, padx=6, pady=(0, 4), sticky="e")
+    tk.Label(main_frame, text="Idle").grid(row=9, column=0, padx=6, pady=(0, 4), sticky="e")
     channel_output_canvases: list[tk.Canvas] = []
     channel_output_fill_ids: list[int] = []
     for i in range(1, 5):
-        canvas = tk.Canvas(root, width=96, height=16, bg="#F0F0F0", highlightthickness=0)
+        canvas = tk.Canvas(main_frame, width=96, height=16, bg="#F0F0F0", highlightthickness=0)
         canvas.create_rectangle(1, 2, 95, 14, fill="#E6EBF0", outline="#B4BEC8")
         canvas.create_line(48, 2, 48, 14, fill="#8F98A3")
         fill_id = canvas.create_rectangle(48, 3, 48, 13, fill="#94D98F", outline="")
@@ -500,34 +525,80 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         channel_output_canvases.append(canvas)
         channel_output_fill_ids.append(fill_id)
 
-    tk.Label(root, text="Hold").grid(row=10, column=0, padx=6, pady=2, sticky="e")
+    tk.Label(main_frame, text="Hold").grid(row=10, column=0, padx=6, pady=2, sticky="e")
     hold_send_buttons: list[tk.Button] = []
     for i in range(4):
-        button = tk.Button(root, text="Pulse", width=8)
+        button = tk.Button(main_frame, text="Pulse", width=8)
         button.grid(row=10, column=i + 1, pady=2)
         hold_send_buttons.append(button)
 
-    tk.Label(root, text="End").grid(row=11, column=0, padx=6, pady=2, sticky="e")
+    tk.Label(main_frame, text="End").grid(row=11, column=0, padx=6, pady=2, sticky="e")
     hold_end_buttons: list[tk.Button] = []
     for i in range(4):
-        button = tk.Button(root, text="End", width=8)
+        button = tk.Button(main_frame, text="End", width=8)
         button.grid(row=11, column=i + 1, pady=2)
         hold_end_buttons.append(button)
 
-    start_button = tk.Button(root, text="Start", width=12)
+    start_button = tk.Button(main_frame, text="Start", width=12)
     start_button.grid(row=12, column=1, columnspan=2, pady=4)
-    stop_button = tk.Button(root, text="Stop", width=12)
+    stop_button = tk.Button(main_frame, text="Stop", width=12)
     stop_button.grid(row=12, column=3, columnspan=2, pady=4)
 
     status = tk.StringVar(value="Idle")
-    tk.Label(root, textvariable=status, anchor="w").grid(row=13, column=0, columnspan=5, sticky="we", padx=6, pady=(0, 6))
+    tk.Label(main_frame, textvariable=status, anchor="w").grid(row=13, column=0, columnspan=5, sticky="we", padx=6, pady=(0, 6))
 
-    tk.Label(root, text="Links").grid(row=14, column=0, padx=6, pady=(0, 6), sticky="e")
-    pc_link_box = tk.Label(root, width=18, relief="groove", bd=2)
+    tk.Label(main_frame, text="Links").grid(row=14, column=0, padx=6, pady=(0, 6), sticky="e")
+    pc_link_box = tk.Label(main_frame, width=18, relief="groove", bd=2)
     pc_link_box.grid(row=14, column=1, columnspan=4, padx=4, pady=(0, 6), sticky="we")
 
+    charts_frame = tk.LabelFrame(root, text="Pulse Movement Charts", padx=6, pady=6)
+    charts_frame.grid(row=1, column=0, columnspan=6, padx=6, pady=(0, 6), sticky="we")
+    chart_status = tk.StringVar(
+        value="Pulse Roll or Pitch to append charts here. Baseline is derived after neutral restore."
+    )
+    tk.Label(charts_frame, textvariable=chart_status, justify="left", anchor="w", wraplength=940).pack(
+        fill="x", pady=(0, 4)
+    )
+
+    chart_shell = tk.Frame(charts_frame)
+    chart_shell.pack(fill="both", expand=True)
+    chart_strip_canvas = tk.Canvas(
+        chart_shell,
+        width=940,
+        height=268,
+        bg="#F4F8FB",
+        bd=0,
+        highlightthickness=1,
+        highlightbackground="#B5C0CB",
+    )
+    chart_scrollbar = tk.Scrollbar(chart_shell, orient="horizontal", command=chart_strip_canvas.xview)
+    chart_strip_frame = tk.Frame(chart_strip_canvas, bg="#F4F8FB")
+    chart_strip_window = chart_strip_canvas.create_window((0, 0), window=chart_strip_frame, anchor="nw")
+    chart_strip_canvas.configure(xscrollcommand=chart_scrollbar.set)
+    chart_strip_canvas.grid(row=0, column=0, sticky="we")
+    chart_scrollbar.grid(row=1, column=0, sticky="we")
+    chart_shell.grid_columnconfigure(0, weight=1)
+
+    def update_chart_scroll_region(_event: tk.Event | None = None) -> None:
+        bbox = chart_strip_canvas.bbox("all")
+        if bbox is None:
+            chart_strip_canvas.configure(scrollregion=(0, 0, 0, 0))
+            return
+        chart_strip_canvas.configure(scrollregion=bbox)
+
+    def keep_chart_strip_height(event: tk.Event) -> None:
+        chart_strip_canvas.itemconfigure(chart_strip_window, height=max(236, event.height - 14))
+
+    def chart_mousewheel_horizontal(event: tk.Event) -> None:
+        if event.delta:
+            chart_strip_canvas.xview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    chart_strip_frame.bind("<Configure>", update_chart_scroll_region)
+    chart_strip_canvas.bind("<Configure>", keep_chart_strip_height)
+    chart_strip_canvas.bind("<Shift-MouseWheel>", chart_mousewheel_horizontal)
+
     fc_frame = tk.LabelFrame(root, text="FC / INAV", padx=8, pady=8)
-    fc_frame.grid(row=0, column=5, rowspan=15, padx=(12, 6), pady=6, sticky="ns")
+    fc_frame.grid(row=0, column=5, padx=(6, 6), pady=6, sticky="ns")
     horizon = ArtificialHorizon(fc_frame, size=180)
     horizon.grid(row=0, column=0, columnspan=3, pady=(0, 8))
     attitude_text = tk.StringVar(value="Roll: 0.0 deg  Pitch: 0.0 deg  Yaw: 0")
@@ -580,6 +651,9 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         scan_fc_button=scan_fc_button,
         connect_fc_button=connect_fc_button,
         disconnect_fc_button=disconnect_fc_button,
+        chart_status=chart_status,
+        chart_strip_canvas=chart_strip_canvas,
+        chart_strip_frame=chart_strip_frame,
     )
 
 
@@ -610,6 +684,9 @@ def main() -> None:
     scan_fc_button = ui.scan_fc_button
     connect_fc_button = ui.connect_fc_button
     disconnect_fc_button = ui.disconnect_fc_button
+    chart_status = ui.chart_status
+    chart_strip_canvas = ui.chart_strip_canvas
+    chart_strip_frame = ui.chart_strip_frame
 
     run_active = False
     start_pending = False
@@ -631,6 +708,10 @@ def main() -> None:
     worker = SerialWorker()
     fc_service = InavSerialService()
     fc_poll_after_id: str | None = None
+    pulse_chart_finalize_after_id: str | None = None
+    pulse_chart_active: PulseChartCapture | None = None
+    pulse_chart_photos: list[tk.PhotoImage] = []
+    pulse_chart_count = 0
 
     def port() -> str:
         return port_entry.get().strip() or PORT_DEFAULT
@@ -646,6 +727,238 @@ def main() -> None:
         if value <= 0:
             raise RuntimeError("FC baud must be > 0.")
         return value
+
+    def pulse_axis_for_channel(channel_index: int) -> str | None:
+        if channel_index == 0:
+            return "roll"
+        if channel_index == 1:
+            return "pitch"
+        return None
+
+    def pulse_axis_value(sample, axis: str) -> float:
+        if axis == "roll":
+            return float(sample.roll_deg)
+        return float(sample.pitch_deg)
+
+    def blend_hex(start_hex: str, end_hex: str, amount: float) -> str:
+        clamped = max(0.0, min(1.0, float(amount)))
+        start = start_hex.lstrip("#")
+        end = end_hex.lstrip("#")
+        s_r, s_g, s_b = int(start[0:2], 16), int(start[2:4], 16), int(start[4:6], 16)
+        e_r, e_g, e_b = int(end[0:2], 16), int(end[2:4], 16), int(end[4:6], 16)
+        r = round(s_r + (e_r - s_r) * clamped)
+        g = round(s_g + (e_g - s_g) * clamped)
+        b = round(s_b + (e_b - s_b) * clamped)
+        return f"#{r:02X}{g:02X}{b:02X}"
+
+    def pulse_direction_label(axis: str, delta_us: int) -> str:
+        if delta_us > 0:
+            return "Right" if axis == "roll" else "Forward"
+        if delta_us < 0:
+            return "Left" if axis == "roll" else "Back"
+        return "Neutral"
+
+    def pulse_visuals(axis: str, delta_us: int) -> tuple[str, str, str, str]:
+        magnitude_ratio = min(1.0, abs(delta_us) / 450.0)
+        if delta_us > 0:
+            card_bg = blend_hex("#EFF6FF", "#DBEAFE", magnitude_ratio)
+            accent_color = blend_hex("#60A5FA", "#1D4ED8", magnitude_ratio)
+            badge_color = blend_hex("#2563EB", "#1E3A8A", magnitude_ratio)
+        elif delta_us < 0:
+            card_bg = blend_hex("#FFF7ED", "#FFEDD5", magnitude_ratio)
+            accent_color = blend_hex("#FDBA74", "#C2410C", magnitude_ratio)
+            badge_color = blend_hex("#EA580C", "#7C2D12", magnitude_ratio)
+        else:
+            card_bg = "#F8FAFC"
+            accent_color = "#94A3B8"
+            badge_color = "#64748B"
+        if axis == "roll":
+            line_color = blend_hex("#38BDF8", "#0369A1", magnitude_ratio)
+        else:
+            line_color = blend_hex("#34D399", "#047857", magnitude_ratio)
+        return card_bg, accent_color, badge_color, line_color
+
+    def cancel_pulse_chart_finalize_timer() -> None:
+        nonlocal pulse_chart_finalize_after_id
+        if pulse_chart_finalize_after_id is None:
+            return
+        try:
+            root.after_cancel(pulse_chart_finalize_after_id)
+        except Exception:
+            pass
+        pulse_chart_finalize_after_id = None
+
+    def pulse_chart_baseline(capture: PulseChartCapture) -> float:
+        if not capture.samples:
+            return 0.0
+        if capture.restore_monotonic is not None:
+            restore_elapsed = max(0.0, capture.restore_monotonic - capture.start_monotonic)
+            settled_values = [value for t, value in capture.samples if t >= restore_elapsed]
+            if settled_values:
+                return sum(settled_values) / len(settled_values)
+        tail = capture.samples[-min(10, len(capture.samples)) :]
+        return sum(value for _, value in tail) / len(tail)
+
+    def append_pulse_chart_card(capture: PulseChartCapture, baseline_deg: float) -> None:
+        nonlocal pulse_chart_count, pulse_chart_photos
+        if len(capture.samples) < 2:
+            chart_status.set("Pulse chart skipped: not enough FC samples were collected.")
+            return
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg", force=True)
+            from matplotlib.backends.backend_agg import FigureCanvasAgg as LocalFigureCanvasAgg
+            from matplotlib.figure import Figure as LocalFigure
+        except Exception as exc:
+            chart_status.set(
+                "Matplotlib is unavailable in this interpreter, so pulse charts cannot be rendered. "
+                f"Install it in .venv to enable charts. Error: {exc}"
+            )
+            return
+
+        axis_title = capture.axis.title()
+        direction_label = pulse_direction_label(capture.axis, capture.command_delta_us)
+        card_bg, accent_color, badge_color, line_color = pulse_visuals(capture.axis, capture.command_delta_us)
+        time_data = [point[0] for point in capture.samples]
+        movement_data = [point[1] - baseline_deg for point in capture.samples]
+        restore_elapsed = None
+        if capture.restore_monotonic is not None:
+            restore_elapsed = max(0.0, capture.restore_monotonic - capture.start_monotonic)
+        magnitude_pct = min(100, round((abs(capture.command_delta_us) / 500.0) * 100))
+
+        fig = LocalFigure(figsize=(4.9, 2.75), dpi=100, facecolor=card_bg)
+        ax = fig.add_subplot(111, facecolor="#ECF3F9")
+        ax.plot(time_data, movement_data, linewidth=1.9, color=line_color)
+        ax.axhline(0.0, linewidth=1.0, color="#334155", linestyle="--", alpha=0.75)
+        if restore_elapsed is not None:
+            ax.axvline(restore_elapsed, linewidth=1.0, color=accent_color, linestyle=":", alpha=0.9)
+        ax.set_title(
+            f"{axis_title} CH{capture.channel_index + 1} target {capture.target_us} us ({direction_label} {capture.command_delta_us:+d} us)",
+            fontsize=9,
+        )
+        ax.set_xlabel("Time from pulse command (s)", fontsize=8)
+        ax.set_ylabel(f"{axis_title} vs settle baseline (deg)", fontsize=8)
+        ax.tick_params(axis="both", labelsize=8)
+        ax.grid(True, alpha=0.3, color="#94A3B8")
+        fig.subplots_adjust(left=0.13, right=0.98, top=0.86, bottom=0.22)
+
+        canvas = LocalFigureCanvasAgg(fig)
+        buffer = io.BytesIO()
+        canvas.print_png(buffer)
+        photo = tk.PhotoImage(data=buffer.getvalue())
+        pulse_chart_photos.append(photo)
+
+        pulse_chart_count += 1
+        card = tk.Frame(chart_strip_frame, bg=card_bg, bd=1, relief="solid", padx=4, pady=4)
+        tk.Frame(card, bg=accent_color, height=4).pack(fill="x", pady=(0, 4))
+        header = tk.Frame(card, bg=card_bg)
+        header.pack(fill="x", pady=(0, 2))
+        tk.Label(header, text=f"{axis_title} pulse #{pulse_chart_count}", bg=card_bg, fg="#0F172A", font=("Segoe UI", 9, "bold")).pack(
+            side="left", anchor="w"
+        )
+        tk.Label(
+            header,
+            text=f"{direction_label} {capture.command_delta_us:+d}us",
+            bg=badge_color,
+            fg="white",
+            font=("Segoe UI", 8, "bold"),
+            padx=6,
+            pady=1,
+        ).pack(side="right", anchor="e")
+        tk.Label(card, image=photo, bg=card_bg).pack(anchor="w", pady=(2, 2))
+        reason = capture.restore_reason or "pulse completed"
+        tk.Label(
+            card,
+            text=f"Baseline {baseline_deg:+.2f} deg ({reason}) | Magnitude {magnitude_pct}%",
+            bg=card_bg,
+            anchor="w",
+            justify="left",
+            font=("Segoe UI", 8),
+        ).pack(anchor="w")
+        card.pack(side="left", padx=(0, 8), pady=(0, 4), anchor="n")
+
+        chart_strip_canvas.configure(scrollregion=chart_strip_canvas.bbox("all"))
+        chart_strip_canvas.xview_moveto(1.0)
+        chart_status.set(
+            f"Added {axis_title} pulse chart #{pulse_chart_count}. "
+            "Charts stay left-to-right in the horizontal strip."
+        )
+
+    def finalize_pulse_chart(force: bool = False) -> None:
+        nonlocal pulse_chart_active
+        cancel_pulse_chart_finalize_timer()
+        capture = pulse_chart_active
+        if capture is None:
+            return
+        if capture.restore_monotonic is None and not force:
+            return
+        baseline_deg = pulse_chart_baseline(capture)
+        append_pulse_chart_card(capture, baseline_deg)
+        pulse_chart_active = None
+
+    def schedule_pulse_chart_finalize() -> None:
+        nonlocal pulse_chart_finalize_after_id
+        cancel_pulse_chart_finalize_timer()
+        delay_ms = max(200, round(PULSE_CHART_SETTLE_S * 1000))
+
+        def on_finalize() -> None:
+            nonlocal pulse_chart_finalize_after_id
+            pulse_chart_finalize_after_id = None
+            finalize_pulse_chart(force=False)
+
+        pulse_chart_finalize_after_id = root.after(delay_ms, on_finalize)
+
+    def mark_pulse_chart_restore(reason: str) -> None:
+        capture = pulse_chart_active
+        if capture is None:
+            return
+        if capture.restore_monotonic is not None:
+            return
+        capture.restore_monotonic = time.monotonic()
+        capture.restore_reason = reason
+        chart_status.set(
+            f"{capture.axis.title()} pulse restore detected; collecting {PULSE_CHART_SETTLE_S:.1f}s settle baseline."
+        )
+        schedule_pulse_chart_finalize()
+
+    def start_pulse_chart_capture(channel_index: int, target_us: int, timeout_s: float, reference_us: int) -> None:
+        nonlocal pulse_chart_active
+        axis = pulse_axis_for_channel(channel_index)
+        if axis is None:
+            return
+        if not fc_service.is_connected:
+            chart_status.set(
+                "Pulse sent on Roll/Pitch, but FC is disconnected so no movement chart could be recorded."
+            )
+            return
+        if pulse_chart_active is not None:
+            finalize_pulse_chart(force=True)
+        capture = PulseChartCapture(
+            axis=axis,
+            channel_index=channel_index,
+            target_us=target_us,
+            reference_us=reference_us,
+            command_delta_us=int(target_us) - int(reference_us),
+            timeout_s=timeout_s,
+            start_monotonic=time.monotonic(),
+        )
+        latest_sample = fc_service.latest_attitude()
+        if latest_sample is not None:
+            capture.samples.append((0.0, pulse_axis_value(latest_sample, axis)))
+        pulse_chart_active = capture
+        chart_status.set(
+            f"Recording {axis.title()} pulse trace on CH{channel_index + 1}; chart will append after neutral settle."
+        )
+
+    def record_pulse_chart_sample(sample) -> None:
+        capture = pulse_chart_active
+        if capture is None:
+            return
+        elapsed = max(0.0, time.monotonic() - capture.start_monotonic)
+        capture.samples.append((elapsed, pulse_axis_value(sample, capture.axis)))
+        if len(capture.samples) > PULSE_CHART_MAX_POINTS:
+            capture.samples = capture.samples[-PULSE_CHART_MAX_POINTS:]
 
     def draw_channel_output(index: int, value: int) -> None:
         clamped = max(1000, min(2000, value))
@@ -909,6 +1222,9 @@ def main() -> None:
             except Exception:
                 pass
             finally:
+                if pulse_chart_active is not None:
+                    mark_pulse_chart_restore("PPM link closed")
+                    finalize_pulse_chart(force=True)
                 run_ser = None
                 run_quant = None
                 run_max_count = None
@@ -937,6 +1253,9 @@ def main() -> None:
             if not is_closing:
                 set_error("FC disconnect error", exc)
         finally:
+            if pulse_chart_active is not None:
+                mark_pulse_chart_restore("FC disconnected")
+                finalize_pulse_chart(force=True)
             horizon.set_attitude(0.0, 0.0)
             attitude_text.set("Roll: 0.0 deg  Pitch: 0.0 deg  Yaw: 0")
             update_link_indicators()
@@ -948,6 +1267,7 @@ def main() -> None:
         try:
             sample = fc_service.latest_attitude()
             if sample is not None:
+                record_pulse_chart_sample(sample)
                 horizon.set_attitude(sample.roll_deg, sample.pitch_deg)
                 attitude_text.set(
                     f"Roll: {sample.roll_deg:6.1f} deg  Pitch: {sample.pitch_deg:6.1f} deg  Yaw: {sample.yaw_deg:6.0f}"
@@ -1103,6 +1423,9 @@ def main() -> None:
     def do_stop() -> None:
         try:
             cancel_hold_timeout()
+            if pulse_chart_active is not None:
+                mark_pulse_chart_restore("Stop pressed")
+                finalize_pulse_chart(force=True)
             def on_stop_done(ok: bool, res: object) -> None:
                 nonlocal run_ser, run_quant, run_max_count, run_active
                 nonlocal channel_update_inflight, pending_channel_update_channels, pending_channel_update_offsets
@@ -1166,6 +1489,7 @@ def main() -> None:
                 active_outputs = base_channel_outputs.copy()
                 active_outputs[i] = targets[i]
                 set_live_channel_outputs(active_outputs)
+                start_pulse_chart_capture(i, targets[i], timeout_s, base_channel_outputs[i])
 
                 timeout_ms = max(1, round(timeout_s * 1000))
                 chan_label = i + 1
@@ -1189,8 +1513,10 @@ def main() -> None:
                         hold_timeout_after_id = None
                         set_live_channel_outputs(base_channel_outputs)
                         if pulse_status_now == PULSE_STATUS_TIMEOUT_RESTORED:
+                            mark_pulse_chart_restore(f"CH{chan_label} timeout restore")
                             status.set(f"CH{chan_label} hold timed out; channel restored.")
                         else:
+                            mark_pulse_chart_restore(f"CH{chan_label} hold end restore")
                             status.set(f"CH{chan_label} hold ended; channel restored.")
 
                     worker.submit(_task_read_pulse_status, run_max_count or 0, callback=cb)
@@ -1211,6 +1537,7 @@ def main() -> None:
                         return
                     cancel_hold_timeout()
                     set_live_channel_outputs(base_channel_outputs)
+                    mark_pulse_chart_restore(f"CH{chan_label} angle threshold restore")
                     status.set(f"CH{chan_label} hold ended on angle threshold; channel restored.")
 
                 def schedule_angle_or_timeout_check() -> None:
@@ -1256,6 +1583,7 @@ def main() -> None:
                     return
                 cancel_hold_timeout()
                 set_live_channel_outputs(base_channel_outputs)
+                mark_pulse_chart_restore(f"CH{i + 1} manual end restore")
                 status.set(f"CH{i + 1} hold ended; channel restored.")
 
             worker.submit(_task_hold_end, i, callback=on_hold_end_done)
@@ -1267,6 +1595,10 @@ def main() -> None:
         is_closing = True
         cancel_adjust_repeat()
         cancel_hold_timeout()
+        cancel_pulse_chart_finalize_timer()
+        if pulse_chart_active is not None:
+            mark_pulse_chart_restore("Application closing")
+            finalize_pulse_chart(force=True)
         if fc_poll_after_id is not None:
             try:
                 root.after_cancel(fc_poll_after_id)
