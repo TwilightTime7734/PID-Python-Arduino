@@ -11,7 +11,7 @@ import struct
 import time
 import io
 import tkinter as tk
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from collections.abc import Callable, Sequence
 from tkinter import messagebox
 
@@ -20,7 +20,7 @@ import threading
 import queue
 from serial.tools import list_ports
 
-from serialUSB.inav_serial_service import InavSerialService
+from serialUSB.inav_serial_service import AttitudeSample, InavSerialService
 
 READ = 0x03
 WRITE = 0x10
@@ -35,9 +35,9 @@ FC_DEVICE_ID = "USB\\VID_0483&PID_5740"
 FC_DEVICE_VID = 0x0483
 FC_DEVICE_PID = 0x5740
 FC_BAUD_DEFAULT = 115200
-CHANNEL_DEFAULTS = [1500, 1500, 1100, 1500]
+CHANNEL_DEFAULTS = [1500, 1500, 1200, 1500]
 OFFSET_DEFAULTS = [-4, -2, -3, 6]
-PULSE_TARGET_DEFAULTS = [1500, 1500, 1100, 1500]
+PULSE_TARGET_DEFAULTS = [1650, 1500, 1200, 1500]
 PULSE_DURATION_DEFAULTS = [1, 1, 1, 1]
 
 PAUSE_US = 300
@@ -60,8 +60,6 @@ ADJUST_REPEAT_INITIAL_MS = 800
 ADJUST_REPEAT_INTERVAL_MS = 94
 HOLD_TIMEOUT_POLL_MS = 20
 HOLD_ANGLE_CHECK_MS = 60
-PULSE_CHART_SETTLE_S = 1.5
-PULSE_CHART_MAX_POINTS = 900
 
 
 def crc16(data: bytes) -> int:
@@ -408,6 +406,276 @@ class ArtificialHorizon(tk.Canvas):
         self.coords(self._ground, x1, y1, x2, y2, gx2, gy2, gx1, gy1)
         self.coords(self._horizon_line, x1, y1, x2, y2)
 
+
+class AttitudeChartPanel:
+    def __init__(self, parent: tk.Misc) -> None:
+        self._view_window_seconds = ATTITUDE_CHART_VIEW_WINDOW_S
+        self._times: list[float] = []
+        self._rolls: list[float] = []
+        self._pitches: list[float] = []
+        self._start_time_s: float | None = None
+        self._last_draw_s = 0.0
+        self._view_start_s = 0.0
+        self._auto_follow = True
+        self._frozen = False
+
+        self._status = tk.StringVar(value="FC chart idle. Connect FC to stream roll/pitch.")
+        header = tk.Frame(parent)
+        header.pack(fill=tk.X, pady=(0, 4))
+        tk.Label(header, textvariable=self._status, anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._freeze_button = tk.Button(header, text="Freeze", width=8, command=self.toggle_freeze)
+        self._freeze_button.pack(side=tk.RIGHT, padx=(6, 0))
+        self._live_button = tk.Button(header, text="Live", width=8, command=self.jump_to_live)
+        self._live_button.pack(side=tk.RIGHT, padx=(6, 0))
+        self._clear_button = tk.Button(header, text="Clear", width=8, command=self.clear)
+        self._clear_button.pack(side=tk.RIGHT, padx=(6, 0))
+
+        self._canvas = None
+        self._axis = None
+        self._line_roll = None
+        self._line_pitch = None
+        self._x_scrollbar = None
+
+        try:
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+            from matplotlib.figure import Figure
+        except Exception as exc:
+            self._clear_button.config(state="disabled")
+            self._live_button.config(state="disabled")
+            self._freeze_button.config(state="disabled")
+            self._status.set("Chart unavailable: matplotlib is not available in this Python environment.")
+            tk.Label(
+                parent,
+                text=f"Matplotlib load error: {exc}",
+                fg="#8B1E1E",
+                anchor="w",
+                justify="left",
+            ).pack(fill=tk.X)
+            return
+
+        figure = Figure(figsize=(8.5, 2.8), dpi=100, facecolor="#172033")
+        axis = figure.add_subplot(111, facecolor="#111827")
+        line_roll, = axis.plot([], [], linewidth=1.8, color="#38bdf8", label="Roll")
+        line_pitch, = axis.plot([], [], linewidth=1.8, color="#34d399", label="Pitch")
+        axis.axhline(0.0, linewidth=1, alpha=0.65, color="#d1d5db", label="Baseline")
+        axis.axhline(LEVEL_DEADBAND_DEG, linestyle="--", linewidth=1.0, color="#f59e0b", label="+ Deadband")
+        axis.axhline(-LEVEL_DEADBAND_DEG, linestyle="--", linewidth=1.0, color="#f59e0b", label="- Deadband")
+        axis.set_title("Live FC Attitude (Roll/Pitch)", fontsize=10, color="#FDFDFD")
+        axis.set_xlabel("Time (s)", fontsize=8, color="#FDFDFD")
+        axis.set_ylabel("Angle (deg)", fontsize=8, color="#FDFDFD")
+        axis.tick_params(axis="both", labelsize=8, colors="#FDFDFD")
+        for spine in axis.spines.values():
+            spine.set_color("#374151")
+        axis.grid(True, alpha=0.35, color="#4b5563")
+        legend = axis.legend(loc="upper left", fontsize=7, ncol=2)
+        legend.get_frame().set_facecolor("#1f2937")
+        legend.get_frame().set_edgecolor("#374151")
+        for text in legend.get_texts():
+            text.set_color("#FDFDFD")
+        axis.set_xlim(0.0, self._view_window_seconds)
+        axis.set_ylim(-20.0, 20.0)
+
+        canvas = FigureCanvasTkAgg(figure, master=parent)
+        canvas_widget = canvas.get_tk_widget()
+        canvas_widget.configure(highlightthickness=0, bd=0)
+        canvas_widget.pack(fill=tk.BOTH, expand=True)
+
+        x_scrollbar = tk.Scrollbar(parent, orient="horizontal", command=self._on_scrollbar)
+        x_scrollbar.pack(fill=tk.X, pady=(4, 0))
+        x_scrollbar.set(0.0, 1.0)
+        canvas.draw_idle()
+
+        self._canvas = canvas
+        self._axis = axis
+        self._line_roll = line_roll
+        self._line_pitch = line_pitch
+        self._x_scrollbar = x_scrollbar
+
+    def clear(self, status_text: str | None = None) -> None:
+        self._times.clear()
+        self._rolls.clear()
+        self._pitches.clear()
+        self._start_time_s = None
+        self._last_draw_s = 0.0
+        self._view_start_s = 0.0
+        self._auto_follow = True
+        self._frozen = False
+        self._freeze_button.config(text="Freeze")
+        if status_text is not None:
+            self._status.set(status_text)
+        if self._axis is None or self._canvas is None or self._line_roll is None or self._line_pitch is None:
+            return
+        self._line_roll.set_data([], [])
+        self._line_pitch.set_data([], [])
+        self._axis.set_xlim(0.0, self._view_window_seconds)
+        self._axis.set_ylim(-20.0, 20.0)
+        self._update_scrollbar_thumb()
+        self._canvas.draw_idle()
+
+    def set_connection_state(self, connected: bool) -> None:
+        if self._axis is None:
+            return
+        if connected:
+            if not self._times:
+                self._status.set("FC connected. Waiting for first attitude sample...")
+            return
+        if self._times:
+            self._status.set("FC disconnected. Chart paused. Press Clear to reset.")
+        else:
+            self._status.set("FC chart idle. Connect FC to stream roll/pitch.")
+
+    def jump_to_live(self) -> None:
+        if not self._times:
+            return
+        self._auto_follow = True
+        self._view_start_s = self._max_view_start()
+        self._redraw(force=True)
+
+    def toggle_freeze(self) -> None:
+        if self._axis is None or self._canvas is None:
+            return
+        self._frozen = not self._frozen
+        if self._frozen:
+            self._freeze_button.config(text="Resume")
+            if self._times:
+                self._status.set("Chart frozen. Press Resume to continue updates.")
+            else:
+                self._status.set("Chart frozen. Waiting for first sample.")
+            return
+
+        self._freeze_button.config(text="Freeze")
+        self._redraw(force=True)
+
+    def _max_view_start(self) -> float:
+        if not self._times:
+            return 0.0
+        return max(0.0, self._times[-1] - self._view_window_seconds)
+
+    def _on_scrollbar(self, *args: str) -> None:
+        if not self._times:
+            return
+
+        latest_time = self._times[-1]
+        max_start = self._max_view_start()
+        if max_start <= 0.0:
+            self._auto_follow = True
+            self._view_start_s = 0.0
+            self._redraw(force=True)
+            return
+
+        next_start = self._view_start_s
+        command = args[0] if args else ""
+        if command == "moveto" and len(args) >= 2:
+            try:
+                fraction = float(args[1])
+            except ValueError:
+                return
+            total_range = max(self._view_window_seconds, latest_time)
+            next_start = fraction * total_range
+        elif command == "scroll" and len(args) >= 3:
+            try:
+                steps = int(args[1])
+            except ValueError:
+                return
+            mode = args[2]
+            delta = self._view_window_seconds * 0.85 if mode == "pages" else ATTITUDE_CHART_SCROLL_UNIT_S
+            next_start += steps * delta
+        else:
+            return
+
+        next_start = max(0.0, min(max_start, next_start))
+        self._view_start_s = next_start
+        self._auto_follow = next_start >= (max_start - 1e-6)
+        self._redraw(force=True)
+
+    def _update_scrollbar_thumb(self) -> None:
+        if self._x_scrollbar is None:
+            return
+        if not self._times:
+            self._x_scrollbar.set(0.0, 1.0)
+            return
+
+        latest_time = self._times[-1]
+        if latest_time <= self._view_window_seconds:
+            self._x_scrollbar.set(0.0, 1.0)
+            return
+
+        total_range = latest_time
+        lo = max(0.0, min(1.0, self._view_start_s / total_range))
+        hi = max(lo, min(1.0, (self._view_start_s + self._view_window_seconds) / total_range))
+        self._x_scrollbar.set(lo, hi)
+
+    def _redraw(self, force: bool = False) -> None:
+        if self._axis is None or self._canvas is None or self._line_roll is None or self._line_pitch is None:
+            return
+
+        now = time.monotonic()
+        if not force and (now - self._last_draw_s < ATTITUDE_CHART_DRAW_INTERVAL_S):
+            return
+        self._last_draw_s = now
+
+        if not self._times:
+            self._line_roll.set_data([], [])
+            self._line_pitch.set_data([], [])
+            self._axis.set_xlim(0.0, self._view_window_seconds)
+            self._axis.set_ylim(-20.0, 20.0)
+            self._update_scrollbar_thumb()
+            self._canvas.draw_idle()
+            return
+
+        if self._auto_follow:
+            self._view_start_s = self._max_view_start()
+
+        view_end_s = self._view_start_s + self._view_window_seconds
+        left = bisect_left(self._times, self._view_start_s)
+        right = bisect_right(self._times, view_end_s)
+        if left > 0:
+            left -= 1
+        if right < len(self._times):
+            right += 1
+
+        x_values = self._times[left:right]
+        roll_values = self._rolls[left:right]
+        pitch_values = self._pitches[left:right]
+        self._line_roll.set_data(x_values, roll_values)
+        self._line_pitch.set_data(x_values, pitch_values)
+
+        visible_values = roll_values + pitch_values
+        max_abs = max(abs(v) for v in visible_values) if visible_values else 0.0
+        y_limit = max(10.0, LEVEL_DEADBAND_DEG + 2.0, max_abs + 2.0)
+        self._axis.set_xlim(self._view_start_s, max(view_end_s, self._view_start_s + 0.1))
+        self._axis.set_ylim(-y_limit, y_limit)
+
+        self._update_scrollbar_thumb()
+        self._canvas.draw_idle()
+
+        latest_roll = self._rolls[-1]
+        latest_pitch = self._pitches[-1]
+        if self._auto_follow:
+            self._status.set(
+                f"Live FC chart: Roll {latest_roll:+5.1f} deg, Pitch {latest_pitch:+5.1f} deg (t={self._times[-1]:.1f}s)"
+            )
+        else:
+            self._status.set(
+                f"History view {self._view_start_s:.1f}s to {view_end_s:.1f}s. Last sample Roll {latest_roll:+5.1f}, Pitch {latest_pitch:+5.1f}."
+            )
+
+    def add_sample(self, sample: AttitudeSample) -> None:
+        if self._axis is None or self._canvas is None or self._line_roll is None or self._line_pitch is None:
+            return
+        sample_time = time.monotonic()
+        if self._start_time_s is None:
+            self._start_time_s = sample_time
+        t_s = sample_time - self._start_time_s
+
+        self._times.append(t_s)
+        self._rolls.append(sample.roll_deg)
+        self._pitches.append(sample.pitch_deg)
+        if self._frozen:
+            return
+        self._redraw()
+
+
 @dataclass
 class MainUi:
     port_entry: tk.Entry
@@ -424,6 +692,7 @@ class MainUi:
     hold_end_buttons: list[tk.Button]
     start_button: tk.Button
     stop_button: tk.Button
+    level_button: tk.Button
     status: tk.StringVar
     pc_link_box: tk.Label
     horizon: ArtificialHorizon
@@ -434,23 +703,6 @@ class MainUi:
     scan_fc_button: tk.Button
     connect_fc_button: tk.Button
     disconnect_fc_button: tk.Button
-    chart_status: tk.StringVar
-    chart_strip_canvas: tk.Canvas
-    chart_strip_frame: tk.Frame
-
-
-@dataclass
-class PulseChartCapture:
-    axis: str
-    channel_index: int
-    target_us: int
-    reference_us: int
-    command_delta_us: int
-    timeout_s: float
-    start_monotonic: float
-    samples: list[tuple[float, float]] = field(default_factory=list)
-    restore_monotonic: float | None = None
-    restore_reason: str = ""
 
 
 def build_main_gui(root: tk.Tk) -> MainUi:
@@ -539,9 +791,9 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         button.grid(row=11, column=i + 1, pady=2)
         hold_end_buttons.append(button)
 
-    start_button = tk.Button(main_frame, text="Start", width=12)
+    start_button = tk.Button(root, text="Start", width=12)
     start_button.grid(row=12, column=1, columnspan=2, pady=4)
-    stop_button = tk.Button(main_frame, text="Stop", width=12)
+    stop_button = tk.Button(root, text="Stop", width=12)
     stop_button.grid(row=12, column=3, columnspan=2, pady=4)
 
     status = tk.StringVar(value="Idle")
@@ -626,6 +878,10 @@ def build_main_gui(root: tk.Tk) -> MainUi:
     disconnect_fc_button = tk.Button(fc_frame, text="Disconnect FC", width=12)
     disconnect_fc_button.grid(row=5, column=1, columnspan=2, pady=(2, 0))
 
+    chart_frame = tk.LabelFrame(root, text="FC Chart", padx=8, pady=8)
+    chart_frame.grid(row=15, column=0, columnspan=6, padx=6, pady=(0, 6), sticky="we")
+    attitude_chart = AttitudeChartPanel(chart_frame)
+
     return MainUi(
         port_entry=port_entry,
         channel_adjust_canvases=channel_adjust_canvases,
@@ -641,6 +897,7 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         hold_end_buttons=hold_end_buttons,
         start_button=start_button,
         stop_button=stop_button,
+        level_button=level_button,
         status=status,
         pc_link_box=pc_link_box,
         horizon=horizon,
@@ -651,9 +908,6 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         scan_fc_button=scan_fc_button,
         connect_fc_button=connect_fc_button,
         disconnect_fc_button=disconnect_fc_button,
-        chart_status=chart_status,
-        chart_strip_canvas=chart_strip_canvas,
-        chart_strip_frame=chart_strip_frame,
     )
 
 
@@ -674,6 +928,7 @@ def main() -> None:
     hold_end_buttons = ui.hold_end_buttons
     start_button = ui.start_button
     stop_button = ui.stop_button
+    level_button = ui.level_button
     status = ui.status
     pc_link_box = ui.pc_link_box
     horizon = ui.horizon
@@ -684,9 +939,6 @@ def main() -> None:
     scan_fc_button = ui.scan_fc_button
     connect_fc_button = ui.connect_fc_button
     disconnect_fc_button = ui.disconnect_fc_button
-    chart_status = ui.chart_status
-    chart_strip_canvas = ui.chart_strip_canvas
-    chart_strip_frame = ui.chart_strip_frame
 
     run_active = False
     start_pending = False
@@ -708,10 +960,6 @@ def main() -> None:
     worker = SerialWorker()
     fc_service = InavSerialService()
     fc_poll_after_id: str | None = None
-    pulse_chart_finalize_after_id: str | None = None
-    pulse_chart_active: PulseChartCapture | None = None
-    pulse_chart_photos: list[tk.PhotoImage] = []
-    pulse_chart_count = 0
 
     def port() -> str:
         return port_entry.get().strip() or PORT_DEFAULT
@@ -1202,6 +1450,11 @@ def main() -> None:
         angle_state = "normal" if fc_connected else "disabled"
         for entry in angle_entries:
             entry.config(state=angle_state)
+        level_ready = run_ser is not None and fc_connected
+        if level_active and not level_ready:
+            stop_level_loop(update_status=False)
+        level_button.config(state="normal" if level_ready else "disabled", relief="sunken" if level_active else "raised")
+        attitude_chart.set_connection_state(fc_connected)
 
     def cancel_hold_timeout() -> None:
         nonlocal hold_timeout_after_id
@@ -1212,6 +1465,154 @@ def main() -> None:
                 pass
             finally:
                 hold_timeout_after_id = None
+
+    def cancel_level_timer() -> None:
+        nonlocal level_after_id
+        if level_after_id is not None:
+            try:
+                root.after_cancel(level_after_id)
+            except Exception:
+                pass
+            finally:
+                level_after_id = None
+
+    def stop_level_loop(update_status: bool = False, reason: str = "Auto-level stopped.") -> None:
+        nonlocal level_active, level_pulse_inflight, level_timeout_deadline_s
+        was_active = level_active
+        cancel_level_timer()
+        level_active = False
+        level_pulse_inflight = False
+        level_timeout_deadline_s = None
+        if hold_timeout_after_id is None:
+            set_live_channel_outputs(base_channel_outputs)
+        update_link_indicators()
+        if update_status and was_active and not is_closing:
+            status.set(reason)
+
+    def level_target_from_angle(angle_deg: float) -> int | None:
+        abs_angle = abs(angle_deg)
+        if abs_angle <= LEVEL_DEADBAND_DEG:
+            return None
+        ratio = min(1.0, abs_angle / LEVEL_FULL_SCALE_DEG)
+        delta = max(LEVEL_MIN_DELTA_US, round(LEVEL_MAX_DELTA_US * ratio))
+        if angle_deg > 0:
+            return LEVEL_CENTER_US - delta
+        return LEVEL_CENTER_US + delta
+
+    def is_level_attitude_settled(roll_deg: float, pitch_deg: float) -> bool:
+        return abs(roll_deg) <= LEVEL_DEADBAND_DEG and abs(pitch_deg) <= LEVEL_DEADBAND_DEG
+
+    def schedule_level_step(delay_ms: int = LEVEL_LOOP_INTERVAL_MS) -> None:
+        nonlocal level_after_id
+        cancel_level_timer()
+        level_after_id = root.after(max(1, delay_ms), run_level_step)
+
+    def run_level_step() -> None:
+        nonlocal level_after_id, level_pulse_inflight
+        level_after_id = None
+        if not level_active:
+            return
+        if not run_active or run_ser is None:
+            stop_level_loop(update_status=True, reason="Auto-level stopped: output is not running.")
+            return
+        if not fc_service.is_connected:
+            stop_level_loop(update_status=True, reason="Auto-level stopped: FC is disconnected.")
+            return
+        if level_timeout_deadline_s is not None and time.monotonic() >= level_timeout_deadline_s:
+            stop_level_loop(update_status=True, reason=f"Auto-level timed out after {level_timeout_s:.3g}s.")
+            return
+        if hold_timeout_after_id is not None or level_pulse_inflight:
+            schedule_level_step()
+            return
+
+        sample = fc_service.latest_attitude()
+        if sample is None:
+            schedule_level_step()
+            return
+        if is_level_attitude_settled(sample.roll_deg, sample.pitch_deg):
+            stop_level_loop(update_status=True, reason="Auto-level complete: roll and pitch are centered.")
+            return
+
+        roll_target_us = level_target_from_angle(sample.roll_deg)
+        pitch_target_us = level_target_from_angle(sample.pitch_deg)
+        axis_targets: list[tuple[int, int, float]] = []
+        if roll_target_us is not None:
+            axis_targets.append((ROLL_CHANNEL_INDEX, roll_target_us, abs(sample.roll_deg)))
+        if pitch_target_us is not None:
+            axis_targets.append((PITCH_CHANNEL_INDEX, pitch_target_us, abs(sample.pitch_deg)))
+        if not axis_targets:
+            stop_level_loop(update_status=True, reason="Auto-level complete: roll and pitch are centered.")
+            return
+        channel_index, target_us, _ = max(axis_targets, key=lambda item: item[2])
+
+        try:
+            offsets = parse_entries(off_entries, int, "Offset")
+        except Exception as exc:
+            stop_level_loop(update_status=False)
+            set_error("Level error", exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
+            return
+
+        active_outputs = base_channel_outputs.copy()
+        active_outputs[channel_index] = target_us
+        set_live_channel_outputs(active_outputs)
+        level_pulse_inflight = True
+
+        def on_level_pulse_done(ok: bool, res: object) -> None:
+            nonlocal level_pulse_inflight
+            level_pulse_inflight = False
+            if not level_active:
+                return
+            if not ok:
+                stop_level_loop(update_status=False)
+                set_error("Level error", res if isinstance(res, Exception) else RuntimeError(res))
+                return
+            if not isinstance(res, int):
+                stop_level_loop(update_status=False)
+                set_error("Level error", RuntimeError("Unexpected worker result from level task"))
+                return
+            if res == PULSE_STATUS_REJECTED:
+                stop_level_loop(update_status=False)
+                set_error("Level error", RuntimeError("Firmware rejected auto-level pulse"))
+                return
+            schedule_level_step()
+
+        worker.submit(
+            _task_hold,
+            channel_index,
+            target_us,
+            offsets[channel_index],
+            LEVEL_PULSE_TIMEOUT_S,
+            callback=on_level_pulse_done,
+        )
+
+    def do_level() -> None:
+        nonlocal level_active, level_timeout_deadline_s, level_timeout_s
+        try:
+            if level_active:
+                stop_level_loop(update_status=True)
+                return
+            if not run_active or run_ser is None:
+                raise RuntimeError("Press Start before using Level.")
+            if not fc_service.is_connected:
+                raise RuntimeError("Connect FC before using Level.")
+            if hold_timeout_after_id is not None:
+                raise RuntimeError("Wait for active Hold to finish or press End/Stop.")
+            if fc_service.latest_attitude() is None:
+                raise RuntimeError("No FC attitude sample yet. Wait a moment, then press Level again.")
+            durations = parse_entries(dur_entries, float, "Duration")
+            level_timeout_s = max(durations[ROLL_CHANNEL_INDEX], durations[PITCH_CHANNEL_INDEX])
+            if level_timeout_s < LEVEL_TIMEOUT_MIN_S or level_timeout_s > LEVEL_TIMEOUT_MAX_S:
+                raise RuntimeError(
+                    f"Duration CH1/CH2 must be between {LEVEL_TIMEOUT_MIN_S:.3g}s and {LEVEL_TIMEOUT_MAX_S:.3g}s."
+                )
+            level_active = True
+            level_timeout_deadline_s = time.monotonic() + level_timeout_s
+            update_link_indicators()
+            status.set(f"Auto-level active ({level_timeout_s:.3g}s timeout). Press Level again to stop.")
+            run_level_step()
+        except Exception as exc:
+            stop_level_loop(update_status=False)
+            set_error("Level error", exc)
 
     def close_run_connection() -> None:
         nonlocal run_ser, run_quant, run_max_count, run_active
@@ -1241,6 +1642,7 @@ def main() -> None:
             selected_port = fc_port()
             selected_baud = fc_baud()
             fc_service.connect(selected_port, selected_baud)
+            attitude_chart.clear("FC connected. Waiting for first attitude sample...")
             update_link_indicators()
             status.set(f"FC connected: {selected_port} @ {selected_baud}.")
         except Exception as exc:
@@ -1253,11 +1655,9 @@ def main() -> None:
             if not is_closing:
                 set_error("FC disconnect error", exc)
         finally:
-            if pulse_chart_active is not None:
-                mark_pulse_chart_restore("FC disconnected")
-                finalize_pulse_chart(force=True)
             horizon.set_attitude(0.0, 0.0)
             attitude_text.set("Roll: 0.0 deg  Pitch: 0.0 deg  Yaw: 0")
+            attitude_chart.set_connection_state(False)
             update_link_indicators()
             if update_status and not is_closing:
                 status.set("FC disconnected.")
@@ -1272,6 +1672,7 @@ def main() -> None:
                 attitude_text.set(
                     f"Roll: {sample.roll_deg:6.1f} deg  Pitch: {sample.pitch_deg:6.1f} deg  Yaw: {sample.yaw_deg:6.0f}"
                 )
+                attitude_chart.add_sample(sample)
         except Exception:
             pass
         fc_poll_after_id = root.after(60, poll_fc_attitude)
@@ -1423,9 +1824,6 @@ def main() -> None:
     def do_stop() -> None:
         try:
             cancel_hold_timeout()
-            if pulse_chart_active is not None:
-                mark_pulse_chart_restore("Stop pressed")
-                finalize_pulse_chart(force=True)
             def on_stop_done(ok: bool, res: object) -> None:
                 nonlocal run_ser, run_quant, run_max_count, run_active
                 nonlocal channel_update_inflight, pending_channel_update_channels, pending_channel_update_offsets
@@ -1455,6 +1853,8 @@ def main() -> None:
         try:
             if not run_active or run_ser is None:
                 raise RuntimeError("Press Start before using Hold.")
+            if level_active:
+                stop_level_loop(update_status=False)
             if hold_timeout_after_id is not None:
                 raise RuntimeError("A hold command is already active. Wait for timeout or press End.")
 
@@ -1595,10 +1995,6 @@ def main() -> None:
         is_closing = True
         cancel_adjust_repeat()
         cancel_hold_timeout()
-        cancel_pulse_chart_finalize_timer()
-        if pulse_chart_active is not None:
-            mark_pulse_chart_restore("Application closing")
-            finalize_pulse_chart(force=True)
         if fc_poll_after_id is not None:
             try:
                 root.after_cancel(fc_poll_after_id)
@@ -1637,6 +2033,7 @@ def main() -> None:
         button.config(command=lambda i=i: do_hold_end(i))
     start_button.config(command=do_start)
     stop_button.config(command=do_stop)
+    level_button.config(command=do_level)
     for i, canvas in enumerate(channel_adjust_canvases):
         canvas.bind("<ButtonPress-1>", lambda event, i=i: on_adjust_press(adjust_channel_value, i, event))
         canvas.bind("<ButtonRelease-1>", on_adjust_release)
