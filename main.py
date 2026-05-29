@@ -34,9 +34,9 @@ FC_DEVICE_ID = "USB\\VID_0483&PID_5740"
 FC_DEVICE_VID = 0x0483
 FC_DEVICE_PID = 0x5740
 FC_BAUD_DEFAULT = 115200
-CHANNEL_DEFAULTS = [1500, 1500, 1100, 1500]
+CHANNEL_DEFAULTS = [1500, 1500, 1200, 1500]
 OFFSET_DEFAULTS = [-4, -2, -3, 6]
-PULSE_TARGET_DEFAULTS = [1500, 1500, 1100, 1500]
+PULSE_TARGET_DEFAULTS = [1650, 1500, 1200, 1500]
 PULSE_DURATION_DEFAULTS = [1, 1, 1, 1]
 
 PAUSE_US = 300
@@ -59,6 +59,17 @@ ADJUST_REPEAT_INITIAL_MS = 800
 ADJUST_REPEAT_INTERVAL_MS = 94
 HOLD_TIMEOUT_POLL_MS = 20
 HOLD_ANGLE_CHECK_MS = 60
+ROLL_CHANNEL_INDEX = 0
+PITCH_CHANNEL_INDEX = 1
+LEVEL_CENTER_US = 1500
+LEVEL_MAX_DELTA_US = 100
+LEVEL_MIN_DELTA_US = 5
+LEVEL_DEADBAND_DEG = 0.8
+LEVEL_FULL_SCALE_DEG = 20.0
+LEVEL_PULSE_TIMEOUT_S = 0.12
+LEVEL_LOOP_INTERVAL_MS = 120
+LEVEL_TIMEOUT_MIN_S = 0.05
+LEVEL_TIMEOUT_MAX_S = 60.0
 
 
 def crc16(data: bytes) -> int:
@@ -421,6 +432,7 @@ class MainUi:
     hold_end_buttons: list[tk.Button]
     start_button: tk.Button
     stop_button: tk.Button
+    level_button: tk.Button
     status: tk.StringVar
     pc_link_box: tk.Label
     horizon: ArtificialHorizon
@@ -514,10 +526,14 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         button.grid(row=11, column=i + 1, pady=2)
         hold_end_buttons.append(button)
 
-    start_button = tk.Button(root, text="Start", width=12)
-    start_button.grid(row=12, column=1, columnspan=2, pady=4)
-    stop_button = tk.Button(root, text="Stop", width=12)
-    stop_button.grid(row=12, column=3, columnspan=2, pady=4)
+    run_button_frame = tk.Frame(root)
+    run_button_frame.grid(row=12, column=1, columnspan=4, pady=4, sticky="w")
+    start_button = tk.Button(run_button_frame, text="Start", width=10)
+    start_button.grid(row=0, column=0, padx=(0, 6))
+    stop_button = tk.Button(run_button_frame, text="Stop", width=10)
+    stop_button.grid(row=0, column=1, padx=(0, 6))
+    level_button = tk.Button(run_button_frame, text="Level", width=10)
+    level_button.grid(row=0, column=2)
 
     status = tk.StringVar(value="Idle")
     tk.Label(root, textvariable=status, anchor="w").grid(row=13, column=0, columnspan=5, sticky="we", padx=6, pady=(0, 6))
@@ -570,6 +586,7 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         hold_end_buttons=hold_end_buttons,
         start_button=start_button,
         stop_button=stop_button,
+        level_button=level_button,
         status=status,
         pc_link_box=pc_link_box,
         horizon=horizon,
@@ -600,6 +617,7 @@ def main() -> None:
     hold_end_buttons = ui.hold_end_buttons
     start_button = ui.start_button
     stop_button = ui.stop_button
+    level_button = ui.level_button
     status = ui.status
     pc_link_box = ui.pc_link_box
     horizon = ui.horizon
@@ -631,6 +649,11 @@ def main() -> None:
     worker = SerialWorker()
     fc_service = InavSerialService()
     fc_poll_after_id: str | None = None
+    level_active = False
+    level_after_id: str | None = None
+    level_pulse_inflight = False
+    level_timeout_deadline_s: float | None = None
+    level_timeout_s = max(PULSE_DURATION_DEFAULTS[ROLL_CHANNEL_INDEX], PULSE_DURATION_DEFAULTS[PITCH_CHANNEL_INDEX])
 
     def port() -> str:
         return port_entry.get().strip() or PORT_DEFAULT
@@ -889,6 +912,10 @@ def main() -> None:
         angle_state = "normal" if fc_connected else "disabled"
         for entry in angle_entries:
             entry.config(state=angle_state)
+        level_ready = run_ser is not None and fc_connected
+        if level_active and not level_ready:
+            stop_level_loop(update_status=False)
+        level_button.config(state="normal" if level_ready else "disabled", relief="sunken" if level_active else "raised")
 
     def cancel_hold_timeout() -> None:
         nonlocal hold_timeout_after_id
@@ -899,6 +926,154 @@ def main() -> None:
                 pass
             finally:
                 hold_timeout_after_id = None
+
+    def cancel_level_timer() -> None:
+        nonlocal level_after_id
+        if level_after_id is not None:
+            try:
+                root.after_cancel(level_after_id)
+            except Exception:
+                pass
+            finally:
+                level_after_id = None
+
+    def stop_level_loop(update_status: bool = False, reason: str = "Auto-level stopped.") -> None:
+        nonlocal level_active, level_pulse_inflight, level_timeout_deadline_s
+        was_active = level_active
+        cancel_level_timer()
+        level_active = False
+        level_pulse_inflight = False
+        level_timeout_deadline_s = None
+        if hold_timeout_after_id is None:
+            set_live_channel_outputs(base_channel_outputs)
+        update_link_indicators()
+        if update_status and was_active and not is_closing:
+            status.set(reason)
+
+    def level_target_from_angle(angle_deg: float) -> int | None:
+        abs_angle = abs(angle_deg)
+        if abs_angle <= LEVEL_DEADBAND_DEG:
+            return None
+        ratio = min(1.0, abs_angle / LEVEL_FULL_SCALE_DEG)
+        delta = max(LEVEL_MIN_DELTA_US, round(LEVEL_MAX_DELTA_US * ratio))
+        if angle_deg > 0:
+            return LEVEL_CENTER_US - delta
+        return LEVEL_CENTER_US + delta
+
+    def is_level_attitude_settled(roll_deg: float, pitch_deg: float) -> bool:
+        return abs(roll_deg) <= LEVEL_DEADBAND_DEG and abs(pitch_deg) <= LEVEL_DEADBAND_DEG
+
+    def schedule_level_step(delay_ms: int = LEVEL_LOOP_INTERVAL_MS) -> None:
+        nonlocal level_after_id
+        cancel_level_timer()
+        level_after_id = root.after(max(1, delay_ms), run_level_step)
+
+    def run_level_step() -> None:
+        nonlocal level_after_id, level_pulse_inflight
+        level_after_id = None
+        if not level_active:
+            return
+        if not run_active or run_ser is None:
+            stop_level_loop(update_status=True, reason="Auto-level stopped: output is not running.")
+            return
+        if not fc_service.is_connected:
+            stop_level_loop(update_status=True, reason="Auto-level stopped: FC is disconnected.")
+            return
+        if level_timeout_deadline_s is not None and time.monotonic() >= level_timeout_deadline_s:
+            stop_level_loop(update_status=True, reason=f"Auto-level timed out after {level_timeout_s:.3g}s.")
+            return
+        if hold_timeout_after_id is not None or level_pulse_inflight:
+            schedule_level_step()
+            return
+
+        sample = fc_service.latest_attitude()
+        if sample is None:
+            schedule_level_step()
+            return
+        if is_level_attitude_settled(sample.roll_deg, sample.pitch_deg):
+            stop_level_loop(update_status=True, reason="Auto-level complete: roll and pitch are centered.")
+            return
+
+        roll_target_us = level_target_from_angle(sample.roll_deg)
+        pitch_target_us = level_target_from_angle(sample.pitch_deg)
+        axis_targets: list[tuple[int, int, float]] = []
+        if roll_target_us is not None:
+            axis_targets.append((ROLL_CHANNEL_INDEX, roll_target_us, abs(sample.roll_deg)))
+        if pitch_target_us is not None:
+            axis_targets.append((PITCH_CHANNEL_INDEX, pitch_target_us, abs(sample.pitch_deg)))
+        if not axis_targets:
+            stop_level_loop(update_status=True, reason="Auto-level complete: roll and pitch are centered.")
+            return
+        channel_index, target_us, _ = max(axis_targets, key=lambda item: item[2])
+
+        try:
+            offsets = parse_entries(off_entries, int, "Offset")
+        except Exception as exc:
+            stop_level_loop(update_status=False)
+            set_error("Level error", exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
+            return
+
+        active_outputs = base_channel_outputs.copy()
+        active_outputs[channel_index] = target_us
+        set_live_channel_outputs(active_outputs)
+        level_pulse_inflight = True
+
+        def on_level_pulse_done(ok: bool, res: object) -> None:
+            nonlocal level_pulse_inflight
+            level_pulse_inflight = False
+            if not level_active:
+                return
+            if not ok:
+                stop_level_loop(update_status=False)
+                set_error("Level error", res if isinstance(res, Exception) else RuntimeError(res))
+                return
+            if not isinstance(res, int):
+                stop_level_loop(update_status=False)
+                set_error("Level error", RuntimeError("Unexpected worker result from level task"))
+                return
+            if res == PULSE_STATUS_REJECTED:
+                stop_level_loop(update_status=False)
+                set_error("Level error", RuntimeError("Firmware rejected auto-level pulse"))
+                return
+            schedule_level_step()
+
+        worker.submit(
+            _task_hold,
+            channel_index,
+            target_us,
+            offsets[channel_index],
+            LEVEL_PULSE_TIMEOUT_S,
+            callback=on_level_pulse_done,
+        )
+
+    def do_level() -> None:
+        nonlocal level_active, level_timeout_deadline_s, level_timeout_s
+        try:
+            if level_active:
+                stop_level_loop(update_status=True)
+                return
+            if not run_active or run_ser is None:
+                raise RuntimeError("Press Start before using Level.")
+            if not fc_service.is_connected:
+                raise RuntimeError("Connect FC before using Level.")
+            if hold_timeout_after_id is not None:
+                raise RuntimeError("Wait for active Hold to finish or press End/Stop.")
+            if fc_service.latest_attitude() is None:
+                raise RuntimeError("No FC attitude sample yet. Wait a moment, then press Level again.")
+            durations = parse_entries(dur_entries, float, "Duration")
+            level_timeout_s = max(durations[ROLL_CHANNEL_INDEX], durations[PITCH_CHANNEL_INDEX])
+            if level_timeout_s < LEVEL_TIMEOUT_MIN_S or level_timeout_s > LEVEL_TIMEOUT_MAX_S:
+                raise RuntimeError(
+                    f"Duration CH1/CH2 must be between {LEVEL_TIMEOUT_MIN_S:.3g}s and {LEVEL_TIMEOUT_MAX_S:.3g}s."
+                )
+            level_active = True
+            level_timeout_deadline_s = time.monotonic() + level_timeout_s
+            update_link_indicators()
+            status.set(f"Auto-level active ({level_timeout_s:.3g}s timeout). Press Level again to stop.")
+            run_level_step()
+        except Exception as exc:
+            stop_level_loop(update_status=False)
+            set_error("Level error", exc)
 
     def close_run_connection() -> None:
         nonlocal run_ser, run_quant, run_max_count, run_active
@@ -937,6 +1112,7 @@ def main() -> None:
             if not is_closing:
                 set_error("FC disconnect error", exc)
         finally:
+            stop_level_loop(update_status=False)
             horizon.set_attitude(0.0, 0.0)
             attitude_text.set("Roll: 0.0 deg  Pitch: 0.0 deg  Yaw: 0")
             update_link_indicators()
@@ -1103,6 +1279,7 @@ def main() -> None:
     def do_stop() -> None:
         try:
             cancel_hold_timeout()
+            stop_level_loop(update_status=False)
             def on_stop_done(ok: bool, res: object) -> None:
                 nonlocal run_ser, run_quant, run_max_count, run_active
                 nonlocal channel_update_inflight, pending_channel_update_channels, pending_channel_update_offsets
@@ -1132,6 +1309,8 @@ def main() -> None:
         try:
             if not run_active or run_ser is None:
                 raise RuntimeError("Press Start before using Hold.")
+            if level_active:
+                stop_level_loop(update_status=False)
             if hold_timeout_after_id is not None:
                 raise RuntimeError("A hold command is already active. Wait for timeout or press End.")
 
@@ -1267,6 +1446,7 @@ def main() -> None:
         is_closing = True
         cancel_adjust_repeat()
         cancel_hold_timeout()
+        stop_level_loop(update_status=False)
         if fc_poll_after_id is not None:
             try:
                 root.after_cancel(fc_poll_after_id)
@@ -1305,6 +1485,7 @@ def main() -> None:
         button.config(command=lambda i=i: do_hold_end(i))
     start_button.config(command=do_start)
     stop_button.config(command=do_stop)
+    level_button.config(command=do_level)
     for i, canvas in enumerate(channel_adjust_canvases):
         canvas.bind("<ButtonPress-1>", lambda event, i=i: on_adjust_press(adjust_channel_value, i, event))
         canvas.bind("<ButtonRelease-1>", on_adjust_release)
