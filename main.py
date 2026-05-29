@@ -10,6 +10,7 @@ import math
 import struct
 import time
 import tkinter as tk
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from collections.abc import Callable, Sequence
 from tkinter import messagebox
@@ -19,7 +20,7 @@ import threading
 import queue
 from serial.tools import list_ports
 
-from serialUSB.inav_serial_service import InavSerialService
+from serialUSB.inav_serial_service import AttitudeSample, InavSerialService
 
 READ = 0x03
 WRITE = 0x10
@@ -70,6 +71,9 @@ LEVEL_PULSE_TIMEOUT_S = 0.12
 LEVEL_LOOP_INTERVAL_MS = 120
 LEVEL_TIMEOUT_MIN_S = 0.05
 LEVEL_TIMEOUT_MAX_S = 60.0
+ATTITUDE_CHART_VIEW_WINDOW_S = 12.0
+ATTITUDE_CHART_DRAW_INTERVAL_S = 0.1
+ATTITUDE_CHART_SCROLL_UNIT_S = 0.5
 
 
 def crc16(data: bytes) -> int:
@@ -416,6 +420,276 @@ class ArtificialHorizon(tk.Canvas):
         self.coords(self._ground, x1, y1, x2, y2, gx2, gy2, gx1, gy1)
         self.coords(self._horizon_line, x1, y1, x2, y2)
 
+
+class AttitudeChartPanel:
+    def __init__(self, parent: tk.Misc) -> None:
+        self._view_window_seconds = ATTITUDE_CHART_VIEW_WINDOW_S
+        self._times: list[float] = []
+        self._rolls: list[float] = []
+        self._pitches: list[float] = []
+        self._start_time_s: float | None = None
+        self._last_draw_s = 0.0
+        self._view_start_s = 0.0
+        self._auto_follow = True
+        self._frozen = False
+
+        self._status = tk.StringVar(value="FC chart idle. Connect FC to stream roll/pitch.")
+        header = tk.Frame(parent)
+        header.pack(fill=tk.X, pady=(0, 4))
+        tk.Label(header, textvariable=self._status, anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._freeze_button = tk.Button(header, text="Freeze", width=8, command=self.toggle_freeze)
+        self._freeze_button.pack(side=tk.RIGHT, padx=(6, 0))
+        self._live_button = tk.Button(header, text="Live", width=8, command=self.jump_to_live)
+        self._live_button.pack(side=tk.RIGHT, padx=(6, 0))
+        self._clear_button = tk.Button(header, text="Clear", width=8, command=self.clear)
+        self._clear_button.pack(side=tk.RIGHT, padx=(6, 0))
+
+        self._canvas = None
+        self._axis = None
+        self._line_roll = None
+        self._line_pitch = None
+        self._x_scrollbar = None
+
+        try:
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+            from matplotlib.figure import Figure
+        except Exception as exc:
+            self._clear_button.config(state="disabled")
+            self._live_button.config(state="disabled")
+            self._freeze_button.config(state="disabled")
+            self._status.set("Chart unavailable: matplotlib is not available in this Python environment.")
+            tk.Label(
+                parent,
+                text=f"Matplotlib load error: {exc}",
+                fg="#8B1E1E",
+                anchor="w",
+                justify="left",
+            ).pack(fill=tk.X)
+            return
+
+        figure = Figure(figsize=(8.5, 2.8), dpi=100, facecolor="#172033")
+        axis = figure.add_subplot(111, facecolor="#111827")
+        line_roll, = axis.plot([], [], linewidth=1.8, color="#38bdf8", label="Roll")
+        line_pitch, = axis.plot([], [], linewidth=1.8, color="#34d399", label="Pitch")
+        axis.axhline(0.0, linewidth=1, alpha=0.65, color="#d1d5db", label="Baseline")
+        axis.axhline(LEVEL_DEADBAND_DEG, linestyle="--", linewidth=1.0, color="#f59e0b", label="+ Deadband")
+        axis.axhline(-LEVEL_DEADBAND_DEG, linestyle="--", linewidth=1.0, color="#f59e0b", label="- Deadband")
+        axis.set_title("Live FC Attitude (Roll/Pitch)", fontsize=10, color="#FDFDFD")
+        axis.set_xlabel("Time (s)", fontsize=8, color="#FDFDFD")
+        axis.set_ylabel("Angle (deg)", fontsize=8, color="#FDFDFD")
+        axis.tick_params(axis="both", labelsize=8, colors="#FDFDFD")
+        for spine in axis.spines.values():
+            spine.set_color("#374151")
+        axis.grid(True, alpha=0.35, color="#4b5563")
+        legend = axis.legend(loc="upper left", fontsize=7, ncol=2)
+        legend.get_frame().set_facecolor("#1f2937")
+        legend.get_frame().set_edgecolor("#374151")
+        for text in legend.get_texts():
+            text.set_color("#FDFDFD")
+        axis.set_xlim(0.0, self._view_window_seconds)
+        axis.set_ylim(-20.0, 20.0)
+
+        canvas = FigureCanvasTkAgg(figure, master=parent)
+        canvas_widget = canvas.get_tk_widget()
+        canvas_widget.configure(highlightthickness=0, bd=0)
+        canvas_widget.pack(fill=tk.BOTH, expand=True)
+
+        x_scrollbar = tk.Scrollbar(parent, orient="horizontal", command=self._on_scrollbar)
+        x_scrollbar.pack(fill=tk.X, pady=(4, 0))
+        x_scrollbar.set(0.0, 1.0)
+        canvas.draw_idle()
+
+        self._canvas = canvas
+        self._axis = axis
+        self._line_roll = line_roll
+        self._line_pitch = line_pitch
+        self._x_scrollbar = x_scrollbar
+
+    def clear(self, status_text: str | None = None) -> None:
+        self._times.clear()
+        self._rolls.clear()
+        self._pitches.clear()
+        self._start_time_s = None
+        self._last_draw_s = 0.0
+        self._view_start_s = 0.0
+        self._auto_follow = True
+        self._frozen = False
+        self._freeze_button.config(text="Freeze")
+        if status_text is not None:
+            self._status.set(status_text)
+        if self._axis is None or self._canvas is None or self._line_roll is None or self._line_pitch is None:
+            return
+        self._line_roll.set_data([], [])
+        self._line_pitch.set_data([], [])
+        self._axis.set_xlim(0.0, self._view_window_seconds)
+        self._axis.set_ylim(-20.0, 20.0)
+        self._update_scrollbar_thumb()
+        self._canvas.draw_idle()
+
+    def set_connection_state(self, connected: bool) -> None:
+        if self._axis is None:
+            return
+        if connected:
+            if not self._times:
+                self._status.set("FC connected. Waiting for first attitude sample...")
+            return
+        if self._times:
+            self._status.set("FC disconnected. Chart paused. Press Clear to reset.")
+        else:
+            self._status.set("FC chart idle. Connect FC to stream roll/pitch.")
+
+    def jump_to_live(self) -> None:
+        if not self._times:
+            return
+        self._auto_follow = True
+        self._view_start_s = self._max_view_start()
+        self._redraw(force=True)
+
+    def toggle_freeze(self) -> None:
+        if self._axis is None or self._canvas is None:
+            return
+        self._frozen = not self._frozen
+        if self._frozen:
+            self._freeze_button.config(text="Resume")
+            if self._times:
+                self._status.set("Chart frozen. Press Resume to continue updates.")
+            else:
+                self._status.set("Chart frozen. Waiting for first sample.")
+            return
+
+        self._freeze_button.config(text="Freeze")
+        self._redraw(force=True)
+
+    def _max_view_start(self) -> float:
+        if not self._times:
+            return 0.0
+        return max(0.0, self._times[-1] - self._view_window_seconds)
+
+    def _on_scrollbar(self, *args: str) -> None:
+        if not self._times:
+            return
+
+        latest_time = self._times[-1]
+        max_start = self._max_view_start()
+        if max_start <= 0.0:
+            self._auto_follow = True
+            self._view_start_s = 0.0
+            self._redraw(force=True)
+            return
+
+        next_start = self._view_start_s
+        command = args[0] if args else ""
+        if command == "moveto" and len(args) >= 2:
+            try:
+                fraction = float(args[1])
+            except ValueError:
+                return
+            total_range = max(self._view_window_seconds, latest_time)
+            next_start = fraction * total_range
+        elif command == "scroll" and len(args) >= 3:
+            try:
+                steps = int(args[1])
+            except ValueError:
+                return
+            mode = args[2]
+            delta = self._view_window_seconds * 0.85 if mode == "pages" else ATTITUDE_CHART_SCROLL_UNIT_S
+            next_start += steps * delta
+        else:
+            return
+
+        next_start = max(0.0, min(max_start, next_start))
+        self._view_start_s = next_start
+        self._auto_follow = next_start >= (max_start - 1e-6)
+        self._redraw(force=True)
+
+    def _update_scrollbar_thumb(self) -> None:
+        if self._x_scrollbar is None:
+            return
+        if not self._times:
+            self._x_scrollbar.set(0.0, 1.0)
+            return
+
+        latest_time = self._times[-1]
+        if latest_time <= self._view_window_seconds:
+            self._x_scrollbar.set(0.0, 1.0)
+            return
+
+        total_range = latest_time
+        lo = max(0.0, min(1.0, self._view_start_s / total_range))
+        hi = max(lo, min(1.0, (self._view_start_s + self._view_window_seconds) / total_range))
+        self._x_scrollbar.set(lo, hi)
+
+    def _redraw(self, force: bool = False) -> None:
+        if self._axis is None or self._canvas is None or self._line_roll is None or self._line_pitch is None:
+            return
+
+        now = time.monotonic()
+        if not force and (now - self._last_draw_s < ATTITUDE_CHART_DRAW_INTERVAL_S):
+            return
+        self._last_draw_s = now
+
+        if not self._times:
+            self._line_roll.set_data([], [])
+            self._line_pitch.set_data([], [])
+            self._axis.set_xlim(0.0, self._view_window_seconds)
+            self._axis.set_ylim(-20.0, 20.0)
+            self._update_scrollbar_thumb()
+            self._canvas.draw_idle()
+            return
+
+        if self._auto_follow:
+            self._view_start_s = self._max_view_start()
+
+        view_end_s = self._view_start_s + self._view_window_seconds
+        left = bisect_left(self._times, self._view_start_s)
+        right = bisect_right(self._times, view_end_s)
+        if left > 0:
+            left -= 1
+        if right < len(self._times):
+            right += 1
+
+        x_values = self._times[left:right]
+        roll_values = self._rolls[left:right]
+        pitch_values = self._pitches[left:right]
+        self._line_roll.set_data(x_values, roll_values)
+        self._line_pitch.set_data(x_values, pitch_values)
+
+        visible_values = roll_values + pitch_values
+        max_abs = max(abs(v) for v in visible_values) if visible_values else 0.0
+        y_limit = max(10.0, LEVEL_DEADBAND_DEG + 2.0, max_abs + 2.0)
+        self._axis.set_xlim(self._view_start_s, max(view_end_s, self._view_start_s + 0.1))
+        self._axis.set_ylim(-y_limit, y_limit)
+
+        self._update_scrollbar_thumb()
+        self._canvas.draw_idle()
+
+        latest_roll = self._rolls[-1]
+        latest_pitch = self._pitches[-1]
+        if self._auto_follow:
+            self._status.set(
+                f"Live FC chart: Roll {latest_roll:+5.1f} deg, Pitch {latest_pitch:+5.1f} deg (t={self._times[-1]:.1f}s)"
+            )
+        else:
+            self._status.set(
+                f"History view {self._view_start_s:.1f}s to {view_end_s:.1f}s. Last sample Roll {latest_roll:+5.1f}, Pitch {latest_pitch:+5.1f}."
+            )
+
+    def add_sample(self, sample: AttitudeSample) -> None:
+        if self._axis is None or self._canvas is None or self._line_roll is None or self._line_pitch is None:
+            return
+        sample_time = time.monotonic()
+        if self._start_time_s is None:
+            self._start_time_s = sample_time
+        t_s = sample_time - self._start_time_s
+
+        self._times.append(t_s)
+        self._rolls.append(sample.roll_deg)
+        self._pitches.append(sample.pitch_deg)
+        if self._frozen:
+            return
+        self._redraw()
+
+
 @dataclass
 class MainUi:
     port_entry: tk.Entry
@@ -443,6 +717,7 @@ class MainUi:
     scan_fc_button: tk.Button
     connect_fc_button: tk.Button
     disconnect_fc_button: tk.Button
+    attitude_chart: AttitudeChartPanel
 
 
 def build_main_gui(root: tk.Tk) -> MainUi:
@@ -571,6 +846,10 @@ def build_main_gui(root: tk.Tk) -> MainUi:
     disconnect_fc_button = tk.Button(fc_frame, text="Disconnect FC", width=12)
     disconnect_fc_button.grid(row=5, column=1, columnspan=2, pady=(2, 0))
 
+    chart_frame = tk.LabelFrame(root, text="FC Chart", padx=8, pady=8)
+    chart_frame.grid(row=15, column=0, columnspan=6, padx=6, pady=(0, 6), sticky="we")
+    attitude_chart = AttitudeChartPanel(chart_frame)
+
     return MainUi(
         port_entry=port_entry,
         channel_adjust_canvases=channel_adjust_canvases,
@@ -597,6 +876,7 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         scan_fc_button=scan_fc_button,
         connect_fc_button=connect_fc_button,
         disconnect_fc_button=disconnect_fc_button,
+        attitude_chart=attitude_chart,
     )
 
 
@@ -628,6 +908,7 @@ def main() -> None:
     scan_fc_button = ui.scan_fc_button
     connect_fc_button = ui.connect_fc_button
     disconnect_fc_button = ui.disconnect_fc_button
+    attitude_chart = ui.attitude_chart
 
     run_active = False
     start_pending = False
@@ -916,6 +1197,7 @@ def main() -> None:
         if level_active and not level_ready:
             stop_level_loop(update_status=False)
         level_button.config(state="normal" if level_ready else "disabled", relief="sunken" if level_active else "raised")
+        attitude_chart.set_connection_state(fc_connected)
 
     def cancel_hold_timeout() -> None:
         nonlocal hold_timeout_after_id
@@ -1100,6 +1382,7 @@ def main() -> None:
             selected_port = fc_port()
             selected_baud = fc_baud()
             fc_service.connect(selected_port, selected_baud)
+            attitude_chart.clear("FC connected. Waiting for first attitude sample...")
             update_link_indicators()
             status.set(f"FC connected: {selected_port} @ {selected_baud}.")
         except Exception as exc:
@@ -1115,6 +1398,7 @@ def main() -> None:
             stop_level_loop(update_status=False)
             horizon.set_attitude(0.0, 0.0)
             attitude_text.set("Roll: 0.0 deg  Pitch: 0.0 deg  Yaw: 0")
+            attitude_chart.set_connection_state(False)
             update_link_indicators()
             if update_status and not is_closing:
                 status.set("FC disconnected.")
@@ -1128,6 +1412,7 @@ def main() -> None:
                 attitude_text.set(
                     f"Roll: {sample.roll_deg:6.1f} deg  Pitch: {sample.pitch_deg:6.1f} deg  Yaw: {sample.yaw_deg:6.0f}"
                 )
+                attitude_chart.add_sample(sample)
         except Exception:
             pass
         fc_poll_after_id = root.after(60, poll_fc_attitude)
