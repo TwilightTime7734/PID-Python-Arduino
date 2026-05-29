@@ -11,7 +11,8 @@ import struct
 import time
 import io
 import tkinter as tk
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Sequence
 from tkinter import messagebox
 
@@ -60,6 +61,23 @@ ADJUST_REPEAT_INITIAL_MS = 800
 ADJUST_REPEAT_INTERVAL_MS = 94
 HOLD_TIMEOUT_POLL_MS = 20
 HOLD_ANGLE_CHECK_MS = 60
+PULSE_CHART_SETTLE_S = 1.5
+PULSE_CHART_MAX_POINTS = 900
+
+ROLL_CHANNEL_INDEX = 0
+PITCH_CHANNEL_INDEX = 1
+LEVEL_CENTER_US = 1500
+LEVEL_DEADBAND_DEG = 2.0
+LEVEL_FULL_SCALE_DEG = 45.0
+LEVEL_MAX_DELTA_US = 350
+LEVEL_MIN_DELTA_US = 60
+LEVEL_LOOP_INTERVAL_MS = 80
+LEVEL_PULSE_TIMEOUT_S = 0.2
+LEVEL_TIMEOUT_MIN_S = 0.2
+LEVEL_TIMEOUT_MAX_S = 60.0
+ATTITUDE_CHART_VIEW_WINDOW_S = 12.0
+ATTITUDE_CHART_SCROLL_UNIT_S = 0.35
+ATTITUDE_CHART_DRAW_INTERVAL_S = 0.05
 
 
 def crc16(data: bytes) -> int:
@@ -703,6 +721,24 @@ class MainUi:
     scan_fc_button: tk.Button
     connect_fc_button: tk.Button
     disconnect_fc_button: tk.Button
+    chart_status: tk.StringVar
+    chart_strip_canvas: tk.Canvas
+    chart_strip_frame: tk.Frame
+    attitude_chart: AttitudeChartPanel
+
+
+@dataclass
+class PulseChartCapture:
+    axis: str
+    channel_index: int
+    target_us: int
+    reference_us: int
+    command_delta_us: int
+    timeout_s: float
+    start_monotonic: float
+    samples: list[tuple[float, float]] = field(default_factory=list)
+    restore_monotonic: float | None = None
+    restore_reason: str = ""
 
 
 def build_main_gui(root: tk.Tk) -> MainUi:
@@ -791,9 +827,11 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         button.grid(row=11, column=i + 1, pady=2)
         hold_end_buttons.append(button)
 
-    start_button = tk.Button(root, text="Start", width=12)
+    level_button = tk.Button(main_frame, text="Level", width=8, state="disabled")
+    level_button.grid(row=12, column=0, padx=4, pady=4)
+    start_button = tk.Button(main_frame, text="Start", width=12)
     start_button.grid(row=12, column=1, columnspan=2, pady=4)
-    stop_button = tk.Button(root, text="Stop", width=12)
+    stop_button = tk.Button(main_frame, text="Stop", width=12)
     stop_button.grid(row=12, column=3, columnspan=2, pady=4)
 
     status = tk.StringVar(value="Idle")
@@ -908,6 +946,10 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         scan_fc_button=scan_fc_button,
         connect_fc_button=connect_fc_button,
         disconnect_fc_button=disconnect_fc_button,
+        chart_status=chart_status,
+        chart_strip_canvas=chart_strip_canvas,
+        chart_strip_frame=chart_strip_frame,
+        attitude_chart=attitude_chart,
     )
 
 
@@ -939,6 +981,10 @@ def main() -> None:
     scan_fc_button = ui.scan_fc_button
     connect_fc_button = ui.connect_fc_button
     disconnect_fc_button = ui.disconnect_fc_button
+    chart_status = ui.chart_status
+    chart_strip_canvas = ui.chart_strip_canvas
+    chart_strip_frame = ui.chart_strip_frame
+    attitude_chart = ui.attitude_chart
 
     run_active = False
     start_pending = False
@@ -960,6 +1006,15 @@ def main() -> None:
     worker = SerialWorker()
     fc_service = InavSerialService()
     fc_poll_after_id: str | None = None
+    pulse_chart_finalize_after_id: str | None = None
+    pulse_chart_active: PulseChartCapture | None = None
+    pulse_chart_photos: list[tk.PhotoImage] = []
+    pulse_chart_count = 0
+    level_active = False
+    level_after_id: str | None = None
+    level_pulse_inflight = False
+    level_timeout_deadline_s: float | None = None
+    level_timeout_s = max(PULSE_DURATION_DEFAULTS[ROLL_CHANNEL_INDEX], PULSE_DURATION_DEFAULTS[PITCH_CHANNEL_INDEX])
 
     def port() -> str:
         return port_entry.get().strip() or PORT_DEFAULT
