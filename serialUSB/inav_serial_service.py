@@ -240,6 +240,8 @@ class InavSerialService:
         self._reader_thread: threading.Thread | None = None
         self._poll_thread: threading.Thread | None = None
         self._setting_index_cache: dict[str, int] = {}
+        self._port_name = ""
+        self._baud_rate = 115200
 
     @property
     def is_connected(self) -> bool:
@@ -248,21 +250,9 @@ class InavSerialService:
 
     def connect(self, port_name: str, baud_rate: int = 115200) -> None:
         self.disconnect()
-        ser = serial.Serial(
-            port=port_name,
-            baudrate=baud_rate,
-            bytesize=serial.EIGHTBITS,
-            parity=serial.PARITY_NONE,
-            stopbits=serial.STOPBITS_ONE,
-            timeout=0.1,
-            write_timeout=1.5,
-        )
-        ser.dtr = True
-        ser.rts = True
-        time.sleep(0.25)
-        ser.reset_input_buffer()
-        ser.reset_output_buffer()
-        time.sleep(0.1)
+        self._port_name = str(port_name).strip()
+        self._baud_rate = int(baud_rate)
+        ser = self._open_transport(self._port_name, self._baud_rate)
 
         self._stop_event.clear()
         with self._sync:
@@ -271,12 +261,21 @@ class InavSerialService:
             self._reader_thread = threading.Thread(target=self._read_loop, name="INAV-MSP-Reader", daemon=True)
             self._reader_thread.start()
 
-        time.sleep(0.2)
         try:
             self._probe_inav()
         except Exception:
-            self.disconnect()
-            raise
+            # Match Usb2Arduino behavior: recover once from transient USB/FC reset races.
+            try:
+                ser.reset_input_buffer()
+                ser.reset_output_buffer()
+            except Exception:
+                pass
+            time.sleep(0.12)
+            try:
+                self._probe_inav()
+            except Exception:
+                self.disconnect()
+                raise
 
         with self._sync:
             if self._poll_thread is None:
@@ -450,14 +449,14 @@ class InavSerialService:
         return request.response
 
     def _probe_inav(self) -> None:
-        variant_payload = self._request(MSP_FC_VARIANT, b"", 3.0)
+        variant_payload = self._request(MSP_FC_VARIANT, b"", 1.2)
         if len(variant_payload) < 4:
             raise RuntimeError("MSP did not return FC variant.")
         variant_text = variant_payload[:4].decode("ascii", errors="ignore").upper()
         if variant_text != "INAV":
             raise RuntimeError(f"MSP variant '{variant_text}' is not INAV.")
-        self._request(MSP_API_VERSION, b"", 2.0)
-        self._request(MSP_FC_VERSION, b"", 2.0)
+        self._request(MSP_API_VERSION, b"", 1.0)
+        self._request(MSP_FC_VERSION, b"", 1.0)
 
     def _attitude_poll_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -511,4 +510,22 @@ class InavSerialService:
             if optional:
                 return None
             raise RuntimeError("FC USB serial transport is not connected.")
+        return ser
+
+    def _open_transport(self, port_name: str, baud_rate: int) -> serial.Serial:
+        ser = serial.Serial(
+            port=port_name,
+            baudrate=baud_rate,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            timeout=0.2,
+            write_timeout=0.2,
+        )
+        time.sleep(0.15)
+        try:
+            ser.reset_input_buffer()
+            ser.reset_output_buffer()
+        except Exception:
+            pass
         return ser

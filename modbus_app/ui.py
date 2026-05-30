@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import time
 import tkinter as tk
+from tkinter import ttk
 from bisect import bisect_left, bisect_right
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -114,7 +115,7 @@ class ArtificialHorizon(tk.Canvas):
 
 
 class AttitudeChartPanel:
-    def __init__(self, parent: tk.Misc) -> None:
+    def __init__(self, parent: tk.Misc, figure_size: tuple[float, float] = (8.5, 2.8)) -> None:
         self._view_window_seconds = ATTITUDE_CHART_VIEW_WINDOW_S
         self._times: list[float] = []
         self._rolls: list[float] = []
@@ -159,7 +160,7 @@ class AttitudeChartPanel:
             ).pack(fill=tk.X)
             return
 
-        figure = Figure(figsize=(8.5, 2.8), dpi=100, facecolor="#172033")
+        figure = Figure(figsize=figure_size, dpi=100, facecolor="#172033")
         axis = figure.add_subplot(111, facecolor="#111827")
         line_roll, = axis.plot([], [], linewidth=1.8, color="#38bdf8", label="Roll")
         line_pitch, = axis.plot([], [], linewidth=1.8, color="#34d399", label="Pitch")
@@ -384,7 +385,7 @@ class AttitudeChartPanel:
 
 @dataclass
 class MainUi:
-    port_entry: tk.Entry
+    port_entry: tk.Entry | ttk.Combobox
     channel_adjust_canvases: list[tk.Canvas]
     target_adjust_canvases: list[tk.Canvas]
     ch_entries: list[tk.Entry]
@@ -405,7 +406,7 @@ class MainUi:
     roll_pidff_vars: list[tk.StringVar]
     pitch_pidff_vars: list[tk.StringVar]
     pid_ff_adjust_canvases: list[tk.Canvas]
-    fc_port_entry: tk.Entry
+    fc_port_entry: tk.Entry | ttk.Combobox
     fc_baud_entry: tk.Entry
     scan_fc_button: tk.Button
     connect_fc_button: tk.Button
@@ -436,8 +437,13 @@ def build_main_gui(root: tk.Tk) -> MainUi:
     for col in range(6):
         root.grid_columnconfigure(col, weight=1)
 
-    main_frame = tk.LabelFrame(root, text="Main Controls", padx=6, pady=4)
-    main_frame.grid(row=0, column=0, columnspan=5, padx=(6, 6), pady=6, sticky="nsew")
+    layout_grid = tk.Frame(root)
+    layout_grid.grid(row=0, column=0, columnspan=6, padx=6, pady=6, sticky="we")
+    layout_grid.grid_columnconfigure(0, weight=3)  # 60%
+    layout_grid.grid_columnconfigure(1, weight=2)  # 40%
+
+    main_frame = tk.LabelFrame(layout_grid, text="Main Controls", padx=6, pady=4)
+    main_frame.grid(row=0, column=0, padx=(0, 4), pady=(0, 6), sticky="nsew")
 
     for i, channel_name in enumerate(("Roll", "Pitch", "Throttle", "Yaw"), start=1):
         tk.Label(main_frame, text=channel_name).grid(row=1, column=i, padx=4)
@@ -497,7 +503,7 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         channel_output_canvases.append(canvas)
         channel_output_fill_ids.append(fill_id)
 
-    tk.Label(main_frame, text="Hold").grid(row=10, column=0, padx=6, pady=1, sticky="e")
+    tk.Label(main_frame, text="Pulse").grid(row=10, column=0, padx=6, pady=1, sticky="e")
     hold_send_canvases: list[tk.Canvas] = []
     for i in range(4):
         width = 52
@@ -522,12 +528,12 @@ def build_main_gui(root: tk.Tk) -> MainUi:
     status = tk.StringVar(value="Idle")
     pc_link_box = tk.Label(main_frame, width=18, relief="groove", bd=2)
 
-    charts_frame = tk.LabelFrame(root, text="Pulse Movement Charts", padx=6, pady=6)
-    charts_frame.grid(row=1, column=0, columnspan=6, padx=6, pady=(0, 6), sticky="we")
+    charts_frame = tk.LabelFrame(layout_grid, text="Pulse Movement Charts", padx=6, pady=6)
+    charts_frame.grid(row=1, column=0, padx=(0, 4), sticky="nsew")
     chart_status = tk.StringVar(
         value="Pulse Roll or Pitch to append charts here. Baseline is derived after neutral restore."
     )
-    tk.Label(charts_frame, textvariable=chart_status, justify="left", anchor="w", wraplength=940).pack(
+    tk.Label(charts_frame, textvariable=chart_status, justify="left", anchor="w", wraplength=540).pack(
         fill="x", pady=(0, 4)
     )
 
@@ -535,7 +541,7 @@ def build_main_gui(root: tk.Tk) -> MainUi:
     chart_shell.pack(fill="both", expand=True)
     chart_strip_canvas = tk.Canvas(
         chart_shell,
-        width=940,
+        width=560,
         height=268,
         bg="#F4F8FB",
         bd=0,
@@ -568,9 +574,9 @@ def build_main_gui(root: tk.Tk) -> MainUi:
     chart_strip_canvas.bind("<Configure>", keep_chart_strip_height)
     chart_strip_canvas.bind("<Shift-MouseWheel>", chart_mousewheel_horizontal)
 
-    fc_frame = tk.LabelFrame(root, text="FC / INAV", padx=8, pady=8)
-    fc_frame.grid(row=0, column=5, padx=(6, 6), pady=6, sticky="ns")
-    horizon = ArtificialHorizon(fc_frame, size=180)
+    fc_frame = tk.LabelFrame(layout_grid, text="FC / INAV", padx=8, pady=8)
+    fc_frame.grid(row=0, column=1, padx=(4, 0), pady=(0, 6), sticky="nsew")
+    horizon = ArtificialHorizon(fc_frame, size=220)
     roll_text = tk.StringVar(value="Roll: 0.0 deg")
     pitch_text = tk.StringVar(value="Pitch: 0.0 deg")
     pid_ff_labels = ("P", "I", "D", "FF")
@@ -578,7 +584,7 @@ def build_main_gui(root: tk.Tk) -> MainUi:
     pitch_pidff_vars: list[tk.StringVar] = []
     pid_ff_adjust_canvases: list[tk.Canvas] = []
     left_metrics_frame = tk.Frame(fc_frame, bd=1, relief="groove", padx=6, pady=6)
-    left_metrics_frame.grid(row=0, column=0, columnspan=2, sticky="nw", pady=(0, 8))
+    left_metrics_frame.grid(row=0, column=0, columnspan=2, sticky="nw", pady=(0, 6))
     tk.Label(left_metrics_frame, textvariable=roll_text, anchor="w", width=12).grid(
         row=0, column=0, columnspan=2, sticky="w", padx=(0, 6), pady=(0, 4)
     )
@@ -622,42 +628,47 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         pitch_pidff_vars.append(pitch_var)
         pid_ff_adjust_canvases.extend((roll_adjust, pitch_adjust))
 
-    horizon.grid(row=0, column=2, columnspan=2, padx=(8, 0), pady=(0, 8))
+    horizon.grid(row=0, column=2, rowspan=2, columnspan=2, padx=(10, 0), pady=(0, 4), sticky="n")
 
-    tk.Label(fc_frame, text="Arduino Port").grid(row=2, column=0, sticky="e", padx=(0, 4))
-    port_entry = tk.Entry(fc_frame, width=10)
-    port_entry.insert(0, PORT_DEFAULT)
-    port_entry.grid(row=2, column=1, sticky="w")
+    port_fields_frame = tk.Frame(fc_frame)
+    port_fields_frame.grid(row=1, column=0, columnspan=2, sticky="nw")
+    tk.Label(port_fields_frame, text="Arduino Port").grid(row=0, column=0, sticky="e", padx=(0, 4))
+    port_entry = ttk.Combobox(port_fields_frame, width=8, state="normal")
+    port_entry.set(PORT_DEFAULT)
+    port_entry.grid(row=0, column=1, sticky="w")
 
-    tk.Label(fc_frame, text="FC Port").grid(row=2, column=2, sticky="e", padx=(8, 4))
-    fc_port_entry = tk.Entry(fc_frame, width=10)
-    fc_port_entry.insert(0, FC_PORT_DEFAULT)
-    fc_port_entry.grid(row=2, column=3, sticky="w")
-
-    tk.Label(fc_frame, text="Baud").grid(row=3, column=0, sticky="e", padx=(0, 4), pady=(4, 0))
-    port_baud_entry = tk.Entry(fc_frame, width=10)
+    tk.Label(port_fields_frame, text="Baud").grid(row=0, column=2, sticky="e", padx=(8, 4))
+    port_baud_entry = tk.Entry(port_fields_frame, width=10)
     port_baud_entry.insert(0, str(BAUDRATE))
     port_baud_entry.config(state="readonly")
-    port_baud_entry.grid(row=3, column=1, sticky="w", pady=(4, 0))
+    port_baud_entry.grid(row=0, column=3, sticky="w")
 
-    tk.Label(fc_frame, text="Baud").grid(row=3, column=2, sticky="e", padx=(8, 4), pady=(4, 0))
-    fc_baud_entry = tk.Entry(fc_frame, width=10)
+    tk.Label(port_fields_frame, text="FC Port").grid(row=1, column=0, sticky="e", padx=(0, 4), pady=(4, 0))
+    fc_port_entry = ttk.Combobox(port_fields_frame, width=8, state="normal")
+    fc_port_entry.set(FC_PORT_DEFAULT)
+    fc_port_entry.grid(row=1, column=1, sticky="w", pady=(4, 0))
+
+    tk.Label(port_fields_frame, text="Baud").grid(row=1, column=2, sticky="e", padx=(8, 4), pady=(4, 0))
+    fc_baud_entry = tk.Entry(port_fields_frame, width=10)
     fc_baud_entry.insert(0, str(FC_BAUD_DEFAULT))
-    fc_baud_entry.grid(row=3, column=3, sticky="w", pady=(4, 0))
+    fc_baud_entry.grid(row=1, column=3, sticky="w", pady=(4, 0))
 
-    fc_button_width = 18
-    connect_fc_button = tk.Button(fc_frame, text="Connect FC", width=fc_button_width)
-    connect_fc_button.grid(row=4, column=0, padx=2, pady=(2, 0))
-    arduino_button = tk.Button(fc_frame, text="Connect Arduino", width=fc_button_width)
-    arduino_button.grid(row=4, column=1, padx=2, pady=(2, 0))
-    scan_fc_button = tk.Button(fc_frame, text="Scan Ports", width=10)
-    scan_fc_button.grid(row=4, column=2, padx=2, pady=(2, 0))
-    level_button = tk.Button(fc_frame, text="Level", width=6, state="disabled")
-    level_button.grid(row=4, column=3, padx=2, pady=(2, 0))
+    fc_button_width = 13
+    arduino_button_width = 18
+    button_row = tk.Frame(fc_frame)
+    button_row.grid(row=2, column=0, columnspan=4, sticky="w", pady=(2, 0))
+    arduino_button = tk.Button(button_row, text="Connect Arduino", width=arduino_button_width)
+    arduino_button.pack(side="left", padx=(0, 2))
+    connect_fc_button = tk.Button(button_row, text="Connect FC", width=fc_button_width)
+    connect_fc_button.pack(side="left", padx=(0, 2))
+    scan_fc_button = tk.Button(button_row, text="Scan Ports", width=10)
+    scan_fc_button.pack(side="left", padx=(0, 2))
+    level_button = tk.Button(button_row, text="Level", width=6, state="disabled")
+    level_button.pack(side="left")
 
-    chart_frame = tk.LabelFrame(root, text="FC Chart", padx=8, pady=8)
-    chart_frame.grid(row=15, column=0, columnspan=6, padx=6, pady=(0, 6), sticky="we")
-    attitude_chart = AttitudeChartPanel(chart_frame)
+    chart_frame = tk.LabelFrame(layout_grid, text="FC Chart", padx=8, pady=8)
+    chart_frame.grid(row=1, column=1, padx=(4, 0), sticky="nsew")
+    attitude_chart = AttitudeChartPanel(chart_frame, figure_size=(4.2, 2.8))
 
     return MainUi(
         port_entry=port_entry,

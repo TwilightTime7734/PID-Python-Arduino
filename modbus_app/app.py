@@ -57,6 +57,7 @@ from .serial_protocol import (
     read_pulse_status_on_serial,
     read_regs,
     run_ppm_on_serial,
+    set_channel_with_human_profile_until_stop_on_serial,
     set_channel_until_stop_on_serial,
     stop_ppm_on_serial,
 )
@@ -112,6 +113,7 @@ def main() -> None:
     run_quant: int | None = None
     run_max_count: int | None = None
     hold_timeout_after_id: str | None = None
+    hold_command_inflight = False
     channel_update_inflight = False
     pending_channel_update_channels: list[int] | None = None
     pending_channel_update_offsets: list[int] | None = None
@@ -209,6 +211,31 @@ def main() -> None:
             if update_status:
                 set_error("PID/FF read error", exc)
             return False
+
+    def queue_fc_pid_ff_refresh(connected_port: str, connected_baud: int) -> None:
+        if not fc_service.is_connected:
+            return
+
+        def on_pid_ff_read_done(ok: bool, res: object) -> None:
+            if not fc_service.is_connected:
+                return
+            if not ok:
+                clear_pid_ff_displays()
+                status.set(f"FC connected: {connected_port} @ {connected_baud}. PID/FF read failed.")
+                return
+            if (
+                not isinstance(res, tuple)
+                or len(res) != 2
+                or not isinstance(res[0], AxisPidFf)
+                or not isinstance(res[1], AxisPidFf)
+            ):
+                clear_pid_ff_displays()
+                status.set(f"FC connected: {connected_port} @ {connected_baud}. PID/FF read failed.")
+                return
+            set_pid_ff_displays(res[0], res[1])
+            status.set(f"FC connected: {connected_port} @ {connected_baud}. PID/FF loaded.")
+
+        worker.submit(_task_fc_read_pid_ff, callback=on_pid_ff_read_done)
 
     def blend_hex(start_hex: str, end_hex: str, amount: float) -> str:
         clamped = max(0.0, min(1.0, float(amount)))
@@ -668,20 +695,30 @@ def main() -> None:
                     return device
         return FC_PORT_DEFAULT
 
-    def scan_fc_ports() -> None:
+    def list_scanned_ports(port_infos: Sequence[object]) -> list[str]:
+        ports = [str(getattr(p, "device", "") or "").strip() for p in port_infos]
+        return [p for p in ports if p]
+
+    def populate_port_dropdowns(ports: Sequence[str]) -> None:
+        values = tuple(ports)
+        port_entry.config(values=values)
+        fc_port_entry.config(values=values)
+
+    def scan_fc_ports(update_status: bool = True) -> None:
         port_infos = sorted(
             list_ports.comports(),
             key=lambda p: str(getattr(p, "device", "") or "").upper(),
         )
-        ports = [str(getattr(p, "device", "") or "").strip() for p in port_infos]
-        ports = [p for p in ports if p]
+        ports = list_scanned_ports(port_infos)
+        populate_port_dropdowns(ports)
         selected_port = select_fc_port(port_infos)
         fc_port_entry.delete(0, tk.END)
         fc_port_entry.insert(0, selected_port)
-        if ports:
-            status.set(f"Detected ports: {', '.join(ports)}. FC port set to {selected_port}.")
-        else:
-            status.set(f"No serial ports detected. FC port set to {selected_port}.")
+        if update_status:
+            if ports:
+                status.set(f"Detected ports: {', '.join(ports)}. FC port set to {selected_port}.")
+            else:
+                status.set(f"No serial ports detected. FC port set to {selected_port}.")
 
     def set_error(title: str, exc: Exception) -> None:
         if is_closing:
@@ -889,6 +926,8 @@ def main() -> None:
                 raise RuntimeError("Press Connect Arduino before using Level.")
             if not fc_service.is_connected:
                 raise RuntimeError("Connect FC before using Level.")
+            if hold_command_inflight:
+                raise RuntimeError("Wait for active Pulse command to finish.")
             if hold_timeout_after_id is not None:
                 raise RuntimeError("Wait for active Hold to finish or press End/Stop.")
             if fc_service.latest_attitude() is None:
@@ -909,7 +948,7 @@ def main() -> None:
             set_error("Level error", exc)
 
     def close_run_connection() -> None:
-        nonlocal run_ser, run_quant, run_max_count, run_active
+        nonlocal run_ser, run_quant, run_max_count, run_active, hold_command_inflight
         nonlocal channel_update_inflight, pending_channel_update_channels, pending_channel_update_offsets
         if run_ser is not None:
             try:
@@ -924,6 +963,7 @@ def main() -> None:
                 run_quant = None
                 run_max_count = None
                 run_active = False
+                hold_command_inflight = False
                 channel_update_inflight = False
                 pending_channel_update_channels = None
                 pending_channel_update_offsets = None
@@ -936,10 +976,12 @@ def main() -> None:
             selected_port = fc_port()
             selected_baud = fc_baud()
             fc_service.connect(selected_port, selected_baud)
-            pid_status_note = "PID/FF loaded." if refresh_pid_ff_from_fc(update_status=False) else "PID/FF read failed."
+            # Mirror Usb2Arduino flow: verify telemetry immediately, then load PID/FF asynchronously.
+            _ = fc_service.read_attitude(timeout_seconds=2.0)
             attitude_chart.clear("FC connected. Waiting for first attitude sample...")
             update_link_indicators()
-            status.set(f"FC connected: {selected_port} @ {selected_baud}. {pid_status_note}")
+            status.set(f"FC connected: {selected_port} @ {selected_baud}. Loading PID/FF...")
+            queue_fc_pid_ff_refresh(selected_port, selected_baud)
         except Exception as exc:
             set_error("FC connect error", exc)
 
@@ -1020,6 +1062,34 @@ def main() -> None:
         set_channel_until_stop_on_serial(worker_self.ser, quant, max_count, i, target, offset, timeout_s)
         return read_pulse_status_on_serial(worker_self.ser, max_count)
 
+    def _task_fc_read_pid_ff(_worker_self: SerialWorker):
+        return fc_service.read_roll_pitch_pid_ff(timeout_seconds=1.2)
+
+    def _task_hold_humanized(
+        worker_self: SerialWorker,
+        i: int,
+        target: int,
+        offset: int,
+        timeout_s: float,
+        channels: list[int],
+        offsets: list[int],
+    ):
+        if worker_self.ser is None:
+            raise RuntimeError("Serial not open")
+        quant, max_count = read_regs(worker_self.ser, REG_QUANT, 2)
+        set_channel_with_human_profile_until_stop_on_serial(
+            worker_self.ser,
+            quant,
+            max_count,
+            channels,
+            offsets,
+            i,
+            target,
+            offset,
+            timeout_s,
+        )
+        return read_pulse_status_on_serial(worker_self.ser, max_count)
+
     def _task_hold_end(worker_self: SerialWorker, i: int):
         if worker_self.ser is None:
             raise RuntimeError("Serial not open")
@@ -1076,6 +1146,8 @@ def main() -> None:
         try:
             if start_pending:
                 raise RuntimeError("Start is already in progress.")
+            if hold_command_inflight:
+                raise RuntimeError("Wait for active Pulse command to finish.")
             if hold_timeout_after_id is not None:
                 raise RuntimeError("Wait for active Hold to finish or press End/Stop.")
             channels = parse_entries(ch_entries, int, "Channel")
@@ -1138,9 +1210,11 @@ def main() -> None:
 
     def do_stop() -> None:
         try:
+            if hold_command_inflight:
+                raise RuntimeError("Pulse command is in progress. Wait a moment, then try again.")
             cancel_hold_timeout()
             def on_stop_done(ok: bool, res: object) -> None:
-                nonlocal run_ser, run_quant, run_max_count, run_active
+                nonlocal run_ser, run_quant, run_max_count, run_active, hold_command_inflight
                 nonlocal channel_update_inflight, pending_channel_update_channels, pending_channel_update_offsets
                 if not ok:
                     set_error("Stop error", res if isinstance(res, Exception) else RuntimeError(res))
@@ -1152,6 +1226,7 @@ def main() -> None:
                 run_quant = None
                 run_max_count = None
                 run_active = False
+                hold_command_inflight = False
                 channel_update_inflight = False
                 pending_channel_update_channels = None
                 pending_channel_update_offsets = None
@@ -1164,12 +1239,14 @@ def main() -> None:
             set_error("Stop error", exc)
 
     def do_hold_send(i: int, direction: int) -> None:
-        nonlocal run_max_count, hold_timeout_after_id
+        nonlocal run_max_count, hold_timeout_after_id, hold_command_inflight
         try:
             if not run_active or run_ser is None:
                 raise RuntimeError("Press Connect Arduino before using Hold.")
             if level_active:
                 stop_level_loop(update_status=False)
+            if hold_command_inflight:
+                raise RuntimeError("A pulse command is already in progress.")
             if hold_timeout_after_id is not None:
                 raise RuntimeError("A hold command is already active. Wait for timeout or press End.")
 
@@ -1203,16 +1280,26 @@ def main() -> None:
                     if angle_magnitude > 0:
                         angle_threshold = float(signed_direction) * angle_magnitude
 
+            def restore_after_hold_failure() -> None:
+                if not run_active or run_ser is None:
+                    return
+                set_live_channel_outputs(base_channel_outputs)
+                queue_live_channel_update(base_channel_outputs.copy(), offsets.copy())
+
             def on_hold_done(ok: bool, res: object) -> None:
-                nonlocal hold_timeout_after_id, run_max_count
+                nonlocal hold_timeout_after_id, run_max_count, hold_command_inflight
+                hold_command_inflight = False
                 if not ok:
+                    restore_after_hold_failure()
                     set_error("Hold error", res if isinstance(res, Exception) else RuntimeError(res))
                     return
                 if not isinstance(res, int):
+                    restore_after_hold_failure()
                     set_error("Hold error", RuntimeError("Unexpected worker result from hold task"))
                     return
                 pulse_status = res
                 if pulse_status == PULSE_STATUS_REJECTED:
+                    restore_after_hold_failure()
                     set_error("Hold error", RuntimeError("Firmware rejected hold command"))
                     return
                 active_outputs = base_channel_outputs.copy()
@@ -1293,7 +1380,21 @@ def main() -> None:
                     f"Press End for early restore (auto in {timeout_s:.3g}s)."
                 )
 
-            worker.submit(_task_hold, i, pulse_target_us, offsets[i], timeout_s, callback=on_hold_done)
+            hold_command_inflight = True
+            try:
+                worker.submit(
+                    _task_hold_humanized,
+                    i,
+                    pulse_target_us,
+                    offsets[i],
+                    timeout_s,
+                    channels.copy(),
+                    offsets.copy(),
+                    callback=on_hold_done,
+                )
+            except Exception:
+                hold_command_inflight = False
+                raise
         except Exception as exc:
             set_error("Hold error", exc)
 
@@ -1301,6 +1402,8 @@ def main() -> None:
         try:
             if not run_active or run_ser is None:
                 raise RuntimeError("Press Connect Arduino before ending Hold.")
+            if hold_command_inflight:
+                raise RuntimeError("Pulse command is still ramping in. Wait a moment, then try End.")
             if hold_timeout_after_id is None:
                 raise RuntimeError("No active Hold to end.")
 
@@ -1350,12 +1453,7 @@ def main() -> None:
         except Exception:
             on_stop_and_close(False, None)
 
-    initial_port_infos = sorted(
-        list_ports.comports(),
-        key=lambda p: str(getattr(p, "device", "") or "").upper(),
-    )
-    fc_port_entry.delete(0, tk.END)
-    fc_port_entry.insert(0, select_fc_port(initial_port_infos))
+    scan_fc_ports(update_status=False)
 
     scan_fc_button.config(command=scan_fc_ports)
     connect_fc_button.config(command=do_fc_toggle)
