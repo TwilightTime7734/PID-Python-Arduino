@@ -13,6 +13,22 @@ MSP_API_VERSION = 1
 MSP_FC_VARIANT = 2
 MSP_FC_VERSION = 3
 MSP_ATTITUDE = 108
+MSP2_COMMON_SETTING = 0x1003
+MSP2_COMMON_SET_SETTING = 0x1004
+MSP2_COMMON_SETTING_INFO = 0x1007
+
+PID_SETTING_NAME = {
+    ("roll", "p"): "mc_p_roll",
+    ("roll", "i"): "mc_i_roll",
+    ("roll", "d"): "mc_d_roll",
+    ("pitch", "p"): "mc_p_pitch",
+    ("pitch", "i"): "mc_i_pitch",
+    ("pitch", "d"): "mc_d_pitch",
+}
+FF_SETTING_NAME = {
+    "roll": "mc_cd_roll",
+    "pitch": "mc_cd_pitch",
+}
 
 
 @dataclass(frozen=True)
@@ -21,6 +37,14 @@ class AttitudeSample:
     pitch_deg: float
     yaw_deg: float
     timestamp_local: datetime
+
+
+@dataclass(frozen=True)
+class AxisPidFf:
+    p: float
+    i: float
+    d: float
+    ff: float
 
 
 @dataclass
@@ -215,6 +239,7 @@ class InavSerialService:
         self._stop_event = threading.Event()
         self._reader_thread: threading.Thread | None = None
         self._poll_thread: threading.Thread | None = None
+        self._setting_index_cache: dict[str, int] = {}
 
     @property
     def is_connected(self) -> bool:
@@ -242,6 +267,7 @@ class InavSerialService:
         self._stop_event.clear()
         with self._sync:
             self._serial = ser
+            self._setting_index_cache.clear()
             self._reader_thread = threading.Thread(target=self._read_loop, name="INAV-MSP-Reader", daemon=True)
             self._reader_thread.start()
 
@@ -293,6 +319,8 @@ class InavSerialService:
 
         with self._attitude_sync:
             self._latest_attitude = None
+        with self._sync:
+            self._setting_index_cache.clear()
 
     def read_attitude(self, timeout_seconds: float = 1.0) -> AttitudeSample:
         with self._attitude_sync:
@@ -308,6 +336,78 @@ class InavSerialService:
     def latest_attitude(self) -> AttitudeSample | None:
         with self._attitude_sync:
             return self._latest_attitude
+
+    def read_roll_pitch_pid_ff(self, timeout_seconds: float = 1.0) -> tuple[AxisPidFf, AxisPidFf]:
+        roll = AxisPidFf(
+            p=float(self.get_setting_int(PID_SETTING_NAME[("roll", "p")], timeout_seconds)),
+            i=float(self.get_setting_int(PID_SETTING_NAME[("roll", "i")], timeout_seconds)),
+            d=float(self.get_setting_int(PID_SETTING_NAME[("roll", "d")], timeout_seconds)),
+            ff=float(self.get_setting_int(FF_SETTING_NAME["roll"], timeout_seconds)),
+        )
+        pitch = AxisPidFf(
+            p=float(self.get_setting_int(PID_SETTING_NAME[("pitch", "p")], timeout_seconds)),
+            i=float(self.get_setting_int(PID_SETTING_NAME[("pitch", "i")], timeout_seconds)),
+            d=float(self.get_setting_int(PID_SETTING_NAME[("pitch", "d")], timeout_seconds)),
+            ff=float(self.get_setting_int(FF_SETTING_NAME["pitch"], timeout_seconds)),
+        )
+        return roll, pitch
+
+    def get_setting_int(self, name: str, timeout_seconds: float = 0.8) -> int:
+        index = self._setting_index(name, timeout_seconds=max(0.1, timeout_seconds))
+        payload = self._request(MSP2_COMMON_SETTING, self._setting_key_payload(index), timeout_seconds=max(0.1, timeout_seconds))
+        if not payload:
+            raise RuntimeError(f"INAV setting '{name}' returned empty payload.")
+        return int.from_bytes(payload, byteorder="little", signed=False)
+
+    def set_setting_int(self, name: str, value: int, timeout_seconds: float = 0.8) -> int:
+        setting = name.strip().lower()
+        target = int(value)
+        timeout_s = max(0.1, timeout_seconds)
+        index = self._setting_index(setting, timeout_seconds=timeout_s)
+        info = bytearray(self._request(MSP2_COMMON_SETTING_INFO, self._setting_key_payload(index), timeout_s))
+        try:
+            name_end = info.index(0)
+        except ValueError as exc:
+            raise RuntimeError(f"Invalid setting info payload for '{setting}'.") from exc
+        current_payload = self._request(MSP2_COMMON_SETTING, self._setting_key_payload(index), timeout_s)
+        value_size = len(current_payload)
+        if value_size not in (1, 2, 4):
+            raise RuntimeError(f"Unsupported setting byte width for '{setting}': {value_size}")
+        encoded = target.to_bytes(value_size, byteorder="little", signed=False)
+        info[name_end + 1 : name_end + 1 + value_size] = encoded
+        self._request(MSP2_COMMON_SET_SETTING, bytes(info), timeout_s)
+        return self.get_setting_int(setting, timeout_seconds=timeout_s)
+
+    def _setting_key_payload(self, index: int) -> bytes:
+        # INAV settings API expects setting index in upper 24 bits.
+        return (int(index) << 8).to_bytes(4, byteorder="little", signed=False)
+
+    def _setting_index(self, name: str, timeout_seconds: float) -> int:
+        key = name.strip().lower()
+        with self._sync:
+            cached = self._setting_index_cache.get(key)
+        if cached is not None:
+            return cached
+
+        setting_info_timeout = min(0.5, max(0.2, timeout_seconds))
+        for index in range(0, 4096):
+            payload = self._request(
+                MSP2_COMMON_SETTING_INFO,
+                self._setting_key_payload(index),
+                timeout_seconds=setting_info_timeout,
+            )
+            nul = payload.find(b"\x00")
+            if nul <= 0:
+                continue
+            found = payload[:nul].decode("ascii", errors="ignore").strip().lower()
+            if not found:
+                continue
+            with self._sync:
+                if found not in self._setting_index_cache:
+                    self._setting_index_cache[found] = index
+                if found == key:
+                    return index
+        raise KeyError(f"INAV setting '{name}' was not found via MSP2_COMMON_SETTING_INFO.")
 
     def _request(self, command_id: int, payload: bytes, timeout_seconds: float) -> bytes:
         timeout_s = max(0.1, timeout_seconds)
