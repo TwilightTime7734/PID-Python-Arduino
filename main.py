@@ -1142,6 +1142,9 @@ def main() -> None:
         )
         ax.set_xlabel("Time from pulse command (s)", fontsize=8)
         ax.set_ylabel(f"{axis_title} vs settle baseline (deg)", fontsize=8)
+        if capture.command_delta_us < 0:
+            # Mirror vertical readout for negative/reverse pulse captures.
+            ax.invert_yaxis()
         ax.tick_params(axis="both", labelsize=8)
         ax.grid(True, alpha=0.3, color="#94A3B8")
         fig.subplots_adjust(left=0.13, right=0.98, top=0.86, bottom=0.22)
