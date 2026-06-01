@@ -227,6 +227,48 @@ def _parse_attitude_payload(payload: bytes) -> AttitudeSample:
     )
 
 
+def send_cli_msc_command(
+    port_name: str,
+    baud_rate: int = 115200,
+    cli_enter_delay_s: float = 0.25,
+    post_command_delay_s: float = 0.2,
+) -> None:
+    """Enter INAV CLI and issue `msc` so the FC re-enumerates as mass storage."""
+    port = str(port_name).strip()
+    if not port:
+        raise RuntimeError("FC port is empty.")
+    baud = int(baud_rate)
+    if baud <= 0:
+        raise RuntimeError("FC baud must be > 0.")
+
+    try:
+        with serial.Serial(
+            port=port,
+            baudrate=baud,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            timeout=0.2,
+            write_timeout=0.2,
+        ) as ser:
+            time.sleep(0.15)
+            try:
+                ser.reset_input_buffer()
+                ser.reset_output_buffer()
+            except Exception:
+                pass
+
+            # Match INAV Configurator CLI entry: send '#', then send 'msc\n'.
+            ser.write(b"#")
+            ser.flush()
+            time.sleep(max(0.0, float(cli_enter_delay_s)))
+            ser.write(b"msc\n")
+            ser.flush()
+            time.sleep(max(0.0, float(post_command_delay_s)))
+    except serial.SerialException as exc:
+        raise RuntimeError(f"Unable to open FC serial port '{port}' @ {baud} baud: {exc}") from exc
+
+
 class InavSerialService:
     def __init__(self) -> None:
         self._sync = threading.Lock()
