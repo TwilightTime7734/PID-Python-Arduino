@@ -198,7 +198,7 @@ def _column(columns: dict[str, np.ndarray], names: list[str]) -> np.ndarray | No
 
 def _extract_plot_columns(time_s: np.ndarray, columns: dict[str, np.ndarray]) -> dict[str, Any]:
     roll_setpoint = _column(columns, ["rcCommand[0]", "setpoint[0]"])
-    roll_actual = _column(columns, ["axisRate[0]", "gyroADC[0]"])
+    roll_actual = _column(columns, ["gyroADC[0]"])
     if roll_setpoint is None or roll_actual is None:
         raise RuntimeError("Missing roll setpoint/actual columns in CSV.")
 

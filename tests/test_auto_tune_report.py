@@ -38,7 +38,8 @@ class AutoTuneReportTests(unittest.TestCase):
             self.assertTrue(Path(report.summary_txt).exists())
             self.assertTrue(Path(report.summary_json).exists())
             self.assertTrue(Path(report.combined_chart_sheet).exists())
-            self.assertEqual(6, len(report.chart_paths))
+            self.assertGreaterEqual(len(report.chart_paths), 7)
+            self.assertTrue(any(str(item).endswith("roll_setpoint_vs_actual.png") for item in report.chart_paths))
             for item in report.chart_paths:
                 self.assertTrue(Path(item).exists())
 
@@ -46,7 +47,7 @@ class AutoTuneReportTests(unittest.TestCase):
         header = [
             "loopIteration",
             "time (us)",
-            "axisRate[0]",
+            "gyroADC[0]",
             "axisP[0]",
             "axisI[0]",
             "axisD[0]",

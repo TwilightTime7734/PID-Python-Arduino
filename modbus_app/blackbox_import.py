@@ -769,7 +769,7 @@ def analyze_blackbox_csv(csv_path: str | Path) -> tuple[str, BlackboxPidReport]:
     axis_summaries: list[BlackboxAnalysis] = []
     for axis_name, axis_index in (("roll", 0), ("pitch", 1)):
         command = _choose_column(columns, [f"setpoint[{axis_index}]", f"rcCommand[{axis_index}]"])
-        measured = _choose_column(columns, [f"axisRate[{axis_index}]", f"gyroADC[{axis_index}]"])
+        measured = _choose_column(columns, [f"gyroADC[{axis_index}]"])
         if command is None or measured is None:
             continue
         if len(command) != len(times) or len(measured) != len(times):
