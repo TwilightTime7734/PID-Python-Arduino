@@ -1,0 +1,2134 @@
+    1: """Application runtime orchestration."""
+    2: 
+    3: from __future__ import annotations
+    4: 
+    5: import os
+    6: from pathlib import Path
+    7: import queue
+    8: import time
+    9: import tkinter as tk
+   10: from collections.abc import Callable, Sequence
+   11: from tkinter import filedialog, messagebox
+   12: 
+   13: import serial
+   14: from serial.tools import list_ports
+   15: 
+   16: from serialUSB.inav_serial_service import (
+   17:     AxisPidFf,
+   18:     FF_SETTING_NAME,
+   19:     InavSerialService,
+   20:     PID_SETTING_NAME,
+   21:     send_cli_msc_command,
+   22: )
+   23: 
+   24: from .constants import (
+   25:     ADJUST_REPEAT_INITIAL_MS,
+   26:     ADJUST_REPEAT_INTERVAL_MS,
+   27:     CHANNEL_DEFAULTS,
+   28:     FC_BAUD_DEFAULT,
+   29:     FC_DEVICE_ID,
+   30:     FC_DEVICE_PID,
+   31:     FC_DEVICE_VID,
+   32:     FC_PORT_DEFAULT,
+   33:     HOLD_ANGLE_CHECK_MS,
+   34:     HOLD_TIMEOUT_POLL_MS,
+   35:     LEVEL_CENTER_US,
+   36:     LEVEL_DEADBAND_DEG,
+   37:     LEVEL_FULL_SCALE_DEG,
+   38:     LEVEL_LOOP_INTERVAL_MS,
+   39:     LEVEL_MAX_DELTA_US,
+   40:     LEVEL_MIN_DELTA_US,
+   41:     LEVEL_PULSE_TIMEOUT_S,
+   42:     LEVEL_TIMEOUT_MAX_S,
+   43:     LEVEL_TIMEOUT_MIN_S,
+   44:     OFFSET_DEFAULTS,
+   45:     PITCH_CHANNEL_INDEX,
+   46:     PORT_DEFAULT,
+   47:     PULSE_DURATION_DEFAULTS,
+   48:     PULSE_STATUS_HOLD_ENDED,
+   49:     PULSE_STATUS_REJECTED,
+   50:     PULSE_STATUS_TIMEOUT_RESTORED,
+   51:     PULSE_TARGET_DEFAULTS,
+   52:     REG_QUANT,
+   53:     ROLL_CHANNEL_INDEX,
+   54: )
+   55: from .serial_protocol import (
+   56:     end_hold_on_serial,
+   57:     open_serial,
+   58:     read_pulse_status_on_serial,
+   59:     read_regs,
+   60:     run_ppm_on_serial,
+   61:     set_channel_with_human_profile_until_stop_on_serial,
+   62:     set_channel_until_stop_on_serial,
+   63:     stop_ppm_on_serial,
+   64: )
+   65: from .adaptive_session import (
+   66:     AdaptiveCommand,
+   67:     AdaptiveExcitationController,
+   68:     AdaptiveSessionConfig,
+   69:     AdaptiveSessionResult,
+   70:     AdaptiveSessionState,
+   71:     ExcitationEvent,
+   72:     axis_channel_index,
+   73: )
+   74: from .auto_tune_report import AutoTuneReport, generate_auto_tune_report
+   75: from .blackbox_import import (
+   76:     BlackboxImportResult,
+   77:     analyze_blackbox_log,
+   78:     analyze_pulled_blackbox_logs,
+   79:     import_blackbox_logs_from_msc,
+   80: )
+   81: from .ui import (
+   82:     build_main_gui,
+   83:     parse_entries,
+   84:     require_duration_range,
+   85:     require_range,
+   86: )
+   87: from .worker import SerialWorker
+   88: 
+   89: 
+   90: def main() -> None:
+   91:     root = tk.Tk()
+   92:     ui = build_main_gui(root)
+   93:     port_entry = ui.port_entry
+   94:     channel_adjust_canvases = ui.channel_adjust_canvases
+   95:     target_adjust_canvases = ui.target_adjust_canvases
+   96:     ch_entries = ui.ch_entries
+   97:     off_entries = ui.off_entries
+   98:     target_entries = ui.target_entries
+   99:     dur_entries = ui.dur_entries
+  100:     angle_entries = ui.angle_entries
+  101:     channel_output_canvases = ui.channel_output_canvases
+  102:     channel_output_fill_ids = ui.channel_output_fill_ids
+  103:     hold_send_canvases = ui.hold_send_canvases
+  104:     level_button = ui.level_button
+  105:     status = ui.status
+  106:     pc_link_box = ui.pc_link_box
+  107:     horizon = ui.horizon
+  108:     roll_text = ui.roll_text
+  109:     pitch_text = ui.pitch_text
+  110:     roll_pidff_vars = ui.roll_pidff_vars
+  111:     pitch_pidff_vars = ui.pitch_pidff_vars
+  112:     pid_ff_adjust_canvases = ui.pid_ff_adjust_canvases
+  113:     fc_port_entry = ui.fc_port_entry
+  114:     fc_baud_entry = ui.fc_baud_entry
+  115:     scan_fc_button = ui.scan_fc_button
+  116:     connect_fc_button = ui.connect_fc_button
+  117:     import_blackbox_button = ui.import_blackbox_button
+  118:     analyze_blackbox_button = ui.analyze_blackbox_button
+  119:     arduino_button = ui.arduino_button
+  120:     auto_session_button = ui.auto_session_button
+  121:     auto_state_var = ui.auto_state_var
+  122:     auto_command_var = ui.auto_command_var
+  123:     auto_safety_var = ui.auto_safety_var
+  124:     auto_roll_conf_var = ui.auto_roll_conf_var
+  125:     auto_pitch_conf_var = ui.auto_pitch_conf_var
+  126:     auto_report_text = ui.auto_report_text
+  127:     auto_report_listbox = ui.auto_report_listbox
+  128:     auto_open_selected_button = ui.auto_open_selected_button
+  129:     auto_open_all_button = ui.auto_open_all_button
+  130: 
+  131:     run_active = False
+  132:     start_pending = False
+  133:     is_closing = False
+  134:     run_port = PORT_DEFAULT
+  135:     run_ser: serial.Serial | None = None
+  136:     run_quant: int | None = None
+  137:     run_max_count: int | None = None
+  138:     hold_timeout_after_id: str | None = None
+  139:     hold_command_inflight = False
+  140:     channel_update_inflight = False
+  141:     pending_channel_update_channels: list[int] | None = None
+  142:     pending_channel_update_offsets: list[int] | None = None
+  143:     adjust_repeat_after_id: str | None = None
+  144:     adjust_repeat_handler: Callable[[int, int], None] | None = None
+  145:     adjust_repeat_index: int | None = None
+  146:     adjust_repeat_delta = 0
+  147:     base_channel_outputs = CHANNEL_DEFAULTS.copy()
+  148:     live_channel_outputs = base_channel_outputs.copy()
+  149:     worker = SerialWorker()
+  150:     fc_service = InavSerialService()
+  151:     fc_poll_after_id: str | None = None
+  152:     level_active = False
+  153:     level_after_id: str | None = None
+  154:     level_pulse_inflight = False
+  155:     level_timeout_deadline_s: float | None = None
+  156:     level_timeout_s = max(PULSE_DURATION_DEFAULTS[ROLL_CHANNEL_INDEX], PULSE_DURATION_DEFAULTS[PITCH_CHANNEL_INDEX])
+  157:     auto_config = AdaptiveSessionConfig()
+  158:     auto_controller: AdaptiveExcitationController | None = None
+  159:     auto_state = AdaptiveSessionState.idle
+  160:     auto_stop_reason = ""
+  161:     auto_warning = ""
+  162:     auto_session_start_s: float | None = None
+  163:     auto_last_tick_s: float | None = None
+  164:     auto_last_sample_s: float | None = None
+  165:     auto_tick_after_id: str | None = None
+  166:     auto_pulse_inflight = False
+  167:     auto_settle_until_s: float | None = None
+  168:     auto_recovery_mode = False
+  169:     auto_active_command: AdaptiveCommand | None = None
+  170:     auto_event_peak_delta = 0.0
+  171:     auto_event_response_delay_s: float | None = None
+  172:     auto_event_baseline = 0.0
+  173:     auto_event_start_s = 0.0
+  174:     auto_latest_report: AutoTuneReport | None = None
+  175:     auto_report_files: list[str] = []
+  176:     auto_import_result: BlackboxImportResult | None = None
+  177:     auto_latest_imported_log: str = ""
+  178:     blackbox_import_inflight = False
+  179:     blackbox_import_dir = (Path(__file__).resolve().parent.parent / "blackbox_imports").resolve()
+  180:     blackbox_msc_mount_timeout_s = 12.0
+  181:     blackbox_msc_mount_poll_s = 1.0
+  182:     pid_ff_labels = ("P", "I", "D", "FF")
+  183:     pid_ff_adjust_fields = [
+  184:         ("roll", "p"),
+  185:         ("pitch", "p"),
+  186:         ("roll", "i"),
+  187:         ("pitch", "i"),
+  188:         ("roll", "d"),
+  189:         ("pitch", "d"),
+  190:         ("roll", "ff"),
+  191:         ("pitch", "ff"),
+  192:     ]
+  193: 
+  194:     def port() -> str:
+  195:         return port_entry.get().strip() or PORT_DEFAULT
+  196: 
+  197:     def fc_port() -> str:
+  198:         return fc_port_entry.get().strip() or FC_PORT_DEFAULT
+  199: 
+  200:     def fc_baud() -> int:
+  201:         try:
+  202:             value = int(fc_baud_entry.get().strip())
+  203:         except ValueError as exc:
+  204:             raise RuntimeError("FC baud must be an integer.") from exc
+  205:         if value <= 0:
+  206:             raise RuntimeError("FC baud must be > 0.")
+  207:         return value
+  208: 
+  209:     def pulse_axis_value(sample, axis: str) -> float:
+  210:         if axis == "roll":
+  211:             return float(sample.roll_deg)
+  212:         return float(sample.pitch_deg)
+  213: 
+  214:     def format_pid_ff_value(value: float) -> str:
+  215:         rounded = round(value)
+  216:         if abs(value - rounded) < 1e-6:
+  217:             return str(int(rounded))
+  218:         return f"{value:.2f}".rstrip("0").rstrip(".")
+  219: 
+  220:     def clear_pid_ff_displays() -> None:
+  221:         for label, var in zip(pid_ff_labels, roll_pidff_vars):
+  222:             var.set(f"{label}: --")
+  223:         for label, var in zip(pid_ff_labels, pitch_pidff_vars):
+  224:             var.set(f"{label}: --")
+  225: 
+  226:     def set_pid_ff_displays(roll_values: AxisPidFf, pitch_values: AxisPidFf) -> None:
+  227:         roll_series = (roll_values.p, roll_values.i, roll_values.d, roll_values.ff)
+  228:         pitch_series = (pitch_values.p, pitch_values.i, pitch_values.d, pitch_values.ff)
+  229:         for label, value, var in zip(pid_ff_labels, roll_series, roll_pidff_vars):
+  230:             var.set(f"{label}: {format_pid_ff_value(value)}")
+  231:         for label, value, var in zip(pid_ff_labels, pitch_series, pitch_pidff_vars):
+  232:             var.set(f"{label}: {format_pid_ff_value(value)}")
+  233: 
+  234:     def set_auto_report_text(text: str) -> None:
+  235:         auto_report_text.config(state="normal")
+  236:         auto_report_text.delete("1.0", tk.END)
+  237:         auto_report_text.insert("1.0", text.strip() + ("\n" if text and not text.endswith("\n") else ""))
+  238:         auto_report_text.config(state="disabled")
+  239: 
+  240:     def refresh_auto_report_file_list() -> None:
+  241:         auto_report_listbox.delete(0, tk.END)
+  242:         for file_path in auto_report_files:
+  243:             auto_report_listbox.insert(tk.END, file_path)
+  244: 
+  245:     def open_local_path(path: str) -> None:
+  246:         if not path:
+  247:             return
+  248:         target = Path(path)
+  249:         if not target.exists():
+  250:             raise RuntimeError(f"File not found: {target}")
+  251:         if os.name == "nt":
+  252:             os.startfile(str(target))  # type: ignore[attr-defined]
+  253:             return
+  254:         raise RuntimeError("Opening files is currently supported only on Windows in this app.")
+  255: 
+  256:     def open_selected_report_file() -> None:
+  257:         try:
+  258:             selected = auto_report_listbox.curselection()
+  259:             if not selected:
+  260:                 status.set("Select a report file first.")
+  261:                 return
+  262:             file_path = auto_report_listbox.get(selected[0])
+  263:             open_local_path(file_path)
+  264:         except Exception as exc:
+  265:             set_error("Open report file error", exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
+  266: 
+  267:     def open_all_report_files() -> None:
+  268:         try:
+  269:             if not auto_report_files:
+  270:                 status.set("No report files available yet.")
+  271:                 return
+  272:             for file_path in auto_report_files:
+  273:                 open_local_path(file_path)
+  274:         except Exception as exc:
+  275:             set_error("Open report files error", exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
+  276: 
+  277:     def auto_elapsed_s(now_s: float | None = None) -> float:
+  278:         if auto_session_start_s is None:
+  279:             return 0.0
+  280:         current = time.monotonic() if now_s is None else now_s
+  281:         return max(0.0, current - auto_session_start_s)
+  282: 
+  283:     def update_auto_confidence_display() -> None:
+  284:         if auto_controller is None:
+  285:             auto_roll_conf_var.set(0.0)
+  286:             auto_pitch_conf_var.set(0.0)
+  287:             return
+  288:         metrics = auto_controller.coverage_metrics()
+  289:         auto_roll_conf_var.set(max(0.0, min(100.0, metrics.axis_confidence["roll"] * 100.0)))
+  290:         auto_pitch_conf_var.set(max(0.0, min(100.0, metrics.axis_confidence["pitch"] * 100.0)))
+  291: 
+  292:     def format_auto_metrics_line() -> str:
+  293:         if auto_controller is None:
+  294:             return "Command: --"
+  295:         metrics = auto_controller.coverage_metrics()
+  296:         roll_conf = metrics.axis_confidence["roll"] * 100.0
+  297:         pitch_conf = metrics.axis_confidence["pitch"] * 100.0
+  298:         return f"Command: {auto_command_var.get().replace('Command: ', '')} | Conf roll {roll_conf:.0f}% pitch {pitch_conf:.0f}%"
+  299: 
+  300:     def set_auto_state(next_state: AdaptiveSessionState, safety_text: str = "") -> None:
+  301:         nonlocal auto_state
+  302:         auto_state = next_state
+  303:         auto_state_var.set(f"State: {next_state.value}")
+  304:         if safety_text:
+  305:             auto_safety_var.set(f"Safety: {safety_text}")
+  306: 
+  307:     def reset_auto_runtime_state() -> None:
+  308:         nonlocal auto_session_start_s, auto_last_tick_s, auto_tick_after_id, auto_pulse_inflight
+  309:         nonlocal auto_settle_until_s, auto_recovery_mode, auto_active_command, auto_event_peak_delta
+  310:         nonlocal auto_event_response_delay_s, auto_event_baseline, auto_event_start_s
+  311:         auto_session_start_s = None
+  312:         auto_last_tick_s = None
+  313:         auto_pulse_inflight = False
+  314:         auto_settle_until_s = None
+  315:         auto_recovery_mode = False
+  316:         auto_active_command = None
+  317:         auto_event_peak_delta = 0.0
+  318:         auto_event_response_delay_s = None
+  319:         auto_event_baseline = 0.0
+  320:         auto_event_start_s = 0.0
+  321:         if auto_tick_after_id is not None:
+  322:             try:
+  323:                 root.after_cancel(auto_tick_after_id)
+  324:             except Exception:
+  325:                 pass
+  326:             auto_tick_after_id = None
+  327: 
+  328:     def auto_session_payload() -> dict[str, object]:
+  329:         metrics: dict[str, object] = {}
+  330:         if auto_controller is not None:
+  331:             snapshot = auto_controller.coverage_metrics()
+  332:             metrics = {
+  333:                 "axis_confidence": snapshot.axis_confidence,
+  334:                 "direction": {
+  335:                     key: {
+  336:                         "total_count": value.total_count,
+  337:                         "valid_count": value.valid_count,
+  338:                         "settle_ratio": value.settle_ratio,
+  339:                         "median_peak_deg": value.median_peak_deg,
+  340:                         "confidence": value.confidence,
+  341:                         "target_met": value.target_met,
+  342:                     }
+  343:                     for key, value in snapshot.direction.items()
+  344:                 },
+  345:             }
+  346:         return {
+  347:             "state": auto_state.value,
+  348:             "stop_reason": auto_stop_reason,
+  349:             "warning": auto_warning,
+  350:             "elapsed_s": auto_elapsed_s(),
+  351:             "metrics": metrics,
+  352:         }
+  353: 
+  354:     def refresh_pid_ff_from_fc(update_status: bool = False) -> bool:
+  355:         if not fc_service.is_connected:
+  356:             clear_pid_ff_displays()
+  357:             if update_status:
+  358:                 status.set("FC is disconnected.")
+  359:             return False
+  360:         try:
+  361:             roll_values, pitch_values = fc_service.read_roll_pitch_pid_ff(timeout_seconds=1.2)
+  362:             set_pid_ff_displays(roll_values, pitch_values)
+  363:             if update_status:
+  364:                 status.set("PID/FF refreshed from FC.")
+  365:             return True
+  366:         except Exception as exc:
+  367:             clear_pid_ff_displays()
+  368:             if update_status:
+  369:                 set_error("PID/FF read error", exc)
+  370:             return False
+  371: 
+  372:     def queue_fc_pid_ff_refresh(connected_port: str, connected_baud: int) -> None:
+  373:         if not fc_service.is_connected:
+  374:             return
+  375: 
+  376:         def on_pid_ff_read_done(ok: bool, res: object) -> None:
+  377:             if not fc_service.is_connected:
+  378:                 return
+  379:             if not ok:
+  380:                 clear_pid_ff_displays()
+  381:                 status.set(f"FC connected: {connected_port} @ {connected_baud}. PID/FF read failed.")
+  382:                 return
+  383:             if (
+  384:                 not isinstance(res, tuple)
+  385:                 or len(res) != 2
+  386:                 or not isinstance(res[0], AxisPidFf)
+  387:                 or not isinstance(res[1], AxisPidFf)
+  388:             ):
+  389:                 clear_pid_ff_displays()
+  390:                 status.set(f"FC connected: {connected_port} @ {connected_baud}. PID/FF read failed.")
+  391:                 return
+  392:             set_pid_ff_displays(res[0], res[1])
+  393:             status.set(f"FC connected: {connected_port} @ {connected_baud}. PID/FF loaded.")
+  394: 
+  395:         worker.submit(_task_fc_read_pid_ff, callback=on_pid_ff_read_done)
+  396: 
+  397:     def record_auto_session_sample(sample) -> None:
+  398:         nonlocal auto_last_sample_s, auto_event_peak_delta, auto_event_response_delay_s
+  399:         auto_last_sample_s = time.monotonic()
+  400:         command = auto_active_command
+  401:         if command is None:
+  402:             return
+  403:         axis_value = pulse_axis_value(sample, command.axis)
+  404:         directed_delta = (axis_value - auto_event_baseline) * float(command.direction)
+  405:         if directed_delta > auto_event_peak_delta:
+  406:             auto_event_peak_delta = float(directed_delta)
+  407:         if auto_event_response_delay_s is None:
+  408:             threshold_deg = max(2.0, (command.force_us / 15.0) * 0.35)
+  409:             if directed_delta >= threshold_deg:
+  410:                 auto_event_response_delay_s = max(0.0, time.monotonic() - auto_event_start_s)
+  411: 
+  412:     def draw_channel_output(index: int, value: int) -> None:
+  413:         clamped = max(1000, min(2000, value))
+  414:         canvas = channel_output_canvases[index]
+  415:         fill_id = channel_output_fill_ids[index]
+  416: 
+  417:         left = 2.0
+  418:         right = 94.0
+  419:         center = (left + right) / 2.0
+  420:         y1 = 3.0
+  421:         y2 = 13.0
+  422: 
+  423:         if clamped < 1500:
+  424:             ratio = (1500 - clamped) / 500.0
+  425:             x = center - (center - left) * ratio
+  426:             canvas.coords(fill_id, x, y1, center, y2)
+  427:             canvas.itemconfig(fill_id, fill="#E38C8C")
+  428:         elif clamped > 1500:
+  429:             ratio = (clamped - 1500) / 500.0
+  430:             x = center + (right - center) * ratio
+  431:             canvas.coords(fill_id, center, y1, x, y2)
+  432:             canvas.itemconfig(fill_id, fill="#94D98F")
+  433:         else:
+  434:             canvas.coords(fill_id, center, y1, center, y2)
+  435:             canvas.itemconfig(fill_id, fill="#94D98F")
+  436: 
+  437:     def parse_channel_values_with_defaults() -> list[int]:
+  438:         values: list[int] = []
+  439:         for i, entry in enumerate(ch_entries):
+  440:             try:
+  441:                 values.append(int(entry.get().strip()))
+  442:             except ValueError:
+  443:                 values.append(CHANNEL_DEFAULTS[i])
+  444:         return values
+  445: 
+  446:     def parse_offset_values_with_defaults() -> list[int]:
+  447:         values: list[int] = []
+  448:         for i, entry in enumerate(off_entries):
+  449:             try:
+  450:                 values.append(int(entry.get().strip()))
+  451:             except ValueError:
+  452:                 values.append(OFFSET_DEFAULTS[i])
+  453:         return values
+  454: 
+  455:     def adjust_channel_value(index: int, delta: int) -> None:
+  456:         try:
+  457:             current = int(ch_entries[index].get().strip())
+  458:         except ValueError:
+  459:             current = CHANNEL_DEFAULTS[index]
+  460:         updated = max(1000, min(2000, current + delta))
+  461:         ch_entries[index].delete(0, tk.END)
+  462:         ch_entries[index].insert(0, str(updated))
+  463:         on_output_inputs_changed()
+  464: 
+  465:     def adjust_target_value(index: int, delta: int) -> None:
+  466:         try:
+  467:             current = int(target_entries[index].get().strip())
+  468:         except ValueError:
+  469:             current = PULSE_TARGET_DEFAULTS[index]
+  470:         updated = max(0, min(500, current + delta))
+  471:         target_entries[index].delete(0, tk.END)
+  472:         target_entries[index].insert(0, str(updated))
+  473: 
+  474:     def get_adjust_delta(event: tk.Event, step: int = 5) -> int:
+  475:         width = int(event.widget.cget("width"))
+  476:         mid_x = width / 2
+  477:         return -step if event.x <= mid_x else step
+  478: 
+  479:     def get_pulse_action(event: tk.Event) -> str:
+  480:         width = int(event.widget.cget("width"))
+  481:         third_x = width / 3
+  482:         if event.x < third_x:
+  483:             return "negative"
+  484:         if event.x < (third_x * 2):
+  485:             return "end"
+  486:         return "positive"
+  487: 
+  488:     def cancel_adjust_repeat() -> None:
+  489:         nonlocal adjust_repeat_after_id, adjust_repeat_handler, adjust_repeat_index, adjust_repeat_delta
+  490:         if adjust_repeat_after_id is not None:
+  491:             try:
+  492:                 root.after_cancel(adjust_repeat_after_id)
+  493:             except Exception:
+  494:                 pass
+  495:             finally:
+  496:                 adjust_repeat_after_id = None
+  497:         adjust_repeat_handler = None
+  498:         adjust_repeat_index = None
+  499:         adjust_repeat_delta = 0
+  500: 
+  501:     def schedule_adjust_repeat() -> None:
+  502:         nonlocal adjust_repeat_after_id
+  503:         if adjust_repeat_handler is None or adjust_repeat_index is None or adjust_repeat_delta == 0:
+  504:             adjust_repeat_after_id = None
+  505:             return
+  506:         adjust_repeat_handler(adjust_repeat_index, adjust_repeat_delta)
+  507:         adjust_repeat_after_id = root.after(ADJUST_REPEAT_INTERVAL_MS, schedule_adjust_repeat)
+  508: 
+  509:     def on_adjust_press(
+  510:         adjust_handler: Callable[[int, int], None],
+  511:         index: int,
+  512:         event: tk.Event,
+  513:         step: int = 5,
+  514:     ) -> None:
+  515:         nonlocal adjust_repeat_after_id, adjust_repeat_handler, adjust_repeat_index, adjust_repeat_delta
+  516:         cancel_adjust_repeat()
+  517:         delta = get_adjust_delta(event, step=step)
+  518:         adjust_handler(index, delta)
+  519:         adjust_repeat_handler = adjust_handler
+  520:         adjust_repeat_index = index
+  521:         adjust_repeat_delta = delta
+  522:         adjust_repeat_after_id = root.after(ADJUST_REPEAT_INITIAL_MS, schedule_adjust_repeat)
+  523: 
+  524:     def adjust_pid_ff_value(index: int, delta: int) -> None:
+  525:         if index < 0 or index >= len(pid_ff_adjust_fields):
+  526:             return
+  527:         if delta == 0:
+  528:             return
+  529:         if not fc_service.is_connected:
+  530:             status.set("Connect FC before adjusting PID/FF.")
+  531:             return
+  532:         axis, gain = pid_ff_adjust_fields[index]
+  533:         setting_name = FF_SETTING_NAME[axis] if gain == "ff" else PID_SETTING_NAME[(axis, gain)]
+  534:         try:
+  535:             current = int(fc_service.get_setting_int(setting_name, timeout_seconds=0.8))
+  536:             target = max(0, min(255, current + delta))
+  537:             if target == current:
+  538:                 return
+  539:             _ = fc_service.set_setting_int(setting_name, target, timeout_seconds=0.9)
+  540:             if not refresh_pid_ff_from_fc(update_status=False):
+  541:                 raise RuntimeError("Failed to refresh PID/FF from FC after update.")
+  542:             status.set(
+  543:                 f"{axis.title()} {gain.upper()} set to {target} on FC."
+  544:             )
+  545:         except Exception as exc:
+  546:             set_error("PID/FF adjust error", exc)
+  547: 
+  548:     def on_adjust_release(_event: tk.Event) -> None:
+  549:         cancel_adjust_repeat()
+  550: 
+  551:     def set_live_channel_outputs(values: list[int]) -> None:
+  552:         nonlocal live_channel_outputs
+  553:         live_channel_outputs = values.copy()
+  554:         refresh_channel_outputs()
+  555: 
+  556:     def restore_base_outputs_after_hold(offsets: list[int] | None = None) -> None:
+  557:         if not run_active or run_ser is None:
+  558:             return
+  559:         restore_offsets = offsets.copy() if offsets is not None else parse_offset_values_with_defaults()
+  560:         set_live_channel_outputs(base_channel_outputs)
+  561:         queue_live_channel_update(base_channel_outputs.copy(), restore_offsets)
+  562: 
+  563:     def refresh_channel_outputs() -> None:
+  564:         for i, value in enumerate(live_channel_outputs):
+  565:             draw_channel_output(i, value)
+  566: 
+  567:     def queue_live_channel_update(channels: list[int], offsets: list[int]) -> None:
+  568:         nonlocal channel_update_inflight, pending_channel_update_channels, pending_channel_update_offsets
+  569:         if not run_active or run_ser is None:
+  570:             return
+  571:         if channel_update_inflight:
+  572:             pending_channel_update_channels = channels.copy()
+  573:             pending_channel_update_offsets = offsets.copy()
+  574:             return
+  575: 
+  576:         channel_update_inflight = True
+  577: 
+  578:         def on_live_update_done(ok: bool, res: object) -> None:
+  579:             nonlocal channel_update_inflight, pending_channel_update_channels, pending_channel_update_offsets
+  580:             nonlocal run_quant, run_max_count, base_channel_outputs
+  581:             channel_update_inflight = False
+  582:             if not ok:
+  583:                 set_error("Live update error", res if isinstance(res, Exception) else RuntimeError(res))
+  584:             else:
+  585:                 if (
+  586:                     not isinstance(res, tuple)
+  587:                     or len(res) != 3
+  588:                     or not isinstance(res[0], int)
+  589:                     or not isinstance(res[1], int)
+  590:                     or not isinstance(res[2], list)
+  591:                 ):
+  592:                     set_error("Live update error", RuntimeError("Unexpected worker result from live update task"))
+  593:                 else:
+  594:                     run_quant = res[0]
+  595:                     run_max_count = res[1]
+  596:                     sent_channels = [int(v) for v in res[2]]
+  597:                     base_channel_outputs = sent_channels
+  598:                     if hold_timeout_after_id is None:
+  599:                         set_live_channel_outputs(sent_channels)
+  600: 
+  601:             if not run_active or run_ser is None:
+  602:                 pending_channel_update_channels = None
+  603:                 pending_channel_update_offsets = None
+  604:                 return
+  605: 
+  606:             if pending_channel_update_channels is None or pending_channel_update_offsets is None:
+  607:                 return
+  608: 
+  609:             next_channels = pending_channel_update_channels
+  610:             next_offsets = pending_channel_update_offsets
+  611:             pending_channel_update_channels = None
+  612:             pending_channel_update_offsets = None
+  613:             queue_live_channel_update(next_channels, next_offsets)
+  614: 
+  615:         worker.submit(_task_update_channels, channels.copy(), offsets.copy(), callback=on_live_update_done)
+  616: 
+  617:     def on_output_inputs_changed() -> None:
+  618:         nonlocal base_channel_outputs
+  619:         if not run_active or run_ser is None:
+  620:             set_live_channel_outputs(parse_channel_values_with_defaults())
+  621:             return
+  622: 
+  623:         try:
+  624:             channels = parse_entries(ch_entries, int, "Channel")
+  625:             require_range(channels, "Channel", 1000, 2000)
+  626:             offsets = parse_entries(off_entries, int, "Offset")
+  627:         except Exception:
+  628:             return
+  629: 
+  630:         set_live_channel_outputs(channels)
+  631:         base_channel_outputs = channels.copy()
+  632:         queue_live_channel_update(channels, offsets)
+  633: 
+  634:     def channel_angle_value(channel_index: int) -> float | None:
+  635:         sample = fc_service.latest_attitude()
+  636:         if sample is None:
+  637:             return None
+  638:         if channel_index == 0:
+  639:             return sample.roll_deg
+  640:         if channel_index == 1:
+  641:             return sample.pitch_deg
+  642:         if channel_index == 3:
+  643:             return sample.yaw_deg
+  644:         return None
+  645: 
+  646:     def is_angle_threshold_reached(channel_index: int, threshold_deg: float) -> bool:
+  647:         if threshold_deg == 0:
+  648:             return False
+  649:         measured = channel_angle_value(channel_index)
+  650:         if measured is None:
+  651:             return False
+  652:         if threshold_deg > 0:
+  653:             return measured >= threshold_deg
+  654:         return measured <= threshold_deg
+  655: 
+  656:     def select_fc_port(port_infos: Sequence[object]) -> str:
+  657:         target_id = FC_DEVICE_ID.upper()
+  658:         for info in port_infos:
+  659:             vid = getattr(info, "vid", None)
+  660:             pid = getattr(info, "pid", None)
+  661:             if vid == FC_DEVICE_VID and pid == FC_DEVICE_PID:
+  662:                 device = str(getattr(info, "device", "") or "").strip()
+  663:                 if device:
+  664:                     return device
+  665:             hwid = str(getattr(info, "hwid", "") or "")
+  666:             if target_id in hwid.upper():
+  667:                 device = str(getattr(info, "device", "") or "").strip()
+  668:                 if device:
+  669:                     return device
+  670:         return FC_PORT_DEFAULT
+  671: 
+  672:     def list_scanned_ports(port_infos: Sequence[object]) -> list[str]:
+  673:         ports = [str(getattr(p, "device", "") or "").strip() for p in port_infos]
+  674:         return [p for p in ports if p]
+  675: 
+  676:     def populate_port_dropdowns(ports: Sequence[str]) -> None:
+  677:         values = tuple(ports)
+  678:         port_entry.config(values=values)
+  679:         fc_port_entry.config(values=values)
+  680: 
+  681:     def scan_fc_ports(update_status: bool = True) -> None:
+  682:         port_infos = sorted(
+  683:             list_ports.comports(),
+  684:             key=lambda p: str(getattr(p, "device", "") or "").upper(),
+  685:         )
+  686:         ports = list_scanned_ports(port_infos)
+  687:         populate_port_dropdowns(ports)
+  688:         selected_port = select_fc_port(port_infos)
+  689:         fc_port_entry.delete(0, tk.END)
+  690:         fc_port_entry.insert(0, selected_port)
+  691:         if update_status:
+  692:             if ports:
+  693:                 status.set(f"Detected ports: {', '.join(ports)}. FC port set to {selected_port}.")
+  694:             else:
+  695:                 status.set(f"No serial ports detected. FC port set to {selected_port}.")
+  696: 
+  697:     def format_blackbox_report(result: BlackboxImportResult) -> str:
+  698:         lines: list[str] = [result.analysis_summary]
+  699:         if result.pid_report is not None:
+  700:             if result.pid_report.headline:
+  701:                 lines.append(result.pid_report.headline)
+  702:             if result.pid_report.highlights:
+  703:                 lines.append("PID recommendations:")
+  704:                 for line in result.pid_report.highlights[:6]:
+  705:                     lines.append(f"- {line}")
+  706:             if result.pid_report.cli_commands:
+  707:                 lines.append("Suggested CLI settings:")
+  708:                 for command in result.pid_report.cli_commands[:10]:
+  709:                     lines.append(f"  {command}")
+  710:             if result.pid_report.advisory:
+  711:                 lines.append("Notes:")
+  712:                 for note in result.pid_report.advisory[:4]:
+  713:                     lines.append(f"- {note}")
+  714:         if result.analysis_source:
+  715:             lines.append(f"Source: {result.analysis_source}")
+  716:         if result.scanned_roots:
+  717:             lines.append("Scanned: " + ", ".join(result.scanned_roots))
+  718:         if result.warnings:
+  719:             lines.append("Warnings:")
+  720:             for warning in result.warnings[:3]:
+  721:                 lines.append(f"- {warning}")
+  722:         return "\n".join(lines)
+  723: 
+  724:     def do_pull_blackbox_logs() -> None:
+  725:         nonlocal blackbox_import_inflight
+  726:         try:
+  727:             if blackbox_import_inflight:
+  728:                 status.set("Blackbox import already in progress.")
+  729:                 return
+  730: 
+  731:             selected_port = fc_port()
+  732:             selected_baud = fc_baud()
+  733:             if fc_service.is_connected:
+  734:                 do_fc_disconnect(update_status=False)
+  735: 
+  736:             blackbox_import_inflight = True
+  737:             status.set(f"Requesting FC MSC mode on {selected_port} @ {selected_baud}, then scanning mounted volumes...")
+  738: 
+  739:             def on_pull_done(ok: bool, res: object) -> None:
+  740:                 nonlocal blackbox_import_inflight
+  741:                 blackbox_import_inflight = False
+  742:                 if not ok:
+  743:                     set_error("Blackbox import error", res if isinstance(res, Exception) else RuntimeError(res))
+  744:                     return
+  745:                 if not isinstance(res, BlackboxImportResult):
+  746:                     set_error("Blackbox import error", RuntimeError("Unexpected import task result."))
+  747:                     return
+  748: 
+  749:                 imported_count = len(res.imported_files)
+  750:                 if imported_count == 0:
+  751:                     if res.skipped_count > 0:
+  752:                         status.set(
+  753:                             f"No new Blackbox logs were copied ({res.skipped_count} duplicate file(s) skipped)."
+  754:                         )
+  755:                     else:
+  756:                         status.set("No new Blackbox logs were imported from MSC volumes.")
+  757:                 else:
+  758:                     if res.skipped_count > 0:
+  759:                         status.set(
+  760:                             f"Imported {imported_count} Blackbox file(s) to {blackbox_import_dir} "
+  761:                             f"({res.skipped_count} duplicate file(s) skipped)."
+  762:                         )
+  763:                     else:
+  764:                         status.set(
+  765:                             f"Imported {imported_count} Blackbox file(s) to {blackbox_import_dir}."
+  766:                         )
+  767: 
+  768:                 set_auto_report_text(format_blackbox_report(res))
+  769: 
+  770:             worker.submit(_task_enter_msc_and_import_blackbox_logs, selected_port, selected_baud, callback=on_pull_done)
+  771:         except Exception as exc:
+  772:             blackbox_import_inflight = False
+  773:             set_error("Blackbox import error", exc)
+  774: 
+  775:     def do_analyze_blackbox_logs() -> None:
+  776:         nonlocal blackbox_import_inflight, auto_latest_report, auto_report_files
+  777:         try:
+  778:             if blackbox_import_inflight:
+  779:                 status.set("Blackbox import already in progress.")
+  780:                 return
+  781: 
+  782:             initial_dir = blackbox_import_dir if blackbox_import_dir.exists() else Path.cwd()
+  783:             selected_log = filedialog.askopenfilename(
+  784:                 parent=root,
+  785:                 title="Select Blackbox Log to Analyze",
+  786:                 initialdir=str(initial_dir),
+  787:                 filetypes=(
+  788:                     ("Blackbox logs", "*.bbl *.bfl *.bbs *.txt *.csv"),
+  789:                     ("All files", "*.*"),
+  790:                 ),
+  791:             )
+  792:             if not selected_log:
+  793:                 status.set("Blackbox analysis canceled.")
+  794:                 return
+  795: 
+  796:             blackbox_import_inflight = True
+  797:             selected_name = Path(selected_log).name
+  798:             status.set(f"Analyzing Blackbox log: {selected_name}...")
+  799: 
+  800:             def on_analyze_done(ok: bool, res: object) -> None:
+  801:                 nonlocal blackbox_import_inflight, auto_latest_report, auto_report_files
+  802:                 if not ok:
+  803:                     blackbox_import_inflight = False
+  804:                     set_error("Blackbox analyze error", res if isinstance(res, Exception) else RuntimeError(res))
+  805:                     return
+  806:                 if not isinstance(res, BlackboxImportResult):
+  807:                     blackbox_import_inflight = False
+  808:                     set_error("Blackbox analyze error", RuntimeError("Unexpected analysis task result."))
+  809:                     return
+  810: 
+  811:                 summary = res.analysis_summary
+  812:                 summary_head = summary.split("|", 1)[0].strip()
+  813:                 if res.pid_report is not None and res.pid_report.headline:
+  814:                     summary_head = res.pid_report.headline
+  815:                 status.set(f"Blackbox analysis complete: {summary_head}. Generating report...")
+  816:                 set_auto_report_text(format_blackbox_report(res))
+  817:                 auto_latest_report = None
+  818:                 auto_report_files = []
+  819:                 refresh_auto_report_file_list()
+  820: 
+  821:                 session_payload = {
+  822:                     "state": "manual_analyze",
+  823:                     "stop_reason": "Manual Analyze Logs run",
+  824:                     "warning": "",
+  825:                     "elapsed_s": 0.0,
+  826:                     "metrics": {},
+  827:                 }
+  828: 
+  829:                 def on_report_done(ok2: bool, res2: object) -> None:
+  830:                     nonlocal blackbox_import_inflight, auto_latest_report, auto_report_files
+  831:                     blackbox_import_inflight = False
+  832:                     if not ok2:
+  833:                         error_text = str(res2) if not isinstance(res2, Exception) else str(res2)
+  834:                         if "Could not resolve a primary Blackbox CSV for" in error_text:
+  835:                             error_text += (
+  836:                                 "\nTip: the selected log did not resolve to a usable CSV. "
+  837:                                 "Try selecting a CSV log directly, or import/decode the raw log first."
+  838:                             )
+  839:                         elif "No module named" in error_text:
+  840:                             error_text += (
+  841:                                 "\nTip: this Python environment may be missing required packages "
+  842:                                 "(for the HTML chart viewer: numpy and plotly)."
+  843:                             )
+  844:                         status.set("Blackbox analysis complete, but report generation failed.")
+  845:                         set_auto_report_text(f"{format_blackbox_report(res)}\n\nReport generation error: {error_text}")
+  846:                         return
+  847:                     if not isinstance(res2, AutoTuneReport):
+  848:                         set_error("Blackbox report error", RuntimeError("Unexpected report task result."))
+  849:                         return
+  850: 
+  851:                     auto_latest_report = res2
+  852:                     report_files = [
+  853:                         res2.summary_txt,
+  854:                         res2.summary_json,
+  855:                         res2.combined_chart_sheet,
+  856:                         *list(res2.chart_paths),
+  857:                     ]
+  858:                     auto_report_files = [path for path in dict.fromkeys(item for item in report_files if item)]
+  859:                     refresh_auto_report_file_list()
+  860:                     try:
+  861:                         report_text = Path(res2.summary_txt).read_text(encoding="utf-8", errors="replace")
+  862:                     except Exception:
+  863:                         report_text = f"Report generated at {res2.report_dir}\nSummary file: {res2.summary_txt}"
+  864:                     set_auto_report_text(report_text)
+  865:                     status.set(f"Blackbox report generated: {res2.report_dir}")
+  866: 
+  867:                 worker.submit(
+  868:                     _task_generate_auto_report,
+  869:                     res,
+  870:                     session_payload,
+  871:                     selected_log,
+  872:                     callback=on_report_done,
+  873:                 )
+  874: 
+  875:             worker.submit(_task_analyze_specific_blackbox_log, selected_log, callback=on_analyze_done)
+  876:         except Exception as exc:
+  877:             blackbox_import_inflight = False
+  878:             set_error("Blackbox analyze error", exc)
+  879: 
+  880:     def auto_is_running() -> bool:
+  881:         return auto_state in {
+  882:             AdaptiveSessionState.adaptive_run,
+  883:             AdaptiveSessionState.recovery,
+  884:             AdaptiveSessionState.finalize,
+  885:             AdaptiveSessionState.import_analyze,
+  886:         }
+  887: 
+  888:     def schedule_auto_tick(delay_ms: int | None = None) -> None:
+  889:         nonlocal auto_tick_after_id
+  890:         if not auto_is_running():
+  891:             return
+  892:         if auto_tick_after_id is not None:
+  893:             try:
+  894:                 root.after_cancel(auto_tick_after_id)
+  895:             except Exception:
+  896:                 pass
+  897:         cadence_ms = max(10, round(auto_config.control_interval_s * 1000.0))
+  898:         auto_tick_after_id = root.after(cadence_ms if delay_ms is None else max(1, delay_ms), run_auto_tick)
+  899: 
+  900:     def stop_auto_session_runtime() -> None:
+  901:         nonlocal auto_tick_after_id, auto_pulse_inflight, auto_settle_until_s, auto_active_command
+  902:         if auto_tick_after_id is not None:
+  903:             try:
+  904:                 root.after_cancel(auto_tick_after_id)
+  905:             except Exception:
+  906:                 pass
+  907:             auto_tick_after_id = None
+  908:         auto_pulse_inflight = False
+  909:         auto_settle_until_s = None
+  910:         auto_active_command = None
+  911: 
+  912:     def set_auto_button_idle() -> None:
+  913:         auto_session_button.config(text="Start Auto Session", state="normal")
+  914: 
+  915:     def update_auto_command_text(text: str) -> None:
+  916:         auto_command_var.set(f"Command: {text}")
+  917: 
+  918:     def complete_auto_session(next_state: AdaptiveSessionState, reason: str, warning: str = "") -> None:
+  919:         nonlocal auto_stop_reason, auto_warning
+  920:         auto_stop_reason = reason
+  921:         auto_warning = warning
+  922:         stop_auto_session_runtime()
+  923:         if run_active and run_ser is not None and hold_timeout_after_id is None:
+  924:             try:
+  925:                 restore_base_outputs_after_hold()
+  926:             except Exception:
+  927:                 pass
+  928:         set_auto_state(next_state, warning or reason)
+  929:         update_auto_command_text("idle")
+  930:         update_auto_confidence_display()
+  931: 
+  932:     def auto_abort(reason: str, warning: str = "", continue_pipeline: bool = False) -> None:
+  933:         complete_auto_session(AdaptiveSessionState.aborted, reason, warning)
+  934:         status.set(f"Auto session aborted: {reason}")
+  935:         set_auto_button_idle()
+  936:         if continue_pipeline:
+  937:             begin_auto_pipeline()
+  938: 
+  939:     def start_auto_session() -> None:
+  940:         nonlocal auto_controller, auto_session_start_s, auto_last_tick_s
+  941:         nonlocal auto_last_sample_s, auto_stop_reason, auto_warning, auto_latest_report
+  942:         nonlocal auto_report_files, auto_import_result, auto_latest_imported_log
+  943:         if blackbox_import_inflight:
+  944:             raise RuntimeError("Blackbox import/analyze is in progress.")
+  945:         if not run_active or run_ser is None:
+  946:             raise RuntimeError("Connect Arduino output before starting auto session.")
+  947:         if not fc_service.is_connected:
+  948:             raise RuntimeError("Connect FC before starting auto session.")
+  949:         if level_active:
+  950:             raise RuntimeError("Stop auto-level before starting auto session.")
+  951:         if hold_command_inflight or hold_timeout_after_id is not None:
+  952:             raise RuntimeError("Wait for active pulse/hold command to complete first.")
+  953:         if fc_service.latest_attitude() is None:
+  954:             raise RuntimeError("No FC attitude sample yet. Wait for telemetry then retry.")
+  955: 
+  956:         prompt = (
+  957:             "Confirm preflight:\n"
+  958:             "- Drone physically armed and leveled on stand\n"
+  959:             "- Transmitter switched to trainer mode\n"
+  960:             "- Area is clear and stand is secure\n\n"
+  961:             "Start adaptive auto tune session now?"
+  962:         )
+  963:         if not messagebox.askyesno("Start Auto Session", prompt):
+  964:             status.set("Auto session start canceled.")
+  965:             return
+  966: 
+  967:         auto_controller = AdaptiveExcitationController(auto_config)
+  968:         auto_stop_reason = ""
+  969:         auto_warning = ""
+  970:         auto_latest_report = None
+  971:         auto_report_files = []
+  972:         auto_import_result = None
+  973:         auto_latest_imported_log = ""
+  974:         refresh_auto_report_file_list()
+  975:         set_auto_report_text("Auto session started. Waiting for adaptive coverage confidence.")
+  976:         auto_session_start_s = time.monotonic()
+  977:         auto_last_tick_s = auto_session_start_s
+  978:         auto_last_sample_s = auto_session_start_s
+  979:         set_auto_state(AdaptiveSessionState.adaptive_run, "Active")
+  980:         update_auto_command_text("waiting")
+  981:         update_auto_confidence_display()
+  982:         auto_session_button.config(text="Abort Auto Session", state="normal")
+  983:         status.set("Adaptive auto session active.")
+  984:         schedule_auto_tick()
+  985: 
+  986:     def finalize_auto_event() -> None:
+  987:         nonlocal auto_active_command, auto_event_peak_delta, auto_event_response_delay_s
+  988:         nonlocal auto_event_baseline, auto_event_start_s
+  989:         if auto_controller is None or auto_active_command is None:
+  990:             return
+  991:         sample = fc_service.latest_attitude()
+  992:         if sample is None:
+  993:             return
+  994:         axis_value = pulse_axis_value(sample, auto_active_command.axis)
+  995:         final_error = axis_value - auto_event_baseline
+  996:         settle_success = abs(final_error) <= auto_config.settle_deadband_deg
+  997:         event = ExcitationEvent(
+  998:             axis=auto_active_command.axis,
+  999:             direction=auto_active_command.direction,
+ 1000:             force_us=auto_active_command.force_us,
+ 1001:             hold_s=auto_active_command.hold_s,
+ 1002:             settle_s=auto_active_command.settle_s,
+ 1003:             baseline_angle_deg=auto_event_baseline,
+ 1004:             peak_delta_deg=auto_event_peak_delta,
+ 1005:             settle_success=settle_success,
+ 1006:             response_delay_s=auto_event_response_delay_s,
+ 1007:             final_error_deg=final_error,
+ 1008:         )
+ 1009:         auto_controller.record_event(event)
+ 1010:         auto_active_command = None
+ 1011:         auto_event_peak_delta = 0.0
+ 1012:         auto_event_response_delay_s = None
+ 1013:         auto_event_baseline = 0.0
+ 1014:         auto_event_start_s = 0.0
+ 1015:         update_auto_confidence_display()
+ 1016: 
+ 1017:     def issue_auto_command(command: AdaptiveCommand) -> None:
+ 1018:         nonlocal auto_pulse_inflight, auto_active_command, auto_settle_until_s
+ 1019:         nonlocal auto_event_peak_delta, auto_event_response_delay_s, auto_event_baseline, auto_event_start_s
+ 1020:         if run_ser is None:
+ 1021:             raise RuntimeError("Arduino output is disconnected.")
+ 1022:         if auto_controller is None:
+ 1023:             raise RuntimeError("Adaptive controller is not initialized.")
+ 1024: 
+ 1025:         sample = fc_service.latest_attitude()
+ 1026:         if sample is None:
+ 1027:             raise RuntimeError("No FC attitude sample available.")
+ 1028: 
+ 1029:         channel_index = axis_channel_index(command.axis)
+ 1030:         target = base_channel_outputs[channel_index] + (command.direction * command.force_us)
+ 1031:         target = max(1000, min(2000, target))
+ 1032:         offsets = parse_offset_values_with_defaults()
+ 1033: 
+ 1034:         active_outputs = base_channel_outputs.copy()
+ 1035:         active_outputs[channel_index] = target
+ 1036:         set_live_channel_outputs(active_outputs)
+ 1037:         auto_pulse_inflight = True
+ 1038:         auto_settle_until_s = None
+ 1039:         auto_active_command = command
+ 1040:         auto_event_peak_delta = 0.0
+ 1041:         auto_event_response_delay_s = None
+ 1042:         auto_event_baseline = pulse_axis_value(sample, command.axis)
+ 1043:         auto_event_start_s = time.monotonic()
+ 1044: 
+ 1045:         direction_label = "positive" if command.direction >= 0 else "negative"
+ 1046:         update_auto_command_text(
+ 1047:             f"{command.axis} {direction_label} {command.force_us}us hold {command.hold_s:.2f}s ({command.reason})"
+ 1048:         )
+ 1049:         auto_safety_var.set("Safety: recovery" if command.recovery else "Safety: tracking")
+ 1050: 
+ 1051:         def on_auto_hold_done(ok: bool, res: object) -> None:
+ 1052:             nonlocal auto_pulse_inflight, auto_settle_until_s
+ 1053:             auto_pulse_inflight = False
+ 1054:             if not auto_is_running():
+ 1055:                 return
+ 1056:             if not ok:
+ 1057:                 auto_abort(
+ 1058:                     "Pulse command failed during auto session.",
+ 1059:                     warning=str(res) if not isinstance(res, Exception) else str(res),
+ 1060:                 )
+ 1061:                 return
+ 1062:             if not isinstance(res, int):
+ 1063:                 auto_abort("Unexpected pulse result from worker.")
+ 1064:                 return
+ 1065:             if res == PULSE_STATUS_REJECTED:
+ 1066:                 auto_abort("Firmware rejected adaptive pulse command.")
+ 1067:                 return
+ 1068:             auto_settle_until_s = time.monotonic() + command.settle_s
+ 1069:             schedule_auto_tick(delay_ms=round(command.settle_s * 1000))
+ 1070: 
+ 1071:         worker.submit(_task_hold, channel_index, target, offsets[channel_index], command.hold_s, callback=on_auto_hold_done)
+ 1072: 
+ 1073:     def run_auto_tick() -> None:
+ 1074:         nonlocal auto_tick_after_id, auto_recovery_mode
+ 1075:         auto_tick_after_id = None
+ 1076:         if not auto_is_running():
+ 1077:             return
+ 1078:         if auto_controller is None:
+ 1079:             auto_abort("Adaptive controller was not initialized.")
+ 1080:             return
+ 1081:         if not run_active or run_ser is None:
+ 1082:             auto_abort("Arduino output disconnected during auto session.")
+ 1083:             return
+ 1084:         if not fc_service.is_connected:
+ 1085:             auto_abort("FC disconnected during auto session.")
+ 1086:             return
+ 1087: 
+ 1088:         now = time.monotonic()
+ 1089:         if auto_last_sample_s is None or (now - auto_last_sample_s) > auto_config.telemetry_stale_s:
+ 1090:             auto_abort("FC telemetry became stale.", continue_pipeline=False)
+ 1091:             return
+ 1092: 
+ 1093:         sample = fc_service.latest_attitude()
+ 1094:         if sample is None:
+ 1095:             schedule_auto_tick()
+ 1096:             return
+ 1097: 
+ 1098:         abort, abort_reason = auto_controller.should_abort(sample.roll_deg, sample.pitch_deg)
+ 1099:         if abort:
+ 1100:             auto_abort(abort_reason, continue_pipeline=True)
+ 1101:             return
+ 1102: 
+ 1103:         if auto_controller.should_recover(sample.roll_deg, sample.pitch_deg):
+ 1104:             auto_recovery_mode = True
+ 1105:             set_auto_state(AdaptiveSessionState.recovery, "Recovery mode")
+ 1106:         elif auto_recovery_mode and auto_controller.recovery_complete(sample.roll_deg, sample.pitch_deg):
+ 1107:             auto_recovery_mode = False
+ 1108:             set_auto_state(AdaptiveSessionState.adaptive_run, "Active")
+ 1109: 
+ 1110:         if auto_pulse_inflight:
+ 1111:             schedule_auto_tick()
+ 1112:             return
+ 1113: 
+ 1114:         if auto_active_command is not None and auto_settle_until_s is not None and now < auto_settle_until_s:
+ 1115:             schedule_auto_tick()
+ 1116:             return
+ 1117: 
+ 1118:         if auto_active_command is not None and auto_settle_until_s is not None and now >= auto_settle_until_s:
+ 1119:             finalize_auto_event()
+ 1120:             auto_settle_until_s = None
+ 1121:             update_auto_command_text("evaluating")
+ 1122: 
+ 1123:         ready, stop_reason, warning = auto_controller.stop_ready(auto_elapsed_s(now))
+ 1124:         if ready:
+ 1125:             complete_auto_session(AdaptiveSessionState.finalize, stop_reason, warning)
+ 1126:             status.set(f"Auto session complete: {stop_reason}")
+ 1127:             begin_auto_pipeline()
+ 1128:             return
+ 1129: 
+ 1130:         command = auto_controller.next_command(sample.roll_deg, sample.pitch_deg, auto_recovery_mode)
+ 1131:         if command is None:
+ 1132:             schedule_auto_tick()
+ 1133:             return
+ 1134: 
+ 1135:         try:
+ 1136:             issue_auto_command(command)
+ 1137:         except Exception as exc:
+ 1138:             auto_abort("Unable to issue adaptive command.", warning=str(exc))
+ 1139:             return
+ 1140:         schedule_auto_tick()
+ 1141: 
+ 1142:     def begin_auto_pipeline() -> None:
+ 1143:         nonlocal blackbox_import_inflight
+ 1144:         if blackbox_import_inflight:
+ 1145:             auto_warning_text = "Blackbox pipeline already in progress."
+ 1146:             auto_safety_var.set(f"Safety: {auto_warning_text}")
+ 1147:             return
+ 1148:         try:
+ 1149:             selected_port = fc_port()
+ 1150:             selected_baud = fc_baud()
+ 1151:             if fc_service.is_connected:
+ 1152:                 do_fc_disconnect(update_status=False)
+ 1153:             blackbox_import_inflight = True
+ 1154:             set_auto_state(AdaptiveSessionState.import_analyze, "Import/analyze running")
+ 1155:             update_auto_command_text("pulling blackbox logs")
+ 1156:             auto_session_button.config(text="Running Analysis...", state="disabled")
+ 1157:             status.set("Auto session finished. Pulling and analyzing blackbox logs...")
+ 1158: 
+ 1159:             def on_auto_pull_done(ok: bool, res: object) -> None:
+ 1160:                 nonlocal blackbox_import_inflight, auto_latest_imported_log
+ 1161:                 if not ok:
+ 1162:                     blackbox_import_inflight = False
+ 1163:                     auto_abort(
+ 1164:                         "Auto pipeline failed while pulling blackbox logs.",
+ 1165:                         warning=str(res) if not isinstance(res, Exception) else str(res),
+ 1166:                     )
+ 1167:                     return
+ 1168:                 if not isinstance(res, BlackboxImportResult):
+ 1169:                     blackbox_import_inflight = False
+ 1170:                     auto_abort("Unexpected pull result in auto pipeline.")
+ 1171:                     return
+ 1172:                 auto_latest_imported_log = ""
+ 1173:                 if res.imported_files:
+ 1174:                     newest = max(res.imported_files, key=lambda item: item.modified_epoch_s)
+ 1175:                     auto_latest_imported_log = newest.local_path
+ 1176:                 elif res.analysis_source:
+ 1177:                     auto_latest_imported_log = res.analysis_source
+ 1178:                 update_auto_command_text("analyzing newest segment")
+ 1179:                 if auto_latest_imported_log:
+ 1180:                     worker.submit(_task_analyze_specific_blackbox_log, auto_latest_imported_log, callback=on_auto_analyze_done)
+ 1181:                 else:
+ 1182:                     worker.submit(_task_analyze_blackbox_logs, callback=on_auto_analyze_done)
+ 1183: 
+ 1184:             def on_auto_analyze_done(ok: bool, res: object) -> None:
+ 1185:                 nonlocal blackbox_import_inflight, auto_import_result
+ 1186:                 if not ok:
+ 1187:                     blackbox_import_inflight = False
+ 1188:                     auto_abort(
+ 1189:                         "Auto pipeline failed while analyzing blackbox logs.",
+ 1190:                         warning=str(res) if not isinstance(res, Exception) else str(res),
+ 1191:                     )
+ 1192:                     return
+ 1193:                 if not isinstance(res, BlackboxImportResult):
+ 1194:                     blackbox_import_inflight = False
+ 1195:                     auto_abort("Unexpected analyze result in auto pipeline.")
+ 1196:                     return
+ 1197:                 auto_import_result = res
+ 1198:                 set_auto_report_text(format_blackbox_report(res))
+ 1199:                 update_auto_command_text("generating report artifacts")
+ 1200:                 worker.submit(
+ 1201:                     _task_generate_auto_report,
+ 1202:                     res,
+ 1203:                     auto_session_payload(),
+ 1204:                     auto_latest_imported_log,
+ 1205:                     callback=on_auto_report_done,
+ 1206:                 )
+ 1207: 
+ 1208:             def on_auto_report_done(ok: bool, res: object) -> None:
+ 1209:                 nonlocal blackbox_import_inflight, auto_latest_report, auto_report_files
+ 1210:                 blackbox_import_inflight = False
+ 1211:                 set_auto_button_idle()
+ 1212:                 if not ok:
+ 1213:                     auto_abort(
+ 1214:                         "Auto pipeline failed while generating report artifacts.",
+ 1215:                         warning=str(res) if not isinstance(res, Exception) else str(res),
+ 1216:                     )
+ 1217:                     return
+ 1218:                 if not isinstance(res, AutoTuneReport):
+ 1219:                     auto_abort("Unexpected report generation result.")
+ 1220:                     return
+ 1221:                 auto_latest_report = res
+ 1222:                 report_files = [
+ 1223:                     res.summary_txt,
+ 1224:                     res.summary_json,
+ 1225:                     res.combined_chart_sheet,
+ 1226:                     *list(res.chart_paths),
+ 1227:                 ]
+ 1228:                 auto_report_files = [path for path in dict.fromkeys(item for item in report_files if item)]
+ 1229:                 refresh_auto_report_file_list()
+ 1230:                 try:
+ 1231:                     report_text = Path(res.summary_txt).read_text(encoding="utf-8", errors="replace")
+ 1232:                 except Exception:
+ 1233:                     report_text = f"Report generated at {res.report_dir}\nSummary file: {res.summary_txt}"
+ 1234:                 set_auto_report_text(report_text)
+ 1235:                 set_auto_state(AdaptiveSessionState.report_ready, "Ready")
+ 1236:                 update_auto_command_text("done")
+ 1237:                 status.set(f"Auto report ready: {res.report_dir}")
+ 1238: 
+ 1239:             worker.submit(_task_enter_msc_and_import_blackbox_logs, selected_port, selected_baud, callback=on_auto_pull_done)
+ 1240:         except Exception as exc:
+ 1241:             blackbox_import_inflight = False
+ 1242:             auto_abort("Unable to start auto blackbox pipeline.", warning=str(exc))
+ 1243: 
+ 1244:     def do_auto_session_toggle() -> None:
+ 1245:         try:
+ 1246:             if auto_is_running():
+ 1247:                 auto_abort("Auto session aborted by user.", continue_pipeline=True)
+ 1248:                 return
+ 1249:             if auto_state == AdaptiveSessionState.import_analyze:
+ 1250:                 status.set("Auto pipeline is running; wait for completion.")
+ 1251:                 return
+ 1252:             start_auto_session()
+ 1253:         except Exception as exc:
+ 1254:             set_error("Auto session error", exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
+ 1255: 
+ 1256:     def set_error(title: str, exc: Exception) -> None:
+ 1257:         if is_closing:
+ 1258:             return
+ 1259:         status.set("Error")
+ 1260:         messagebox.showerror(title, str(exc))
+ 1261: 
+ 1262:     def update_link_indicators() -> None:
+ 1263:         if run_ser is not None:
+ 1264:             pc_link_box.config(text="PC-ARD OPEN", bg="#2E7D32", fg="white")
+ 1265:         else:
+ 1266:             pc_link_box.config(text="PC-ARD CLOSED", bg="#8B1E1E", fg="white")
+ 1267:         fc_connected = fc_service.is_connected
+ 1268:         if fc_connected:
+ 1269:             connect_fc_button.config(
+ 1270:                 text="Disconnect FC",
+ 1271:                 state="normal",
+ 1272:                 bg="#BEEAC4",
+ 1273:                 activebackground="#A6E1AE",
+ 1274:                 fg="#0E2F11",
+ 1275:                 activeforeground="#0E2F11",
+ 1276:             )
+ 1277:         else:
+ 1278:             connect_fc_button.config(
+ 1279:                 text="Connect FC",
+ 1280:                 state="normal",
+ 1281:                 bg="#F3C1C1",
+ 1282:                 activebackground="#ECA8A8",
+ 1283:                 fg="#3A1111",
+ 1284:                 activeforeground="#3A1111",
+ 1285:             )
+ 1286:         arduino_connected = run_active and run_ser is not None
+ 1287:         if start_pending:
+ 1288:             arduino_button.config(
+ 1289:                 text="Connecting...",
+ 1290:                 state="disabled",
+ 1291:                 bg="#F3E6B3",
+ 1292:                 activebackground="#EBD997",
+ 1293:                 fg="#3F3210",
+ 1294:                 activeforeground="#3F3210",
+ 1295:             )
+ 1296:         elif arduino_connected:
+ 1297:             arduino_button.config(
+ 1298:                 text="Disconnect Arduino",
+ 1299:                 state="normal",
+ 1300:                 bg="#BEEAC4",
+ 1301:                 activebackground="#A6E1AE",
+ 1302:                 fg="#0E2F11",
+ 1303:                 activeforeground="#0E2F11",
+ 1304:             )
+ 1305:         else:
+ 1306:             arduino_button.config(
+ 1307:                 text="Connect Arduino",
+ 1308:                 state="normal",
+ 1309:                 bg="#F3C1C1",
+ 1310:                 activebackground="#ECA8A8",
+ 1311:                 fg="#3A1111",
+ 1312:                 activeforeground="#3A1111",
+ 1313:             )
+ 1314:         angle_state = "normal" if fc_connected else "disabled"
+ 1315:         for entry in angle_entries:
+ 1316:             entry.config(state=angle_state)
+ 1317:         level_ready = run_ser is not None and fc_connected
+ 1318:         if level_active and not level_ready:
+ 1319:             stop_level_loop(update_status=False)
+ 1320:         level_button.config(state="normal" if level_ready else "disabled", relief="sunken" if level_active else "raised")
+ 1321:         if auto_state == AdaptiveSessionState.import_analyze:
+ 1322:             auto_session_button.config(text="Running Analysis...", state="disabled")
+ 1323:         elif auto_is_running():
+ 1324:             auto_session_button.config(text="Abort Auto Session", state="normal")
+ 1325:         else:
+ 1326:             auto_session_button.config(text="Start Auto Session", state="normal")
+ 1327: 
+ 1328:     def cancel_hold_timeout() -> None:
+ 1329:         nonlocal hold_timeout_after_id
+ 1330:         if hold_timeout_after_id is not None:
+ 1331:             try:
+ 1332:                 root.after_cancel(hold_timeout_after_id)
+ 1333:             except Exception:
+ 1334:                 pass
+ 1335:             finally:
+ 1336:                 hold_timeout_after_id = None
+ 1337: 
+ 1338:     def cancel_level_timer() -> None:
+ 1339:         nonlocal level_after_id
+ 1340:         if level_after_id is not None:
+ 1341:             try:
+ 1342:                 root.after_cancel(level_after_id)
+ 1343:             except Exception:
+ 1344:                 pass
+ 1345:             finally:
+ 1346:                 level_after_id = None
+ 1347: 
+ 1348:     def stop_level_loop(update_status: bool = False, reason: str = "Auto-level stopped.") -> None:
+ 1349:         nonlocal level_active, level_pulse_inflight, level_timeout_deadline_s
+ 1350:         was_active = level_active
+ 1351:         cancel_level_timer()
+ 1352:         level_active = False
+ 1353:         level_pulse_inflight = False
+ 1354:         level_timeout_deadline_s = None
+ 1355:         if hold_timeout_after_id is None:
+ 1356:             set_live_channel_outputs(base_channel_outputs)
+ 1357:         update_link_indicators()
+ 1358:         if update_status and was_active and not is_closing:
+ 1359:             status.set(reason)
+ 1360: 
+ 1361:     def level_target_from_angle(angle_deg: float) -> int | None:
+ 1362:         abs_angle = abs(angle_deg)
+ 1363:         if abs_angle <= LEVEL_DEADBAND_DEG:
+ 1364:             return None
+ 1365:         ratio = min(1.0, abs_angle / LEVEL_FULL_SCALE_DEG)
+ 1366:         delta = max(LEVEL_MIN_DELTA_US, round(LEVEL_MAX_DELTA_US * ratio))
+ 1367:         if angle_deg > 0:
+ 1368:             return LEVEL_CENTER_US - delta
+ 1369:         return LEVEL_CENTER_US + delta
+ 1370: 
+ 1371:     def is_level_attitude_settled(roll_deg: float, pitch_deg: float) -> bool:
+ 1372:         return abs(roll_deg) <= LEVEL_DEADBAND_DEG and abs(pitch_deg) <= LEVEL_DEADBAND_DEG
+ 1373: 
+ 1374:     def schedule_level_step(delay_ms: int = LEVEL_LOOP_INTERVAL_MS) -> None:
+ 1375:         nonlocal level_after_id
+ 1376:         cancel_level_timer()
+ 1377:         level_after_id = root.after(max(1, delay_ms), run_level_step)
+ 1378: 
+ 1379:     def run_level_step() -> None:
+ 1380:         nonlocal level_after_id, level_pulse_inflight
+ 1381:         level_after_id = None
+ 1382:         if not level_active:
+ 1383:             return
+ 1384:         if not run_active or run_ser is None:
+ 1385:             stop_level_loop(update_status=True, reason="Auto-level stopped: output is not running.")
+ 1386:             return
+ 1387:         if not fc_service.is_connected:
+ 1388:             stop_level_loop(update_status=True, reason="Auto-level stopped: FC is disconnected.")
+ 1389:             return
+ 1390:         if level_timeout_deadline_s is not None and time.monotonic() >= level_timeout_deadline_s:
+ 1391:             stop_level_loop(update_status=True, reason=f"Auto-level timed out after {level_timeout_s:.3g}s.")
+ 1392:             return
+ 1393:         if hold_timeout_after_id is not None or level_pulse_inflight:
+ 1394:             schedule_level_step()
+ 1395:             return
+ 1396: 
+ 1397:         sample = fc_service.latest_attitude()
+ 1398:         if sample is None:
+ 1399:             schedule_level_step()
+ 1400:             return
+ 1401:         if is_level_attitude_settled(sample.roll_deg, sample.pitch_deg):
+ 1402:             stop_level_loop(update_status=True, reason="Auto-level complete: roll and pitch are centered.")
+ 1403:             return
+ 1404: 
+ 1405:         roll_target_us = level_target_from_angle(sample.roll_deg)
+ 1406:         pitch_target_us = level_target_from_angle(sample.pitch_deg)
+ 1407:         axis_targets: list[tuple[int, int, float]] = []
+ 1408:         if roll_target_us is not None:
+ 1409:             axis_targets.append((ROLL_CHANNEL_INDEX, roll_target_us, abs(sample.roll_deg)))
+ 1410:         if pitch_target_us is not None:
+ 1411:             axis_targets.append((PITCH_CHANNEL_INDEX, pitch_target_us, abs(sample.pitch_deg)))
+ 1412:         if not axis_targets:
+ 1413:             stop_level_loop(update_status=True, reason="Auto-level complete: roll and pitch are centered.")
+ 1414:             return
+ 1415:         channel_index, target_us, _ = max(axis_targets, key=lambda item: item[2])
+ 1416: 
+ 1417:         try:
+ 1418:             offsets = parse_entries(off_entries, int, "Offset")
+ 1419:         except Exception as exc:
+ 1420:             stop_level_loop(update_status=False)
+ 1421:             set_error("Level error", exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
+ 1422:             return
+ 1423: 
+ 1424:         active_outputs = base_channel_outputs.copy()
+ 1425:         active_outputs[channel_index] = target_us
+ 1426:         set_live_channel_outputs(active_outputs)
+ 1427:         level_pulse_inflight = True
+ 1428: 
+ 1429:         def on_level_pulse_done(ok: bool, res: object) -> None:
+ 1430:             nonlocal level_pulse_inflight
+ 1431:             level_pulse_inflight = False
+ 1432:             if not level_active:
+ 1433:                 return
+ 1434:             if not ok:
+ 1435:                 stop_level_loop(update_status=False)
+ 1436:                 set_error("Level error", res if isinstance(res, Exception) else RuntimeError(res))
+ 1437:                 return
+ 1438:             if not isinstance(res, int):
+ 1439:                 stop_level_loop(update_status=False)
+ 1440:                 set_error("Level error", RuntimeError("Unexpected worker result from level task"))
+ 1441:                 return
+ 1442:             if res == PULSE_STATUS_REJECTED:
+ 1443:                 stop_level_loop(update_status=False)
+ 1444:                 set_error("Level error", RuntimeError("Firmware rejected auto-level pulse"))
+ 1445:                 return
+ 1446:             schedule_level_step()
+ 1447: 
+ 1448:         worker.submit(
+ 1449:             _task_hold,
+ 1450:             channel_index,
+ 1451:             target_us,
+ 1452:             offsets[channel_index],
+ 1453:             LEVEL_PULSE_TIMEOUT_S,
+ 1454:             callback=on_level_pulse_done,
+ 1455:         )
+ 1456: 
+ 1457:     def do_level() -> None:
+ 1458:         nonlocal level_active, level_timeout_deadline_s, level_timeout_s
+ 1459:         try:
+ 1460:             if level_active:
+ 1461:                 stop_level_loop(update_status=True)
+ 1462:                 return
+ 1463:             if not run_active or run_ser is None:
+ 1464:                 raise RuntimeError("Press Connect Arduino before using Level.")
+ 1465:             if not fc_service.is_connected:
+ 1466:                 raise RuntimeError("Connect FC before using Level.")
+ 1467:             if hold_command_inflight:
+ 1468:                 raise RuntimeError("Wait for active Pulse command to finish.")
+ 1469:             if hold_timeout_after_id is not None:
+ 1470:                 raise RuntimeError("Wait for active Hold to finish or press ∅/Stop.")
+ 1471:             if fc_service.latest_attitude() is None:
+ 1472:                 raise RuntimeError("No FC attitude sample yet. Wait a moment, then press Level again.")
+ 1473:             durations = parse_entries(dur_entries, float, "Duration")
+ 1474:             level_timeout_s = max(durations[ROLL_CHANNEL_INDEX], durations[PITCH_CHANNEL_INDEX])
+ 1475:             if level_timeout_s < LEVEL_TIMEOUT_MIN_S or level_timeout_s > LEVEL_TIMEOUT_MAX_S:
+ 1476:                 raise RuntimeError(
+ 1477:                     f"Duration CH1/CH2 must be between {LEVEL_TIMEOUT_MIN_S:.3g}s and {LEVEL_TIMEOUT_MAX_S:.3g}s."
+ 1478:                 )
+ 1479:             level_active = True
+ 1480:             level_timeout_deadline_s = time.monotonic() + level_timeout_s
+ 1481:             update_link_indicators()
+ 1482:             status.set(f"Auto-level active ({level_timeout_s:.3g}s timeout). Press Level again to stop.")
+ 1483:             run_level_step()
+ 1484:         except Exception as exc:
+ 1485:             stop_level_loop(update_status=False)
+ 1486:             set_error("Level error", exc)
+ 1487: 
+ 1488:     def close_run_connection() -> None:
+ 1489:         nonlocal run_ser, run_quant, run_max_count, run_active, hold_command_inflight
+ 1490:         nonlocal channel_update_inflight, pending_channel_update_channels, pending_channel_update_offsets
+ 1491:         if run_ser is not None:
+ 1492:             try:
+ 1493:                 run_ser.close()
+ 1494:             except Exception:
+ 1495:                 pass
+ 1496:             finally:
+ 1497:                 run_ser = None
+ 1498:                 run_quant = None
+ 1499:                 run_max_count = None
+ 1500:                 run_active = False
+ 1501:                 hold_command_inflight = False
+ 1502:                 channel_update_inflight = False
+ 1503:                 pending_channel_update_channels = None
+ 1504:                 pending_channel_update_offsets = None
+ 1505:                 update_link_indicators()
+ 1506: 
+ 1507:     def do_fc_connect() -> None:
+ 1508:         try:
+ 1509:             if fc_service.is_connected:
+ 1510:                 return
+ 1511:             selected_port = fc_port()
+ 1512:             selected_baud = fc_baud()
+ 1513:             fc_service.connect(selected_port, selected_baud)
+ 1514:             # Mirror Usb2Arduino flow: verify telemetry immediately, then load PID/FF asynchronously.
+ 1515:             _ = fc_service.read_attitude(timeout_seconds=2.0)
+ 1516:             update_link_indicators()
+ 1517:             status.set(f"FC connected: {selected_port} @ {selected_baud}. Loading PID/FF...")
+ 1518:             queue_fc_pid_ff_refresh(selected_port, selected_baud)
+ 1519:         except Exception as exc:
+ 1520:             set_error("FC connect error", exc)
+ 1521: 
+ 1522:     def do_fc_disconnect(update_status: bool = True) -> None:
+ 1523:         if auto_state in (AdaptiveSessionState.adaptive_run, AdaptiveSessionState.recovery):
+ 1524:             auto_abort("FC disconnected during adaptive session.", continue_pipeline=False)
+ 1525:         try:
+ 1526:             fc_service.disconnect()
+ 1527:         except Exception as exc:
+ 1528:             if not is_closing:
+ 1529:                 set_error("FC disconnect error", exc)
+ 1530:         finally:
+ 1531:             horizon.set_attitude(0.0, 0.0)
+ 1532:             roll_text.set("Roll: 0.0 deg")
+ 1533:             pitch_text.set("Pitch: 0.0 deg")
+ 1534:             clear_pid_ff_displays()
+ 1535:             update_link_indicators()
+ 1536:             if update_status and not is_closing:
+ 1537:                 status.set("FC disconnected.")
+ 1538: 
+ 1539:     def do_fc_toggle() -> None:
+ 1540:         if fc_service.is_connected:
+ 1541:             do_fc_disconnect()
+ 1542:         else:
+ 1543:             do_fc_connect()
+ 1544: 
+ 1545:     def do_arduino_toggle() -> None:
+ 1546:         if start_pending:
+ 1547:             return
+ 1548:         if run_active and run_ser is not None:
+ 1549:             do_stop()
+ 1550:         else:
+ 1551:             do_start()
+ 1552: 
+ 1553:     def poll_fc_attitude() -> None:
+ 1554:         nonlocal fc_poll_after_id
+ 1555:         try:
+ 1556:             sample = fc_service.latest_attitude()
+ 1557:             if sample is not None:
+ 1558:                 record_auto_session_sample(sample)
+ 1559:                 horizon.set_attitude(sample.roll_deg, sample.pitch_deg)
+ 1560:                 roll_text.set(f"Roll: {sample.roll_deg:6.1f} deg")
+ 1561:                 pitch_text.set(f"Pitch: {sample.pitch_deg:6.1f} deg")
+ 1562:         except Exception:
+ 1563:             pass
+ 1564:         fc_poll_after_id = root.after(60, poll_fc_attitude)
+ 1565: 
+ 1566:     def _task_open_and_start(worker_self: SerialWorker, port: str, channels: list[int], offsets: list[int]):
+ 1567:         ser = open_serial(port)
+ 1568:         worker_self.ser = ser
+ 1569:         try:
+ 1570:             quant, max_count, version_warning = run_ppm_on_serial(ser, channels, offsets)
+ 1571:         except Exception:
+ 1572:             ser.close()
+ 1573:             worker_self.ser = None
+ 1574:             raise
+ 1575:         return (quant, max_count, version_warning)
+ 1576: 
+ 1577:     def _task_stop(worker_self: SerialWorker, port: str):
+ 1578:         if worker_self.ser is not None:
+ 1579:             try:
+ 1580:                 stop_ppm_on_serial(worker_self.ser)
+ 1581:             finally:
+ 1582:                 try:
+ 1583:                     worker_self.ser.close()
+ 1584:                 finally:
+ 1585:                     worker_self.ser = None
+ 1586:             return None
+ 1587:         else:
+ 1588:             with open_serial(port) as ser:
+ 1589:                 stop_ppm_on_serial(ser)
+ 1590:             return None
+ 1591: 
+ 1592:     def _task_hold(worker_self: SerialWorker, i: int, target: int, offset: int, timeout_s: float):
+ 1593:         if worker_self.ser is None:
+ 1594:             raise RuntimeError("Serial not open")
+ 1595:         quant, max_count = read_regs(worker_self.ser, REG_QUANT, 2)
+ 1596:         set_channel_until_stop_on_serial(worker_self.ser, quant, max_count, i, target, offset, timeout_s)
+ 1597:         return read_pulse_status_on_serial(worker_self.ser, max_count)
+ 1598: 
+ 1599:     def _task_fc_read_pid_ff(_worker_self: SerialWorker):
+ 1600:         return fc_service.read_roll_pitch_pid_ff(timeout_seconds=1.2)
+ 1601: 
+ 1602:     def _task_enter_msc_and_import_blackbox_logs(_worker_self: SerialWorker, fc_port_name: str, fc_baud_rate: int):
+ 1603:         msc_warnings: list[str] = []
+ 1604:         try:
+ 1605:             send_cli_msc_command(fc_port_name, fc_baud_rate)
+ 1606:         except Exception as exc:
+ 1607:             msc_warnings.append(f"Could not send CLI 'msc' on {fc_port_name}: {exc}")
+ 1608: 
+ 1609:         deadline = time.monotonic() + blackbox_msc_mount_timeout_s
+ 1610:         result: BlackboxImportResult | None = None
+ 1611:         while True:
+ 1612:             result = import_blackbox_logs_from_msc(blackbox_import_dir)
+ 1613:             if result.scanned_roots:
+ 1614:                 break
+ 1615:             if time.monotonic() >= deadline:
+ 1616:                 break
+ 1617:             time.sleep(blackbox_msc_mount_poll_s)
+ 1618: 
+ 1619:         if result is None:
+ 1620:             result = import_blackbox_logs_from_msc(blackbox_import_dir)
+ 1621:         if not msc_warnings:
+ 1622:             return result
+ 1623: 
+ 1624:         merged_warnings: list[str] = []
+ 1625:         for warning in [*msc_warnings, *result.warnings]:
+ 1626:             if warning and warning not in merged_warnings:
+ 1627:                 merged_warnings.append(warning)
+ 1628:         return BlackboxImportResult(
+ 1629:             scanned_roots=result.scanned_roots,
+ 1630:             imported_files=result.imported_files,
+ 1631:             skipped_count=result.skipped_count,
+ 1632:             warnings=tuple(merged_warnings),
+ 1633:             analysis_summary=result.analysis_summary,
+ 1634:             analysis_source=result.analysis_source,
+ 1635:             pid_report=result.pid_report,
+ 1636:         )
+ 1637: 
+ 1638:     def _task_analyze_blackbox_logs(_worker_self: SerialWorker):
+ 1639:         return analyze_pulled_blackbox_logs(blackbox_import_dir)
+ 1640: 
+ 1641:     def _task_analyze_specific_blackbox_log(_worker_self: SerialWorker, log_path: str):
+ 1642:         return analyze_blackbox_log(log_path, decode_destination_dir=blackbox_import_dir)
+ 1643: 
+ 1644:     def _is_auxiliary_blackbox_csv(path: Path) -> bool:
+ 1645:         lower = path.name.lower()
+ 1646:         return lower.endswith(".gps.csv") or lower.endswith(".event.csv") or lower.endswith(".events.csv")
+ 1647: 
+ 1648:     def _resolve_chart_source_path(analysis_result: BlackboxImportResult, preferred_log_path: str) -> str | None:
+ 1649:         candidates: list[Path] = []
+ 1650:         if preferred_log_path:
+ 1651:             candidates.append(Path(preferred_log_path))
+ 1652:         if analysis_result.analysis_source:
+ 1653:             candidates.append(Path(analysis_result.analysis_source))
+ 1654: 
+ 1655:         # Prefer any explicit, existing non-aux CSV path first.
+ 1656:         for candidate in candidates:
+ 1657:             if candidate.exists() and candidate.is_file() and candidate.suffix.lower() == ".csv":
+ 1658:                 if not _is_auxiliary_blackbox_csv(candidate):
+ 1659:                     return str(candidate)
+ 1660: 
+ 1661:         search_dirs: list[Path] = []
+ 1662:         for candidate in candidates:
+ 1663:             parent = candidate.parent
+ 1664:             if parent.exists() and parent not in search_dirs:
+ 1665:                 search_dirs.append(parent)
+ 1666:         if blackbox_import_dir.exists() and blackbox_import_dir not in search_dirs:
+ 1667:             search_dirs.append(blackbox_import_dir)
+ 1668: 
+ 1669:         stems: list[str] = []
+ 1670:         for candidate in candidates:
+ 1671:             stem = candidate.stem.strip()
+ 1672:             if stem and stem not in stems:
+ 1673:                 stems.append(stem)
+ 1674: 
+ 1675:         for search_dir in search_dirs:
+ 1676:             csv_candidates: list[Path] = []
+ 1677:             for stem in stems:
+ 1678:                 csv_candidates.extend(p for p in search_dir.glob(f"{stem}*.csv") if p.is_file())
+ 1679:             csv_candidates.extend(p for p in search_dir.glob("*.csv") if p.is_file())
+ 1680:             preferred_csvs = [p for p in csv_candidates if not _is_auxiliary_blackbox_csv(p)]
+ 1681:             if preferred_csvs:
+ 1682:                 return str(max(preferred_csvs, key=lambda p: p.stat().st_mtime))
+ 1683: 
+ 1684:         if analysis_result.analysis_source:
+ 1685:             return analysis_result.analysis_source
+ 1686:         return preferred_log_path or None
+ 1687: 
+ 1688:     def _task_generate_auto_report(
+ 1689:         _worker_self: SerialWorker,
+ 1690:         analysis_result: BlackboxImportResult,
+ 1691:         session_payload: dict[str, object],
+ 1692:         preferred_log_path: str,
+ 1693:     ):
+ 1694:         source_path = _resolve_chart_source_path(analysis_result, preferred_log_path)
+ 1695:         return generate_auto_tune_report(
+ 1696:             blackbox_import_dir,
+ 1697:             analysis_result,
+ 1698:             session_payload,
+ 1699:             source_path,
+ 1700:         )
+ 1701: 
+ 1702:     def _task_hold_humanized(
+ 1703:         worker_self: SerialWorker,
+ 1704:         i: int,
+ 1705:         target: int,
+ 1706:         offset: int,
+ 1707:         timeout_s: float,
+ 1708:         channels: list[int],
+ 1709:         offsets: list[int],
+ 1710:     ):
+ 1711:         if worker_self.ser is None:
+ 1712:             raise RuntimeError("Serial not open")
+ 1713:         quant, max_count = read_regs(worker_self.ser, REG_QUANT, 2)
+ 1714:         set_channel_with_human_profile_until_stop_on_serial(
+ 1715:             worker_self.ser,
+ 1716:             quant,
+ 1717:             max_count,
+ 1718:             channels,
+ 1719:             offsets,
+ 1720:             i,
+ 1721:             target,
+ 1722:             offset,
+ 1723:             timeout_s,
+ 1724:         )
+ 1725:         return read_pulse_status_on_serial(worker_self.ser, max_count)
+ 1726: 
+ 1727:     def _task_hold_end(worker_self: SerialWorker, i: int):
+ 1728:         if worker_self.ser is None:
+ 1729:             raise RuntimeError("Serial not open")
+ 1730:         _, max_count = read_regs(worker_self.ser, REG_QUANT, 2)
+ 1731:         end_hold_on_serial(worker_self.ser, max_count, i)
+ 1732:         return read_pulse_status_on_serial(worker_self.ser, max_count)
+ 1733: 
+ 1734:     def _task_run_ppm_on_existing(worker_self: SerialWorker, channels: list[int], offsets: list[int]):
+ 1735:         if worker_self.ser is None:
+ 1736:             raise RuntimeError("Serial not open")
+ 1737:         return run_ppm_on_serial(worker_self.ser, channels, offsets)
+ 1738: 
+ 1739:     def _task_update_channels(worker_self: SerialWorker, channels: list[int], offsets: list[int]):
+ 1740:         if worker_self.ser is None:
+ 1741:             raise RuntimeError("Serial not open")
+ 1742:         quant, max_count, _ = run_ppm_on_serial(worker_self.ser, channels, offsets)
+ 1743:         return (quant, max_count, channels)
+ 1744: 
+ 1745:     def _task_read_pulse_status(worker_self: SerialWorker, max_count: int):
+ 1746:         if worker_self.ser is None:
+ 1747:             raise RuntimeError("Serial not open")
+ 1748:         return read_pulse_status_on_serial(worker_self.ser, max_count)
+ 1749: 
+ 1750:     def _task_shutdown(worker_self: SerialWorker):
+ 1751:         if worker_self.ser is None:
+ 1752:             return None
+ 1753:         try:
+ 1754:             stop_ppm_on_serial(worker_self.ser)
+ 1755:         except Exception:
+ 1756:             pass
+ 1757:         finally:
+ 1758:             try:
+ 1759:                 worker_self.ser.close()
+ 1760:             finally:
+ 1761:                 worker_self.ser = None
+ 1762:         return None
+ 1763: 
+ 1764:     def poll_results() -> None:
+ 1765:         while True:
+ 1766:             try:
+ 1767:                 cb, ok, res = worker.results.get_nowait()
+ 1768:             except queue.Empty:
+ 1769:                 break
+ 1770:             if cb:
+ 1771:                 try:
+ 1772:                     cb(ok, res)
+ 1773:                 except Exception as e:
+ 1774:                     set_error("Callback error", e)
+ 1775:         root.after(50, poll_results)
+ 1776: 
+ 1777:     def do_start() -> None:
+ 1778:         nonlocal run_active, run_port, run_ser, run_quant, run_max_count, start_pending, base_channel_outputs
+ 1779:         nonlocal channel_update_inflight, pending_channel_update_channels, pending_channel_update_offsets
+ 1780:         try:
+ 1781:             if start_pending:
+ 1782:                 raise RuntimeError("Start is already in progress.")
+ 1783:             if hold_command_inflight:
+ 1784:                 raise RuntimeError("Wait for active Pulse command to finish.")
+ 1785:             if hold_timeout_after_id is not None:
+ 1786:                 raise RuntimeError("Wait for active Hold to finish or press ∅/Stop.")
+ 1787:             channels = parse_entries(ch_entries, int, "Channel")
+ 1788:             require_range(channels, "Channel", 1000, 2000)
+ 1789:             offsets = parse_entries(off_entries, int, "Offset")
+ 1790:             selected_port = port()
+ 1791: 
+ 1792:             def on_start_done(ok: bool, res: object) -> None:
+ 1793:                 nonlocal run_active, run_port, run_ser, run_quant, run_max_count, start_pending, base_channel_outputs
+ 1794:                 nonlocal channel_update_inflight, pending_channel_update_channels, pending_channel_update_offsets
+ 1795:                 start_pending = False
+ 1796:                 if not ok:
+ 1797:                     update_link_indicators()
+ 1798:                     set_error("Start error", res if isinstance(res, Exception) else RuntimeError(res))
+ 1799:                     return
+ 1800:                 if (
+ 1801:                     not isinstance(res, tuple)
+ 1802:                     or len(res) != 3
+ 1803:                     or not isinstance(res[0], int)
+ 1804:                     or not isinstance(res[1], int)
+ 1805:                     or (res[2] is not None and not isinstance(res[2], str))
+ 1806:                 ):
+ 1807:                     update_link_indicators()
+ 1808:                     set_error("Start error", RuntimeError("Unexpected worker result from start task"))
+ 1809:                     return
+ 1810:                 # success
+ 1811:                 run_port = selected_port
+ 1812:                 run_quant = res[0]
+ 1813:                 run_max_count = res[1]
+ 1814:                 run_ser = worker.ser
+ 1815:                 run_active = True
+ 1816:                 channel_update_inflight = False
+ 1817:                 pending_channel_update_channels = None
+ 1818:                 pending_channel_update_offsets = None
+ 1819:                 base_channel_outputs = channels.copy()
+ 1820:                 set_live_channel_outputs(base_channel_outputs)
+ 1821:                 update_link_indicators()
+ 1822:                 version_warning = res[2]
+ 1823:                 if version_warning:
+ 1824:                     status.set(version_warning)
+ 1825:                     messagebox.showwarning("Firmware version", version_warning)
+ 1826:                 else:
+ 1827:                     status.set("PPM output configured and started.")
+ 1828: 
+ 1829:             if run_ser is None:
+ 1830:                 start_pending = True
+ 1831:                 update_link_indicators()
+ 1832:                 worker.submit(_task_open_and_start, selected_port, channels, offsets, callback=on_start_done)
+ 1833:             else:
+ 1834:                 if selected_port != run_port:
+ 1835:                     raise RuntimeError(f"Output is active on {run_port}. Press Disconnect Arduino before switching ports.")
+ 1836:                 start_pending = True
+ 1837:                 update_link_indicators()
+ 1838:                 worker.submit(_task_run_ppm_on_existing, channels, offsets, callback=on_start_done)
+ 1839: 
+ 1840:         except Exception as exc:
+ 1841:             start_pending = False
+ 1842:             update_link_indicators()
+ 1843:             set_error("Start error", exc)
+ 1844: 
+ 1845:     def do_stop() -> None:
+ 1846:         try:
+ 1847:             if hold_command_inflight:
+ 1848:                 raise RuntimeError("Pulse command is in progress. Wait a moment, then try again.")
+ 1849:             cancel_hold_timeout()
+ 1850:             def on_stop_done(ok: bool, res: object) -> None:
+ 1851:                 nonlocal run_ser, run_quant, run_max_count, run_active, hold_command_inflight
+ 1852:                 nonlocal channel_update_inflight, pending_channel_update_channels, pending_channel_update_offsets
+ 1853:                 if not ok:
+ 1854:                     set_error("Stop error", res if isinstance(res, Exception) else RuntimeError(res))
+ 1855:                     return
+ 1856:                 if res is not None:
+ 1857:                     set_error("Stop error", RuntimeError("Unexpected worker result from stop task"))
+ 1858:                     return
+ 1859:                 run_ser = None
+ 1860:                 run_quant = None
+ 1861:                 run_max_count = None
+ 1862:                 run_active = False
+ 1863:                 hold_command_inflight = False
+ 1864:                 channel_update_inflight = False
+ 1865:                 pending_channel_update_channels = None
+ 1866:                 pending_channel_update_offsets = None
+ 1867:                 set_live_channel_outputs(parse_channel_values_with_defaults())
+ 1868:                 update_link_indicators()
+ 1869:                 status.set("PPM output stopped.")
+ 1870: 
+ 1871:             worker.submit(_task_stop, port(), callback=on_stop_done)
+ 1872:         except Exception as exc:
+ 1873:             set_error("Stop error", exc)
+ 1874: 
+ 1875:     def do_hold_send(i: int, direction: int) -> None:
+ 1876:         nonlocal run_max_count, hold_timeout_after_id, hold_command_inflight
+ 1877:         try:
+ 1878:             if not run_active or run_ser is None:
+ 1879:                 raise RuntimeError("Press Connect Arduino before using Hold.")
+ 1880:             if level_active:
+ 1881:                 stop_level_loop(update_status=False)
+ 1882:             if hold_command_inflight:
+ 1883:                 raise RuntimeError("A pulse command is already in progress.")
+ 1884:             if hold_timeout_after_id is not None:
+ 1885:                 raise RuntimeError("A hold command is already active. Wait for timeout or press ∅.")
+ 1886: 
+ 1887:             channels = parse_entries(ch_entries, int, "Channel")
+ 1888:             require_range(channels, "Channel", 1000, 2000)
+ 1889:             offsets = parse_entries(off_entries, int, "Offset")
+ 1890:             targets = parse_entries(target_entries, int, "Target")
+ 1891:             require_range(targets, "Target", 0, 500)
+ 1892:             durations = parse_entries(dur_entries, float, "Duration")
+ 1893:             require_duration_range(durations, 0.05, 60.0)
+ 1894:             timeout_s = durations[i]
+ 1895:             signed_direction = 1 if direction >= 0 else -1
+ 1896:             target_delta_us = signed_direction * targets[i]
+ 1897:             pulse_target_us = channels[i] + target_delta_us
+ 1898:             if pulse_target_us < 1000 or pulse_target_us > 2000:
+ 1899:                 raise RuntimeError(
+ 1900:                     f"Computed pulse value CH{i + 1} is {pulse_target_us}. "
+ 1901:                     "Adjust Channel/Target so output stays between 1000 and 2000."
+ 1902:                 )
+ 1903:             angle_threshold = 0.0
+ 1904:             angle_state = str(angle_entries[i].cget("state"))
+ 1905:             if angle_state == "normal":
+ 1906:                 raw_threshold = angle_entries[i].get().strip()
+ 1907:                 if raw_threshold:
+ 1908:                     try:
+ 1909:                         angle_magnitude = float(raw_threshold)
+ 1910:                     except ValueError as exc:
+ 1911:                         raise RuntimeError(f"Angle CH{i + 1} must be a number.") from exc
+ 1912:                     if angle_magnitude < 0 or angle_magnitude > 45:
+ 1913:                         raise RuntimeError(f"Angle CH{i + 1} must be between 0 and 45.")
+ 1914:                     if angle_magnitude > 0:
+ 1915:                         angle_threshold = float(signed_direction) * angle_magnitude
+ 1916: 
+ 1917:             def restore_after_hold_failure() -> None:
+ 1918:                 if not run_active or run_ser is None:
+ 1919:                     return
+ 1920:                 restore_base_outputs_after_hold(offsets)
+ 1921: 
+ 1922:             def on_hold_done(ok: bool, res: object) -> None:
+ 1923:                 nonlocal hold_timeout_after_id, run_max_count, hold_command_inflight
+ 1924:                 hold_command_inflight = False
+ 1925:                 if not ok:
+ 1926:                     restore_after_hold_failure()
+ 1927:                     set_error("Hold error", res if isinstance(res, Exception) else RuntimeError(res))
+ 1928:                     return
+ 1929:                 if not isinstance(res, int):
+ 1930:                     restore_after_hold_failure()
+ 1931:                     set_error("Hold error", RuntimeError("Unexpected worker result from hold task"))
+ 1932:                     return
+ 1933:                 pulse_status = res
+ 1934:                 if pulse_status == PULSE_STATUS_REJECTED:
+ 1935:                     restore_after_hold_failure()
+ 1936:                     set_error("Hold error", RuntimeError("Firmware rejected hold command"))
+ 1937:                     return
+ 1938:                 active_outputs = base_channel_outputs.copy()
+ 1939:                 active_outputs[i] = pulse_target_us
+ 1940:                 set_live_channel_outputs(active_outputs)
+ 1941: 
+ 1942:                 timeout_ms = max(1, round(timeout_s * 1000))
+ 1943:                 chan_label = i + 1
+ 1944:                 deadline_s = time.monotonic() + timeout_s
+ 1945:                 direction_label = "positive" if signed_direction > 0 else "negative"
+ 1946: 
+ 1947:                 def schedule_timeout_status_check() -> None:
+ 1948:                     def cb(ok2: bool, res2: object) -> None:
+ 1949:                         nonlocal hold_timeout_after_id
+ 1950:                         if not ok2:
+ 1951:                             set_error("Hold timeout error", res2 if isinstance(res2, Exception) else RuntimeError(res2))
+ 1952:                             hold_timeout_after_id = None
+ 1953:                             return
+ 1954:                         if not isinstance(res2, int):
+ 1955:                             set_error("Hold timeout error", RuntimeError("Unexpected worker result from pulse-status task"))
+ 1956:                             hold_timeout_after_id = None
+ 1957:                             return
+ 1958:                         pulse_status_now = res2
+ 1959:                         if pulse_status_now not in (PULSE_STATUS_TIMEOUT_RESTORED, PULSE_STATUS_HOLD_ENDED):
+ 1960:                             hold_timeout_after_id = root.after(HOLD_TIMEOUT_POLL_MS, schedule_timeout_status_check)
+ 1961:                             return
+ 1962:                         hold_timeout_after_id = None
+ 1963:                         restore_base_outputs_after_hold(offsets)
+ 1964:                         if pulse_status_now == PULSE_STATUS_TIMEOUT_RESTORED:
+ 1965:                             status.set(f"CH{chan_label} hold timed out; channel restored.")
+ 1966:                         else:
+ 1967:                             status.set(f"CH{chan_label} hold ended; channel restored.")
+ 1968: 
+ 1969:                     worker.submit(_task_read_pulse_status, run_max_count or 0, callback=cb)
+ 1970: 
+ 1971:                 def on_angle_hold_end_done(ok3: bool, res3: object) -> None:
+ 1972:                     nonlocal hold_timeout_after_id
+ 1973:                     if not ok3:
+ 1974:                         set_error("Hold end error", res3 if isinstance(res3, Exception) else RuntimeError(res3))
+ 1975:                         hold_timeout_after_id = root.after(HOLD_ANGLE_CHECK_MS, schedule_angle_or_timeout_check)
+ 1976:                         return
+ 1977:                     if not isinstance(res3, int):
+ 1978:                         set_error("Hold end error", RuntimeError("Unexpected worker result from hold-end task"))
+ 1979:                         hold_timeout_after_id = root.after(HOLD_ANGLE_CHECK_MS, schedule_angle_or_timeout_check)
+ 1980:                         return
+ 1981:                     if res3 == PULSE_STATUS_REJECTED:
+ 1982:                         set_error("Hold end error", RuntimeError("Firmware rejected hold-end command"))
+ 1983:                         hold_timeout_after_id = root.after(HOLD_ANGLE_CHECK_MS, schedule_angle_or_timeout_check)
+ 1984:                         return
+ 1985:                     cancel_hold_timeout()
+ 1986:                     restore_base_outputs_after_hold(offsets)
+ 1987:                     status.set(f"CH{chan_label} hold ended on angle threshold; channel restored.")
+ 1988: 
+ 1989:                 def schedule_angle_or_timeout_check() -> None:
+ 1990:                     nonlocal hold_timeout_after_id
+ 1991:                     if hold_timeout_after_id is None:
+ 1992:                         return
+ 1993: 
+ 1994:                     angle_entry_enabled = str(angle_entries[i].cget("state")) == "normal"
+ 1995:                     if angle_entry_enabled and angle_threshold != 0 and is_angle_threshold_reached(i, angle_threshold):
+ 1996:                         worker.submit(_task_hold_end, i, callback=on_angle_hold_end_done)
+ 1997:                         return
+ 1998: 
+ 1999:                     if time.monotonic() >= deadline_s:
+ 2000:                         schedule_timeout_status_check()
+ 2001:                         return
+ 2002: 
+ 2003:                     remaining_ms = max(1, round((deadline_s - time.monotonic()) * 1000))
+ 2004:                     hold_timeout_after_id = root.after(min(HOLD_ANGLE_CHECK_MS, remaining_ms), schedule_angle_or_timeout_check)
+ 2005: 
+ 2006:                 hold_timeout_after_id = root.after(min(HOLD_ANGLE_CHECK_MS, timeout_ms), schedule_angle_or_timeout_check)
+ 2007:                 status.set(
+ 2008:                     f"CH{chan_label} hold active ({direction_label}, {target_delta_us:+d}us). "
+ 2009:                     f"Press ∅ for early restore (auto in {timeout_s:.3g}s)."
+ 2010:                 )
+ 2011: 
+ 2012:             hold_command_inflight = True
+ 2013:             try:
+ 2014:                 worker.submit(
+ 2015:                     _task_hold_humanized,
+ 2016:                     i,
+ 2017:                     pulse_target_us,
+ 2018:                     offsets[i],
+ 2019:                     timeout_s,
+ 2020:                     channels.copy(),
+ 2021:                     offsets.copy(),
+ 2022:                     callback=on_hold_done,
+ 2023:                 )
+ 2024:             except Exception:
+ 2025:                 hold_command_inflight = False
+ 2026:                 raise
+ 2027:         except Exception as exc:
+ 2028:             set_error("Hold error", exc)
+ 2029: 
+ 2030:     def do_hold_end(i: int) -> None:
+ 2031:         try:
+ 2032:             if not run_active or run_ser is None:
+ 2033:                 raise RuntimeError("Press Connect Arduino before ending Hold.")
+ 2034:             if hold_command_inflight:
+ 2035:                 raise RuntimeError("Pulse command is still ramping in. Wait a moment, then try ∅.")
+ 2036:             if hold_timeout_after_id is None:
+ 2037:                 raise RuntimeError("No active Hold to end.")
+ 2038: 
+ 2039:             def on_hold_end_done(ok: bool, res: object) -> None:
+ 2040:                 if not ok:
+ 2041:                     set_error("Hold end error", res if isinstance(res, Exception) else RuntimeError(res))
+ 2042:                     return
+ 2043:                 if not isinstance(res, int):
+ 2044:                     set_error("Hold end error", RuntimeError("Unexpected worker result from hold-end task"))
+ 2045:                     return
+ 2046:                 if res == PULSE_STATUS_REJECTED:
+ 2047:                     set_error("Hold end error", RuntimeError("Firmware rejected hold-end command"))
+ 2048:                     return
+ 2049:                 cancel_hold_timeout()
+ 2050:                 restore_base_outputs_after_hold()
+ 2051:                 status.set(f"CH{i + 1} hold ended; channel restored.")
+ 2052: 
+ 2053:             worker.submit(_task_hold_end, i, callback=on_hold_end_done)
+ 2054:         except Exception as exc:
+ 2055:             set_error("Hold end error", exc)
+ 2056: 
+ 2057:     def on_close() -> None:
+ 2058:         nonlocal is_closing, fc_poll_after_id
+ 2059:         is_closing = True
+ 2060:         cancel_adjust_repeat()
+ 2061:         cancel_hold_timeout()
+ 2062:         stop_auto_session_runtime()
+ 2063:         if fc_poll_after_id is not None:
+ 2064:             try:
+ 2065:                 root.after_cancel(fc_poll_after_id)
+ 2066:             except Exception:
+ 2067:                 pass
+ 2068:             finally:
+ 2069:                 fc_poll_after_id = None
+ 2070: 
+ 2071:         def on_stop_and_close(ok: bool, res: object) -> None:
+ 2072:             do_fc_disconnect(update_status=False)
+ 2073:             try:
+ 2074:                 worker.stop()
+ 2075:             except Exception:
+ 2076:                 pass
+ 2077:             close_run_connection()
+ 2078:             root.destroy()
+ 2079: 
+ 2080:         try:
+ 2081:             worker.submit(_task_shutdown, callback=on_stop_and_close)
+ 2082:         except Exception:
+ 2083:             on_stop_and_close(False, None)
+ 2084: 
+ 2085:     scan_fc_ports(update_status=False)
+ 2086: 
+ 2087:     scan_fc_button.config(command=scan_fc_ports)
+ 2088:     connect_fc_button.config(command=do_fc_toggle)
+ 2089:     import_blackbox_button.config(command=do_pull_blackbox_logs)
+ 2090:     analyze_blackbox_button.config(command=do_analyze_blackbox_logs)
+ 2091:     auto_session_button.config(command=do_auto_session_toggle)
+ 2092:     auto_open_selected_button.config(command=open_selected_report_file)
+ 2093:     auto_open_all_button.config(command=open_all_report_files)
+ 2094:     arduino_button.config(command=do_arduino_toggle)
+ 2095:     for i, canvas in enumerate(hold_send_canvases):
+ 2096:         def on_hold_press(event: tk.Event, i: int = i) -> None:
+ 2097:             action = get_pulse_action(event)
+ 2098:             if action == "end":
+ 2099:                 do_hold_end(i)
+ 2100:                 return
+ 2101:             direction = 1 if action == "positive" else -1
+ 2102:             do_hold_send(i, direction)
+ 2103: 
+ 2104:         canvas.bind("<ButtonPress-1>", on_hold_press)
+ 2105:     level_button.config(command=do_level)
+ 2106:     for i, canvas in enumerate(channel_adjust_canvases):
+ 2107:         canvas.bind("<ButtonPress-1>", lambda event, i=i: on_adjust_press(adjust_channel_value, i, event))
+ 2108:         canvas.bind("<ButtonRelease-1>", on_adjust_release)
+ 2109:         canvas.bind("<Leave>", on_adjust_release)
+ 2110:     for i, canvas in enumerate(target_adjust_canvases):
+ 2111:         canvas.bind("<ButtonPress-1>", lambda event, i=i: on_adjust_press(adjust_target_value, i, event))
+ 2112:         canvas.bind("<ButtonRelease-1>", on_adjust_release)
+ 2113:         canvas.bind("<Leave>", on_adjust_release)
+ 2114:     for i, canvas in enumerate(pid_ff_adjust_canvases):
+ 2115:         canvas.bind("<ButtonPress-1>", lambda event, i=i: on_adjust_press(adjust_pid_ff_value, i, event, 1))
+ 2116:         canvas.bind("<ButtonRelease-1>", on_adjust_release)
+ 2117:         canvas.bind("<Leave>", on_adjust_release)
+ 2118:     for entry in ch_entries:
+ 2119:         entry.bind("<KeyRelease>", lambda _event: on_output_inputs_changed())
+ 2120:         entry.bind("<FocusOut>", lambda _event: on_output_inputs_changed())
+ 2121:     set_auto_state(AdaptiveSessionState.idle, "--")
+ 2122:     update_auto_command_text("--")
+ 2123:     update_auto_confidence_display()
+ 2124:     set_live_channel_outputs(parse_channel_values_with_defaults())
+ 2125:     update_link_indicators()
+ 2126:     root.after(50, poll_results)
+ 2127:     fc_poll_after_id = root.after(60, poll_fc_attitude)
+ 2128:     root.protocol("WM_DELETE_WINDOW", on_close)
+ 2129: 
+ 2130:     root.mainloop()
+ 2131: 
+ 2132: 
+ 2133: if __name__ == "__main__":
+ 2134:     main()

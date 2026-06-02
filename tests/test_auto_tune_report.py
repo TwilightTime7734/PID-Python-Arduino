@@ -38,8 +38,9 @@ class AutoTuneReportTests(unittest.TestCase):
             self.assertTrue(Path(report.summary_txt).exists())
             self.assertTrue(Path(report.summary_json).exists())
             self.assertTrue(Path(report.combined_chart_sheet).exists())
-            self.assertGreaterEqual(len(report.chart_paths), 7)
-            self.assertTrue(any(str(item).endswith("roll_setpoint_vs_actual.png") for item in report.chart_paths))
+            self.assertTrue(str(report.combined_chart_sheet).endswith(".html"))
+            self.assertEqual(len(report.chart_paths), 1)
+            self.assertTrue(str(report.chart_paths[0]).endswith("roll_trace_viewer.html"))
             for item in report.chart_paths:
                 self.assertTrue(Path(item).exists())
 

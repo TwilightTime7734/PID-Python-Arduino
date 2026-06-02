@@ -812,7 +812,7 @@ def main() -> None:
                 summary_head = summary.split("|", 1)[0].strip()
                 if res.pid_report is not None and res.pid_report.headline:
                     summary_head = res.pid_report.headline
-                status.set(f"Blackbox analysis complete: {summary_head}. Generating charts...")
+                status.set(f"Blackbox analysis complete: {summary_head}. Generating report...")
                 set_auto_report_text(format_blackbox_report(res))
                 auto_latest_report = None
                 auto_report_files = []
@@ -831,7 +831,7 @@ def main() -> None:
                     blackbox_import_inflight = False
                     if not ok2:
                         error_text = str(res2) if not isinstance(res2, Exception) else str(res2)
-                        if "Could not resolve a primary Blackbox CSV for chart generation." in error_text:
+                        if "Could not resolve a primary Blackbox CSV for" in error_text:
                             error_text += (
                                 "\nTip: the selected log did not resolve to a usable CSV. "
                                 "Try selecting a CSV log directly, or import/decode the raw log first."
@@ -839,29 +839,30 @@ def main() -> None:
                         elif "No module named" in error_text:
                             error_text += (
                                 "\nTip: this Python environment may be missing required packages "
-                                "(for charts: numpy and matplotlib)."
+                                "(for the HTML chart viewer: numpy and plotly)."
                             )
-                        status.set("Blackbox analysis complete, but chart generation failed.")
-                        set_auto_report_text(f"{format_blackbox_report(res)}\n\nChart generation error: {error_text}")
+                        status.set("Blackbox analysis complete, but report generation failed.")
+                        set_auto_report_text(f"{format_blackbox_report(res)}\n\nReport generation error: {error_text}")
                         return
                     if not isinstance(res2, AutoTuneReport):
-                        set_error("Blackbox report error", RuntimeError("Unexpected chart/report task result."))
+                        set_error("Blackbox report error", RuntimeError("Unexpected report task result."))
                         return
 
                     auto_latest_report = res2
-                    auto_report_files = [
+                    report_files = [
                         res2.summary_txt,
                         res2.summary_json,
                         res2.combined_chart_sheet,
                         *list(res2.chart_paths),
                     ]
+                    auto_report_files = [path for path in dict.fromkeys(item for item in report_files if item)]
                     refresh_auto_report_file_list()
                     try:
                         report_text = Path(res2.summary_txt).read_text(encoding="utf-8", errors="replace")
                     except Exception:
                         report_text = f"Report generated at {res2.report_dir}\nSummary file: {res2.summary_txt}"
                     set_auto_report_text(report_text)
-                    status.set(f"Blackbox charts generated: {res2.report_dir}")
+                    status.set(f"Blackbox report generated: {res2.report_dir}")
 
                 worker.submit(
                     _task_generate_auto_report,
@@ -1218,12 +1219,13 @@ def main() -> None:
                     auto_abort("Unexpected report generation result.")
                     return
                 auto_latest_report = res
-                auto_report_files = [
+                report_files = [
                     res.summary_txt,
                     res.summary_json,
                     res.combined_chart_sheet,
                     *list(res.chart_paths),
                 ]
+                auto_report_files = [path for path in dict.fromkeys(item for item in report_files if item)]
                 refresh_auto_report_file_list()
                 try:
                     report_text = Path(res.summary_txt).read_text(encoding="utf-8", errors="replace")

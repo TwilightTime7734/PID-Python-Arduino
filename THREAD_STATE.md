@@ -73,3 +73,7 @@ $env:PYTHONIOENCODING='utf-8'
   - `uno_r4_minima`: SUCCESS
 - Upload result:
   - `uno_r4_wifi` to `COM6`: SUCCESS
+
+## Blackbox Viewer Reminder
+- For roll trace HTML viewer column detection, do **not** use `axisRate[0]` as the setpoint source.
+- Keep setpoint selection on `setpoint[0]` / `gyroSetpoint[0]` / `rcCommand[0]`, and keep gyro on gyro columns.
