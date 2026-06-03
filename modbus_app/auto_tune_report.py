@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 
 from .blackbox_import import BlackboxImportResult
-from .blackbox_trace_viewer import build_roll_trace_viewer
+from .blackbox_trace_viewer import build_pitch_trace_viewer, build_roll_trace_viewer
 
 
 @dataclass(frozen=True)
@@ -44,12 +44,18 @@ def generate_auto_tune_report(
     data = _extract_plot_columns(time_s, cols)
 
     trace_dir = report_dir / "charts"
-    trace_viewer_html: Path | None = None
-    trace_viewer_warning = ""
+    roll_trace_viewer_html: Path | None = None
+    pitch_trace_viewer_html: Path | None = None
+    roll_trace_viewer_warning = ""
+    pitch_trace_viewer_warning = ""
     try:
-        trace_viewer_html = build_roll_trace_viewer(csv_path, trace_dir)
+        roll_trace_viewer_html = build_roll_trace_viewer(csv_path, trace_dir)
     except Exception as exc:
-        trace_viewer_warning = str(exc)
+        roll_trace_viewer_warning = str(exc)
+    try:
+        pitch_trace_viewer_html = build_pitch_trace_viewer(csv_path, trace_dir)
+    except Exception as exc:
+        pitch_trace_viewer_warning = str(exc)
 
     summary_txt = report_dir / "summary.txt"
     summary_json = report_dir / "summary.json"
@@ -59,14 +65,20 @@ def generate_auto_tune_report(
         session_payload=session_payload,
         csv_path=csv_path,
         data=data,
-        trace_viewer_html=trace_viewer_html,
-        trace_viewer_warning=trace_viewer_warning,
+        roll_trace_viewer_html=roll_trace_viewer_html,
+        pitch_trace_viewer_html=pitch_trace_viewer_html,
+        roll_trace_viewer_warning=roll_trace_viewer_warning,
+        pitch_trace_viewer_warning=pitch_trace_viewer_warning,
     )
     summary_txt.write_text(_format_summary_text(summary_payload), encoding="utf-8")
     summary_json.write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
 
-    chart_paths = (str(trace_viewer_html),) if trace_viewer_html is not None else tuple()
-    combined_artifact = str(trace_viewer_html) if trace_viewer_html is not None else ""
+    chart_paths = tuple(
+        str(path)
+        for path in (roll_trace_viewer_html, pitch_trace_viewer_html)
+        if path is not None
+    )
+    combined_artifact = chart_paths[0] if chart_paths else ""
     return AutoTuneReport(
         report_dir=str(report_dir),
         summary_txt=str(summary_txt),
@@ -232,14 +244,20 @@ def _extract_plot_columns(time_s: np.ndarray, columns: dict[str, np.ndarray]) ->
         raise RuntimeError("Missing roll setpoint/actual columns in CSV.")
 
     roll_error = roll_setpoint - roll_actual
+    pitch_setpoint = _column(columns, ["rcCommand[1]", "setpoint[1]"])
+    pitch_actual = _column(columns, ["gyroADC[1]", "gyroRaw[1]"])
+    pitch_error = pitch_setpoint - pitch_actual if pitch_setpoint is not None and pitch_actual is not None else None
     sample_rate = _estimate_sample_rate(time_s)
-    return {
+    data: dict[str, Any] = {
         "time_s": time_s,
         "setpoint": roll_setpoint,
         "actual": roll_actual,
         "error": roll_error,
         "sample_rate": sample_rate,
     }
+    if pitch_error is not None:
+        data["pitch_error"] = pitch_error
+    return data
 
 
 def _estimate_sample_rate(time_s: np.ndarray) -> float:
@@ -257,14 +275,27 @@ def _build_summary_payload(
     session_payload: dict[str, Any],
     csv_path: Path,
     data: dict[str, Any],
-    trace_viewer_html: Path | None,
-    trace_viewer_warning: str,
+    roll_trace_viewer_html: Path | None,
+    pitch_trace_viewer_html: Path | None,
+    roll_trace_viewer_warning: str,
+    pitch_trace_viewer_warning: str,
 ) -> dict[str, Any]:
     metrics = session_payload.get("metrics", {})
     pid_report = analysis_result.pid_report
 
-    viewer_path = str(trace_viewer_html) if trace_viewer_html is not None else ""
-    viewer_files = [viewer_path] if viewer_path else []
+    roll_viewer_path = str(roll_trace_viewer_html) if roll_trace_viewer_html is not None else ""
+    pitch_viewer_path = str(pitch_trace_viewer_html) if pitch_trace_viewer_html is not None else ""
+    viewer_files = [path for path in (roll_viewer_path, pitch_viewer_path) if path]
+
+    log_payload = {
+        "csv_used": str(csv_path),
+        "rows": int(data["time_s"].size),
+        "duration_s": round(float(data["time_s"].max() - data["time_s"].min()), 3),
+        "sample_rate_hz": round(float(data["sample_rate"]), 2),
+        "peak_roll_error": round(float(np.max(np.abs(data["error"]))), 3),
+    }
+    if "pitch_error" in data:
+        log_payload["peak_pitch_error"] = round(float(np.max(np.abs(data["pitch_error"]))), 3)
 
     return {
         "generated_at": datetime.now().isoformat(),
@@ -273,6 +304,9 @@ def _build_summary_payload(
             "stop_reason": session_payload.get("stop_reason", ""),
             "warning": session_payload.get("warning", ""),
             "elapsed_s": round(float(session_payload.get("elapsed_s", 0.0)), 3),
+            "start_throttle_us": int(session_payload.get("start_throttle_us", 0)),
+            "current_throttle_us": int(session_payload.get("current_throttle_us", 0)),
+            "peak_throttle_us": int(session_payload.get("peak_throttle_us", 0)),
         },
         "coverage": metrics,
         "analysis": {
@@ -283,19 +317,24 @@ def _build_summary_payload(
             "pid_cli": list(pid_report.cli_commands) if pid_report else [],
             "warnings": list(analysis_result.warnings),
         },
-        "log": {
-            "csv_used": str(csv_path),
-            "rows": int(data["time_s"].size),
-            "duration_s": round(float(data["time_s"].max() - data["time_s"].min()), 3),
-            "sample_rate_hz": round(float(data["sample_rate"]), 2),
-            "peak_roll_error": round(float(np.max(np.abs(data["error"]))), 3),
-        },
+        "log": log_payload,
         "artifacts": {
-            "combined_chart_sheet": viewer_path,
+            "combined_chart_sheet": roll_viewer_path or pitch_viewer_path,
             "trace_viewer": {
-                "html": viewer_path,
+                "html": roll_viewer_path,
+                "files": [roll_viewer_path] if roll_viewer_path else [],
+                "warning": roll_trace_viewer_warning,
+            },
+            "trace_viewers": {
+                "roll": {
+                    "html": roll_viewer_path,
+                    "warning": roll_trace_viewer_warning,
+                },
+                "pitch": {
+                    "html": pitch_viewer_path,
+                    "warning": pitch_trace_viewer_warning,
+                },
                 "files": viewer_files,
-                "warning": trace_viewer_warning,
             },
         },
     }
@@ -309,6 +348,11 @@ def _format_summary_text(payload: dict[str, Any]) -> str:
     session = payload.get("session", {})
     lines.append(f"State: {session.get('state', '')}")
     lines.append(f"Elapsed: {session.get('elapsed_s', 0.0)} s")
+    if session.get("start_throttle_us") or session.get("peak_throttle_us"):
+        lines.append(
+            f"Throttle: start {session.get('start_throttle_us', 0)} us, "
+            f"peak {session.get('peak_throttle_us', 0)} us"
+        )
     if session.get("stop_reason"):
         lines.append(f"Stop reason: {session.get('stop_reason')}")
     if session.get("warning"):
@@ -346,13 +390,26 @@ def _format_summary_text(payload: dict[str, Any]) -> str:
     lines.append("")
     lines.append("Artifacts")
     lines.append("-" * 9)
-    trace_viewer = artifacts.get("trace_viewer", {})
-    if isinstance(trace_viewer, dict):
-        trace_html = str(trace_viewer.get("html", "")).strip()
-        if trace_html:
-            lines.append(f"Trace viewer: {trace_html}")
-        trace_warning = str(trace_viewer.get("warning", "")).strip()
-        if trace_warning:
-            lines.append(f"Trace viewer warning: {trace_warning}")
+    trace_viewers = artifacts.get("trace_viewers", {})
+    if isinstance(trace_viewers, dict):
+        for axis in ("roll", "pitch"):
+            trace_viewer = trace_viewers.get(axis, {})
+            if not isinstance(trace_viewer, dict):
+                continue
+            trace_html = str(trace_viewer.get("html", "")).strip()
+            if trace_html:
+                lines.append(f"{axis.title()} trace viewer: {trace_html}")
+            trace_warning = str(trace_viewer.get("warning", "")).strip()
+            if trace_warning:
+                lines.append(f"{axis.title()} trace viewer warning: {trace_warning}")
+    else:
+        trace_viewer = artifacts.get("trace_viewer", {})
+        if isinstance(trace_viewer, dict):
+            trace_html = str(trace_viewer.get("html", "")).strip()
+            if trace_html:
+                lines.append(f"Trace viewer: {trace_html}")
+            trace_warning = str(trace_viewer.get("warning", "")).strip()
+            if trace_warning:
+                lines.append(f"Trace viewer warning: {trace_warning}")
 
     return "\n".join(lines).strip() + "\n"

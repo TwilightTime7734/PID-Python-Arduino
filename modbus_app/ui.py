@@ -146,6 +146,7 @@ class MainUi:
     auto_report_listbox: tk.Listbox
     auto_open_selected_button: tk.Button
     auto_open_all_button: tk.Button
+    pulse_calibrate_button: tk.Button
 
 def build_main_gui(root: tk.Tk) -> MainUi:
     root.title("PPM Modbus")
@@ -354,6 +355,8 @@ def build_main_gui(root: tk.Tk) -> MainUi:
 
     auto_session_button = tk.Button(auto_status_frame, text="Start Auto Session", width=18)
     auto_session_button.grid(row=0, column=1, rowspan=2, padx=(10, 0), sticky="e")
+    pulse_calibrate_button = tk.Button(auto_status_frame, text="Calibrate Pulses", width=18)
+    pulse_calibrate_button.grid(row=2, column=1, padx=(10, 0), pady=(2, 0), sticky="e")
 
     auto_roll_conf_var = tk.DoubleVar(value=0.0)
     auto_pitch_conf_var = tk.DoubleVar(value=0.0)
@@ -440,4 +443,5 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         auto_report_listbox=auto_report_listbox,
         auto_open_selected_button=auto_open_selected_button,
         auto_open_all_button=auto_open_all_button,
+        pulse_calibrate_button=pulse_calibrate_button,
     )

@@ -51,6 +51,7 @@ from .constants import (
     PULSE_TARGET_DEFAULTS,
     REG_QUANT,
     ROLL_CHANNEL_INDEX,
+    THROTTLE_CHANNEL_INDEX,
 )
 from .serial_protocol import (
     end_hold_on_serial,
@@ -127,6 +128,7 @@ def main() -> None:
     auto_report_listbox = ui.auto_report_listbox
     auto_open_selected_button = ui.auto_open_selected_button
     auto_open_all_button = ui.auto_open_all_button
+    pulse_calibrate_button = ui.pulse_calibrate_button
 
     run_active = False
     start_pending = False
@@ -171,6 +173,10 @@ def main() -> None:
     auto_event_response_delay_s: float | None = None
     auto_event_baseline = 0.0
     auto_event_start_s = 0.0
+    auto_original_base_outputs: list[int] | None = None
+    auto_start_throttle_us = base_channel_outputs[THROTTLE_CHANNEL_INDEX]
+    auto_current_throttle_us = base_channel_outputs[THROTTLE_CHANNEL_INDEX]
+    auto_peak_throttle_us = base_channel_outputs[THROTTLE_CHANNEL_INDEX]
     auto_latest_report: AutoTuneReport | None = None
     auto_report_files: list[str] = []
     auto_import_result: BlackboxImportResult | None = None
@@ -190,6 +196,39 @@ def main() -> None:
         ("roll", "ff"),
         ("pitch", "ff"),
     ]
+    pulse_cal_sequence = (
+        ("roll", ROLL_CHANNEL_INDEX, 1),
+        ("roll", ROLL_CHANNEL_INDEX, -1),
+        ("pitch", PITCH_CHANNEL_INDEX, 1),
+        ("pitch", PITCH_CHANNEL_INDEX, -1),
+    )
+    pulse_cal_target_angle_deg = 30.0
+    pulse_cal_start_strength_us = 100
+    pulse_cal_start_duration_s = 0.30
+    pulse_cal_strength_step_us = 25
+    pulse_cal_duration_step_s = 0.05
+    pulse_cal_max_strength_us = 500
+    pulse_cal_max_duration_s = 1.20
+    pulse_cal_observe_extra_s = 0.25
+    pulse_cal_recenter_timeout_s = 8.0
+    pulse_cal_safety_limit_deg = 43.0
+    pulse_cal_active = False
+    pulse_cal_after_id: str | None = None
+    pulse_cal_pulse_inflight = False
+    pulse_cal_recenter_inflight = False
+    pulse_cal_after_recenter: Callable[[], None] | None = None
+    pulse_cal_recenter_deadline_s: float | None = None
+    pulse_cal_target_index = 0
+    pulse_cal_attempt = 0
+    pulse_cal_current_axis: str | None = None
+    pulse_cal_current_channel = ROLL_CHANNEL_INDEX
+    pulse_cal_current_direction = 1
+    pulse_cal_current_strength_us = pulse_cal_start_strength_us
+    pulse_cal_current_duration_s = pulse_cal_start_duration_s
+    pulse_cal_baseline = 0.0
+    pulse_cal_peak_delta = 0.0
+    pulse_cal_observing = False
+    pulse_cal_results: dict[int, tuple[int, float]] = {}
 
     def port() -> str:
         return port_entry.get().strip() or PORT_DEFAULT
@@ -307,7 +346,8 @@ def main() -> None:
     def reset_auto_runtime_state() -> None:
         nonlocal auto_session_start_s, auto_last_tick_s, auto_tick_after_id, auto_pulse_inflight
         nonlocal auto_settle_until_s, auto_recovery_mode, auto_active_command, auto_event_peak_delta
-        nonlocal auto_event_response_delay_s, auto_event_baseline, auto_event_start_s
+        nonlocal auto_event_response_delay_s, auto_event_baseline, auto_event_start_s, auto_original_base_outputs
+        nonlocal auto_start_throttle_us, auto_current_throttle_us, auto_peak_throttle_us
         auto_session_start_s = None
         auto_last_tick_s = None
         auto_pulse_inflight = False
@@ -318,6 +358,10 @@ def main() -> None:
         auto_event_response_delay_s = None
         auto_event_baseline = 0.0
         auto_event_start_s = 0.0
+        auto_original_base_outputs = None
+        auto_start_throttle_us = base_channel_outputs[THROTTLE_CHANNEL_INDEX]
+        auto_current_throttle_us = base_channel_outputs[THROTTLE_CHANNEL_INDEX]
+        auto_peak_throttle_us = base_channel_outputs[THROTTLE_CHANNEL_INDEX]
         if auto_tick_after_id is not None:
             try:
                 root.after_cancel(auto_tick_after_id)
@@ -349,6 +393,9 @@ def main() -> None:
             "warning": auto_warning,
             "elapsed_s": auto_elapsed_s(),
             "metrics": metrics,
+            "start_throttle_us": auto_start_throttle_us,
+            "current_throttle_us": auto_current_throttle_us,
+            "peak_throttle_us": auto_peak_throttle_us,
         }
 
     def refresh_pid_ff_from_fc(update_status: bool = False) -> bool:
@@ -408,6 +455,18 @@ def main() -> None:
             threshold_deg = max(2.0, (command.force_us / 15.0) * 0.35)
             if directed_delta >= threshold_deg:
                 auto_event_response_delay_s = max(0.0, time.monotonic() - auto_event_start_s)
+
+    def record_pulse_calibration_sample(sample) -> None:
+        nonlocal pulse_cal_peak_delta
+        if not pulse_cal_active or not pulse_cal_observing or pulse_cal_current_axis is None:
+            return
+        if abs(sample.roll_deg) >= pulse_cal_safety_limit_deg or abs(sample.pitch_deg) >= pulse_cal_safety_limit_deg:
+            abort_pulse_calibration(
+                f"safety limit reached (roll={sample.roll_deg:+.1f}, pitch={sample.pitch_deg:+.1f})"
+            )
+            return
+        axis_value = pulse_axis_value(sample, pulse_cal_current_axis)
+        pulse_cal_peak_delta = max(pulse_cal_peak_delta, abs(axis_value - pulse_cal_baseline))
 
     def draw_channel_output(index: int, value: int) -> None:
         clamped = max(1000, min(2000, value))
@@ -614,8 +673,60 @@ def main() -> None:
 
         worker.submit(_task_update_channels, channels.copy(), offsets.copy(), callback=on_live_update_done)
 
+    def set_channel_entry_value(index: int, value: int) -> None:
+        ch_entries[index].delete(0, tk.END)
+        ch_entries[index].insert(0, str(value))
+
+    def apply_auto_base_outputs(channels: list[int], safety_text: str = "") -> None:
+        nonlocal base_channel_outputs, auto_current_throttle_us, auto_peak_throttle_us
+        clamped = [max(1000, min(2000, int(value))) for value in channels]
+        base_channel_outputs = clamped.copy()
+        if auto_original_base_outputs is not None:
+            auto_current_throttle_us = clamped[THROTTLE_CHANNEL_INDEX]
+            auto_peak_throttle_us = max(auto_peak_throttle_us, auto_current_throttle_us)
+        for index, value in enumerate(clamped):
+            set_channel_entry_value(index, value)
+        set_live_channel_outputs(clamped)
+        if run_active and run_ser is not None:
+            queue_live_channel_update(clamped.copy(), parse_offset_values_with_defaults())
+        if safety_text:
+            auto_safety_var.set(f"Safety: {safety_text}")
+
+    def restore_auto_original_base_outputs() -> None:
+        nonlocal auto_original_base_outputs
+        if auto_original_base_outputs is None:
+            return
+        original = auto_original_base_outputs
+        auto_original_base_outputs = None
+        apply_auto_base_outputs(original, "restored pre-auto outputs")
+
+    def prepare_auto_throttle() -> bool:
+        if auto_controller is None:
+            return False
+        current = base_channel_outputs[THROTTLE_CHANNEL_INDEX]
+        target, reason = auto_controller.initial_throttle(current)
+        if target == current:
+            return False
+        channels = base_channel_outputs.copy()
+        channels[THROTTLE_CHANNEL_INDEX] = target
+        apply_auto_base_outputs(channels, reason)
+        return True
+
+    def adjust_auto_throttle_after_event(event: ExcitationEvent, recovery_event: bool) -> None:
+        if auto_controller is None or recovery_event:
+            return
+        current = base_channel_outputs[THROTTLE_CHANNEL_INDEX]
+        target, reason = auto_controller.throttle_after_event(current, event)
+        if target == current:
+            return
+        channels = base_channel_outputs.copy()
+        channels[THROTTLE_CHANNEL_INDEX] = target
+        apply_auto_base_outputs(channels, reason)
+
     def on_output_inputs_changed() -> None:
         nonlocal base_channel_outputs
+        if pulse_cal_active:
+            return
         if not run_active or run_ser is None:
             set_live_channel_outputs(parse_channel_values_with_defaults())
             return
@@ -727,6 +838,8 @@ def main() -> None:
             if blackbox_import_inflight:
                 status.set("Blackbox import already in progress.")
                 return
+            if pulse_cal_active:
+                raise RuntimeError("Wait for pulse calibration to finish first.")
 
             selected_port = fc_port()
             selected_baud = fc_baud()
@@ -778,6 +891,8 @@ def main() -> None:
             if blackbox_import_inflight:
                 status.set("Blackbox import already in progress.")
                 return
+            if pulse_cal_active:
+                raise RuntimeError("Wait for pulse calibration to finish first.")
 
             initial_dir = blackbox_import_dir if blackbox_import_dir.exists() else Path.cwd()
             selected_log = filedialog.askopenfilename(
@@ -905,6 +1020,7 @@ def main() -> None:
             except Exception:
                 pass
             auto_tick_after_id = None
+        restore_auto_original_base_outputs()
         auto_pulse_inflight = False
         auto_settle_until_s = None
         auto_active_command = None
@@ -939,9 +1055,12 @@ def main() -> None:
     def start_auto_session() -> None:
         nonlocal auto_controller, auto_session_start_s, auto_last_tick_s
         nonlocal auto_last_sample_s, auto_stop_reason, auto_warning, auto_latest_report
-        nonlocal auto_report_files, auto_import_result, auto_latest_imported_log
+        nonlocal auto_report_files, auto_import_result, auto_latest_imported_log, auto_original_base_outputs
+        nonlocal auto_start_throttle_us, auto_current_throttle_us, auto_peak_throttle_us
         if blackbox_import_inflight:
             raise RuntimeError("Blackbox import/analyze is in progress.")
+        if pulse_cal_active:
+            raise RuntimeError("Wait for pulse calibration to finish first.")
         if not run_active or run_ser is None:
             raise RuntimeError("Connect Arduino output before starting auto session.")
         if not fc_service.is_connected:
@@ -965,6 +1084,10 @@ def main() -> None:
             return
 
         auto_controller = AdaptiveExcitationController(auto_config)
+        auto_original_base_outputs = base_channel_outputs.copy()
+        auto_start_throttle_us = base_channel_outputs[THROTTLE_CHANNEL_INDEX]
+        auto_current_throttle_us = auto_start_throttle_us
+        auto_peak_throttle_us = auto_start_throttle_us
         auto_stop_reason = ""
         auto_warning = ""
         auto_latest_report = None
@@ -979,9 +1102,10 @@ def main() -> None:
         set_auto_state(AdaptiveSessionState.adaptive_run, "Active")
         update_auto_command_text("waiting")
         update_auto_confidence_display()
+        throttle_prepared = prepare_auto_throttle()
         auto_session_button.config(text="Abort Auto Session", state="normal")
         status.set("Adaptive auto session active.")
-        schedule_auto_tick()
+        schedule_auto_tick(delay_ms=250 if throttle_prepared else None)
 
     def finalize_auto_event() -> None:
         nonlocal auto_active_command, auto_event_peak_delta, auto_event_response_delay_s
@@ -991,6 +1115,7 @@ def main() -> None:
         sample = fc_service.latest_attitude()
         if sample is None:
             return
+        recovery_event = auto_active_command.recovery
         axis_value = pulse_axis_value(sample, auto_active_command.axis)
         final_error = axis_value - auto_event_baseline
         settle_success = abs(final_error) <= auto_config.settle_deadband_deg
@@ -1007,6 +1132,7 @@ def main() -> None:
             final_error_deg=final_error,
         )
         auto_controller.record_event(event)
+        adjust_auto_throttle_after_event(event, recovery_event)
         auto_active_command = None
         auto_event_peak_delta = 0.0
         auto_event_response_delay_s = None
@@ -1044,7 +1170,8 @@ def main() -> None:
 
         direction_label = "positive" if command.direction >= 0 else "negative"
         update_auto_command_text(
-            f"{command.axis} {direction_label} {command.force_us}us hold {command.hold_s:.2f}s ({command.reason})"
+            f"{command.axis} {direction_label} {command.force_us}us hold {command.hold_s:.2f}s "
+            f"thr {base_channel_outputs[THROTTLE_CHANNEL_INDEX]}us ({command.reason})"
         )
         auto_safety_var.set("Safety: recovery" if command.recovery else "Safety: tracking")
 
@@ -1253,6 +1380,433 @@ def main() -> None:
         except Exception as exc:
             set_error("Auto session error", exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
 
+    def pulse_cal_duration_text(duration_s: float) -> str:
+        return f"{duration_s:.2f}".rstrip("0").rstrip(".")
+
+    def pulse_cal_target_description(axis: str, direction: int) -> str:
+        sign = "+" if direction >= 0 else "-"
+        return f"{axis} {sign}"
+
+    def set_entry_text(entry: tk.Entry, text: str) -> None:
+        state = str(entry.cget("state"))
+        if state != "normal":
+            entry.config(state="normal")
+        entry.delete(0, tk.END)
+        entry.insert(0, text)
+        if state != "normal":
+            entry.config(state=state)
+
+    def cancel_pulse_calibration_timer() -> None:
+        nonlocal pulse_cal_after_id
+        if pulse_cal_after_id is not None:
+            try:
+                root.after_cancel(pulse_cal_after_id)
+            except Exception:
+                pass
+            finally:
+                pulse_cal_after_id = None
+
+    def restore_pulse_calibration_state_label() -> None:
+        auto_state_var.set(f"State: {auto_state.value}")
+
+    def stop_pulse_calibration_runtime() -> None:
+        nonlocal pulse_cal_active, pulse_cal_pulse_inflight, pulse_cal_recenter_inflight
+        nonlocal pulse_cal_after_recenter, pulse_cal_recenter_deadline_s, pulse_cal_observing
+        cancel_pulse_calibration_timer()
+        pulse_cal_active = False
+        pulse_cal_pulse_inflight = False
+        pulse_cal_recenter_inflight = False
+        pulse_cal_after_recenter = None
+        pulse_cal_recenter_deadline_s = None
+        pulse_cal_observing = False
+        restore_pulse_calibration_state_label()
+        if hold_timeout_after_id is None and not level_active:
+            set_live_channel_outputs(base_channel_outputs)
+        update_link_indicators()
+
+    def abort_pulse_calibration(reason: str) -> None:
+        was_active = pulse_cal_active
+        stop_pulse_calibration_runtime()
+        if was_active and not is_closing:
+            update_auto_command_text("pulse calibration aborted")
+            auto_safety_var.set(f"Safety: {reason}")
+            status.set(f"Pulse calibration aborted: {reason}")
+
+    def reset_pulse_calibration_attempt() -> None:
+        nonlocal pulse_cal_attempt, pulse_cal_current_strength_us, pulse_cal_current_duration_s
+        if pulse_cal_target_index >= len(pulse_cal_sequence):
+            return
+        _, channel_index, _ = pulse_cal_sequence[pulse_cal_target_index]
+        existing = pulse_cal_results.get(channel_index)
+        if existing is None:
+            pulse_cal_current_strength_us = pulse_cal_start_strength_us
+            pulse_cal_current_duration_s = pulse_cal_start_duration_s
+        else:
+            pulse_cal_current_strength_us = existing[0]
+            pulse_cal_current_duration_s = existing[1]
+        pulse_cal_attempt = 0
+
+    def store_pulse_calibration_result(channel_index: int, strength_us: int, duration_s: float) -> None:
+        current = pulse_cal_results.get(channel_index)
+        if current is None:
+            pulse_cal_results[channel_index] = (strength_us, duration_s)
+            return
+        pulse_cal_results[channel_index] = (max(current[0], strength_us), max(current[1], duration_s))
+
+    def write_pulse_calibration_results() -> None:
+        for channel_index in (ROLL_CHANNEL_INDEX, PITCH_CHANNEL_INDEX):
+            result = pulse_cal_results.get(channel_index)
+            if result is None:
+                continue
+            strength_us, duration_s = result
+            set_entry_text(target_entries[channel_index], str(int(strength_us)))
+            set_entry_text(dur_entries[channel_index], pulse_cal_duration_text(duration_s))
+            set_entry_text(angle_entries[channel_index], pulse_cal_duration_text(pulse_cal_target_angle_deg))
+
+    def complete_pulse_calibration() -> None:
+        roll_result = pulse_cal_results.get(ROLL_CHANNEL_INDEX)
+        pitch_result = pulse_cal_results.get(PITCH_CHANNEL_INDEX)
+        if roll_result is None or pitch_result is None:
+            abort_pulse_calibration("calibration ended before roll and pitch both completed")
+            return
+        write_pulse_calibration_results()
+        roll_strength, roll_duration = roll_result
+        pitch_strength, pitch_duration = pitch_result
+        stop_pulse_calibration_runtime()
+        update_auto_command_text("pulse calibration complete")
+        auto_safety_var.set("Safety: pulse calibration complete")
+        summary = (
+            "Pulse calibration complete.\n"
+            f"Roll: {roll_strength}us for {pulse_cal_duration_text(roll_duration)}s, "
+            f"angle {pulse_cal_target_angle_deg:.0f} deg\n"
+            f"Pitch: {pitch_strength}us for {pulse_cal_duration_text(pitch_duration)}s, "
+            f"angle {pulse_cal_target_angle_deg:.0f} deg"
+        )
+        set_auto_report_text(summary)
+        status.set(
+            "Pulse calibration complete: "
+            f"Roll {roll_strength}us/{pulse_cal_duration_text(roll_duration)}s, "
+            f"Pitch {pitch_strength}us/{pulse_cal_duration_text(pitch_duration)}s."
+        )
+
+    def schedule_pulse_calibration_recenter(delay_ms: int = LEVEL_LOOP_INTERVAL_MS) -> None:
+        nonlocal pulse_cal_after_id
+        cancel_pulse_calibration_timer()
+        pulse_cal_after_id = root.after(max(1, delay_ms), run_pulse_calibration_recenter)
+
+    def begin_pulse_calibration_recenter(next_step: Callable[[], None], reason: str) -> None:
+        nonlocal pulse_cal_after_recenter, pulse_cal_recenter_deadline_s
+        if not pulse_cal_active:
+            return
+        pulse_cal_after_recenter = next_step
+        pulse_cal_recenter_deadline_s = time.monotonic() + pulse_cal_recenter_timeout_s
+        update_auto_command_text(reason)
+        auto_safety_var.set("Safety: recentering")
+        schedule_pulse_calibration_recenter(delay_ms=1)
+
+    def run_pulse_calibration_recenter() -> None:
+        nonlocal pulse_cal_after_id, pulse_cal_recenter_inflight, pulse_cal_after_recenter
+        pulse_cal_after_id = None
+        if not pulse_cal_active:
+            return
+        if not run_active or run_ser is None:
+            abort_pulse_calibration("Arduino output disconnected")
+            return
+        if not fc_service.is_connected:
+            abort_pulse_calibration("FC disconnected")
+            return
+
+        sample = fc_service.latest_attitude()
+        if sample is None:
+            schedule_pulse_calibration_recenter()
+            return
+        if abs(sample.roll_deg) >= pulse_cal_safety_limit_deg or abs(sample.pitch_deg) >= pulse_cal_safety_limit_deg:
+            abort_pulse_calibration(
+                f"safety limit reached while recentering (roll={sample.roll_deg:+.1f}, pitch={sample.pitch_deg:+.1f})"
+            )
+            return
+        if is_level_attitude_settled(sample.roll_deg, sample.pitch_deg):
+            set_live_channel_outputs(base_channel_outputs)
+            next_step = pulse_cal_after_recenter
+            pulse_cal_after_recenter = None
+            if next_step is not None:
+                pulse_cal_after_id = root.after(100, next_step)
+            return
+        if pulse_cal_recenter_deadline_s is not None and time.monotonic() >= pulse_cal_recenter_deadline_s:
+            abort_pulse_calibration(
+                f"could not recenter within {pulse_cal_recenter_timeout_s:.0f}s "
+                f"(roll={sample.roll_deg:+.1f}, pitch={sample.pitch_deg:+.1f})"
+            )
+            return
+        if pulse_cal_recenter_inflight:
+            schedule_pulse_calibration_recenter()
+            return
+
+        roll_target_us = level_target_from_angle(sample.roll_deg)
+        pitch_target_us = level_target_from_angle(sample.pitch_deg)
+        axis_targets: list[tuple[int, int, float]] = []
+        if roll_target_us is not None:
+            axis_targets.append((ROLL_CHANNEL_INDEX, roll_target_us, abs(sample.roll_deg)))
+        if pitch_target_us is not None:
+            axis_targets.append((PITCH_CHANNEL_INDEX, pitch_target_us, abs(sample.pitch_deg)))
+        if not axis_targets:
+            schedule_pulse_calibration_recenter()
+            return
+
+        try:
+            offsets = parse_entries(off_entries, int, "Offset")
+        except Exception as exc:
+            abort_pulse_calibration(str(exc))
+            return
+
+        channel_index, target_us, _ = max(axis_targets, key=lambda item: item[2])
+        active_outputs = base_channel_outputs.copy()
+        active_outputs[channel_index] = target_us
+        set_live_channel_outputs(active_outputs)
+        pulse_cal_recenter_inflight = True
+
+        def on_recenter_done(ok: bool, res: object) -> None:
+            nonlocal pulse_cal_recenter_inflight
+            pulse_cal_recenter_inflight = False
+            set_live_channel_outputs(base_channel_outputs)
+            if not pulse_cal_active:
+                return
+            if not ok:
+                abort_pulse_calibration(str(res) if not isinstance(res, Exception) else str(res))
+                return
+            if not isinstance(res, int):
+                abort_pulse_calibration("unexpected recenter pulse result")
+                return
+            if res == PULSE_STATUS_REJECTED:
+                abort_pulse_calibration("firmware rejected recenter pulse")
+                return
+            schedule_pulse_calibration_recenter()
+
+        worker.submit(
+            _task_hold,
+            channel_index,
+            target_us,
+            offsets[channel_index],
+            LEVEL_PULSE_TIMEOUT_S,
+            callback=on_recenter_done,
+        )
+
+    def issue_pulse_calibration_test() -> None:
+        nonlocal pulse_cal_after_id, pulse_cal_pulse_inflight, pulse_cal_observing
+        nonlocal pulse_cal_current_axis, pulse_cal_current_channel, pulse_cal_current_direction
+        nonlocal pulse_cal_baseline, pulse_cal_peak_delta
+        pulse_cal_after_id = None
+        if not pulse_cal_active:
+            return
+        if pulse_cal_target_index >= len(pulse_cal_sequence):
+            complete_pulse_calibration()
+            return
+        if not run_active or run_ser is None:
+            abort_pulse_calibration("Arduino output disconnected")
+            return
+        if not fc_service.is_connected:
+            abort_pulse_calibration("FC disconnected")
+            return
+
+        sample = fc_service.latest_attitude()
+        if sample is None:
+            pulse_cal_after_id = root.after(100, issue_pulse_calibration_test)
+            return
+
+        axis, channel_index, direction = pulse_cal_sequence[pulse_cal_target_index]
+        target_us = base_channel_outputs[channel_index] + (direction * pulse_cal_current_strength_us)
+        if target_us < 1000 or target_us > 2000:
+            abort_pulse_calibration(
+                f"{pulse_cal_target_description(axis, direction)} test would command {target_us}us; "
+                "adjust channel defaults so the pulse stays between 1000 and 2000"
+            )
+            return
+        try:
+            offsets = parse_entries(off_entries, int, "Offset")
+        except Exception as exc:
+            abort_pulse_calibration(str(exc))
+            return
+
+        pulse_cal_current_axis = axis
+        pulse_cal_current_channel = channel_index
+        pulse_cal_current_direction = direction
+        pulse_cal_baseline = pulse_axis_value(sample, axis)
+        pulse_cal_peak_delta = 0.0
+        pulse_cal_observing = True
+        pulse_cal_pulse_inflight = True
+
+        label = pulse_cal_target_description(axis, direction)
+        update_auto_command_text(
+            f"{label} test {pulse_cal_current_strength_us}us for "
+            f"{pulse_cal_duration_text(pulse_cal_current_duration_s)}s"
+        )
+        auto_safety_var.set("Safety: measuring pulse response")
+        status.set(
+            f"Pulse calibration {label}: attempt {pulse_cal_attempt + 1}, "
+            f"{pulse_cal_current_strength_us}us for {pulse_cal_duration_text(pulse_cal_current_duration_s)}s."
+        )
+
+        active_outputs = base_channel_outputs.copy()
+        active_outputs[channel_index] = target_us
+        set_live_channel_outputs(active_outputs)
+
+        def on_test_done(ok: bool, res: object) -> None:
+            nonlocal pulse_cal_pulse_inflight, pulse_cal_after_id
+            pulse_cal_pulse_inflight = False
+            set_live_channel_outputs(base_channel_outputs)
+            if not pulse_cal_active:
+                return
+            if not ok:
+                abort_pulse_calibration(str(res) if not isinstance(res, Exception) else str(res))
+                return
+            if not isinstance(res, int):
+                abort_pulse_calibration("unexpected test pulse result")
+                return
+            if res == PULSE_STATUS_REJECTED:
+                abort_pulse_calibration("firmware rejected calibration pulse")
+                return
+            pulse_cal_after_id = root.after(round(pulse_cal_observe_extra_s * 1000), evaluate_pulse_calibration_test)
+
+        worker.submit(
+            _task_hold,
+            channel_index,
+            target_us,
+            offsets[channel_index],
+            pulse_cal_current_duration_s,
+            callback=on_test_done,
+        )
+
+    def evaluate_pulse_calibration_test() -> None:
+        nonlocal pulse_cal_after_id, pulse_cal_observing, pulse_cal_target_index, pulse_cal_attempt
+        nonlocal pulse_cal_current_strength_us, pulse_cal_current_duration_s
+        pulse_cal_after_id = None
+        if not pulse_cal_active:
+            return
+        pulse_cal_observing = False
+        axis = pulse_cal_current_axis or "axis"
+        label = pulse_cal_target_description(axis, pulse_cal_current_direction)
+        peak = pulse_cal_peak_delta
+        if peak >= pulse_cal_target_angle_deg:
+            store_pulse_calibration_result(
+                pulse_cal_current_channel,
+                pulse_cal_current_strength_us,
+                pulse_cal_current_duration_s,
+            )
+            status.set(
+                f"Pulse calibration {label}: target hit at {peak:.1f} deg "
+                f"with {pulse_cal_current_strength_us}us/"
+                f"{pulse_cal_duration_text(pulse_cal_current_duration_s)}s."
+            )
+            pulse_cal_target_index += 1
+            if pulse_cal_target_index >= len(pulse_cal_sequence):
+                begin_pulse_calibration_recenter(complete_pulse_calibration, "final recenter")
+                return
+            reset_pulse_calibration_attempt()
+            begin_pulse_calibration_recenter(issue_pulse_calibration_test, "recenter before next test")
+            return
+
+        if (
+            pulse_cal_current_strength_us >= pulse_cal_max_strength_us
+            and pulse_cal_current_duration_s >= pulse_cal_max_duration_s
+        ):
+            abort_pulse_calibration(
+                f"{label} reached only {peak:.1f} deg at "
+                f"{pulse_cal_max_strength_us}us/{pulse_cal_duration_text(pulse_cal_max_duration_s)}s"
+            )
+            return
+
+        pulse_cal_current_strength_us = min(
+            pulse_cal_max_strength_us,
+            pulse_cal_current_strength_us + pulse_cal_strength_step_us,
+        )
+        pulse_cal_current_duration_s = min(
+            pulse_cal_max_duration_s,
+            round(pulse_cal_current_duration_s + pulse_cal_duration_step_s, 2),
+        )
+        pulse_cal_attempt += 1
+        update_auto_command_text(
+            f"{label} peak {peak:.1f} deg; next {pulse_cal_current_strength_us}us/"
+            f"{pulse_cal_duration_text(pulse_cal_current_duration_s)}s"
+        )
+        status.set(
+            f"Pulse calibration {label}: peak {peak:.1f} deg under "
+            f"{pulse_cal_target_angle_deg:.0f} deg; increasing pulse."
+        )
+        begin_pulse_calibration_recenter(issue_pulse_calibration_test, "recenter before retry")
+
+    def start_pulse_calibration() -> None:
+        nonlocal pulse_cal_active, pulse_cal_target_index, pulse_cal_results
+        nonlocal pulse_cal_current_axis, pulse_cal_current_channel, pulse_cal_current_direction
+        nonlocal pulse_cal_baseline, pulse_cal_peak_delta, pulse_cal_observing
+        if blackbox_import_inflight:
+            raise RuntimeError("Blackbox import/analyze is in progress.")
+        if auto_is_running() or auto_state == AdaptiveSessionState.import_analyze:
+            raise RuntimeError("Wait for the auto session/pipeline to finish first.")
+        if start_pending:
+            raise RuntimeError("Arduino connection is still starting.")
+        if not run_active or run_ser is None:
+            raise RuntimeError("Connect Arduino output before calibrating pulses.")
+        if not fc_service.is_connected:
+            raise RuntimeError("Connect FC before calibrating pulses.")
+        if level_active:
+            raise RuntimeError("Stop auto-level before calibrating pulses.")
+        if hold_command_inflight or hold_timeout_after_id is not None:
+            raise RuntimeError("Wait for active pulse/hold command to complete first.")
+        sample = fc_service.latest_attitude()
+        if sample is None:
+            raise RuntimeError("No FC attitude sample yet. Wait for telemetry then retry.")
+        if abs(sample.roll_deg) >= pulse_cal_safety_limit_deg or abs(sample.pitch_deg) >= pulse_cal_safety_limit_deg:
+            raise RuntimeError(
+                f"Attitude is too far from level to start "
+                f"(roll={sample.roll_deg:+.1f}, pitch={sample.pitch_deg:+.1f})."
+            )
+        channels = parse_entries(ch_entries, int, "Channel")
+        require_range(channels, "Channel", 1000, 2000)
+        _ = parse_entries(off_entries, int, "Offset")
+
+        prompt = (
+            "Confirm pulse calibration:\n"
+            "- Drone is secured on a stand\n"
+            "- FC attitude telemetry is live\n"
+            "- Props/motor state is safe for roll and pitch movement\n\n"
+            "The app will send roll/pitch pulses up to a 30 degree target and recenter between tries.\n"
+            "Start pulse calibration now?"
+        )
+        if not messagebox.askyesno("Calibrate Pulses", prompt):
+            status.set("Pulse calibration canceled.")
+            return
+
+        pulse_cal_active = True
+        pulse_cal_target_index = 0
+        pulse_cal_results = {}
+        pulse_cal_current_axis = None
+        pulse_cal_current_channel = ROLL_CHANNEL_INDEX
+        pulse_cal_current_direction = 1
+        pulse_cal_baseline = 0.0
+        pulse_cal_peak_delta = 0.0
+        pulse_cal_observing = False
+        reset_pulse_calibration_attempt()
+        auto_state_var.set("State: pulse calibration")
+        update_auto_command_text("pulse calibration starting")
+        auto_safety_var.set("Safety: centering before first test")
+        set_auto_report_text(
+            "Pulse calibration started.\n"
+            f"Target peak: {pulse_cal_target_angle_deg:.0f} deg.\n"
+            "Testing roll and pitch in both directions, then writing Pulse Str, Duration, and Angle."
+        )
+        update_link_indicators()
+        status.set("Pulse calibration started. Centering before first test.")
+        begin_pulse_calibration_recenter(issue_pulse_calibration_test, "center before first test")
+
+    def do_pulse_calibration_toggle() -> None:
+        try:
+            if pulse_cal_active:
+                abort_pulse_calibration("aborted by user")
+                return
+            start_pulse_calibration()
+        except Exception as exc:
+            set_error("Pulse calibration error", exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
+
     def set_error(title: str, exc: Exception) -> None:
         if is_closing:
             return
@@ -1317,8 +1871,30 @@ def main() -> None:
         level_ready = run_ser is not None and fc_connected
         if level_active and not level_ready:
             stop_level_loop(update_status=False)
-        level_button.config(state="normal" if level_ready else "disabled", relief="sunken" if level_active else "raised")
-        if auto_state == AdaptiveSessionState.import_analyze:
+        level_button.config(
+            state="normal" if level_ready and not pulse_cal_active else "disabled",
+            relief="sunken" if level_active else "raised",
+        )
+        pulse_cal_ready = (
+            level_ready
+            and not level_active
+            and not hold_command_inflight
+            and hold_timeout_after_id is None
+            and not auto_is_running()
+            and auto_state != AdaptiveSessionState.import_analyze
+            and not blackbox_import_inflight
+            and not start_pending
+        )
+        if pulse_cal_active:
+            pulse_calibrate_button.config(text="Abort Calibration", state="normal")
+        else:
+            pulse_calibrate_button.config(
+                text="Calibrate Pulses",
+                state="normal" if pulse_cal_ready else "disabled",
+            )
+        if pulse_cal_active:
+            auto_session_button.config(text="Start Auto Session", state="disabled")
+        elif auto_state == AdaptiveSessionState.import_analyze:
             auto_session_button.config(text="Running Analysis...", state="disabled")
         elif auto_is_running():
             auto_session_button.config(text="Abort Auto Session", state="normal")
@@ -1464,6 +2040,8 @@ def main() -> None:
                 raise RuntimeError("Press Connect Arduino before using Level.")
             if not fc_service.is_connected:
                 raise RuntimeError("Connect FC before using Level.")
+            if pulse_cal_active:
+                raise RuntimeError("Wait for pulse calibration to finish first.")
             if hold_command_inflight:
                 raise RuntimeError("Wait for active Pulse command to finish.")
             if hold_timeout_after_id is not None:
@@ -1522,6 +2100,8 @@ def main() -> None:
     def do_fc_disconnect(update_status: bool = True) -> None:
         if auto_state in (AdaptiveSessionState.adaptive_run, AdaptiveSessionState.recovery):
             auto_abort("FC disconnected during adaptive session.", continue_pipeline=False)
+        if pulse_cal_active:
+            abort_pulse_calibration("FC disconnected during pulse calibration")
         try:
             fc_service.disconnect()
         except Exception as exc:
@@ -1556,6 +2136,7 @@ def main() -> None:
             sample = fc_service.latest_attitude()
             if sample is not None:
                 record_auto_session_sample(sample)
+                record_pulse_calibration_sample(sample)
                 horizon.set_attitude(sample.roll_deg, sample.pitch_deg)
                 roll_text.set(f"Roll: {sample.roll_deg:6.1f} deg")
                 pitch_text.set(f"Pitch: {sample.pitch_deg:6.1f} deg")
@@ -1780,6 +2361,8 @@ def main() -> None:
         try:
             if start_pending:
                 raise RuntimeError("Start is already in progress.")
+            if pulse_cal_active:
+                raise RuntimeError("Pulse calibration is running. Press Abort Calibration first.")
             if hold_command_inflight:
                 raise RuntimeError("Wait for active Pulse command to finish.")
             if hold_timeout_after_id is not None:
@@ -1844,6 +2427,8 @@ def main() -> None:
 
     def do_stop() -> None:
         try:
+            if pulse_cal_active:
+                raise RuntimeError("Pulse calibration is running. Press Abort Calibration first.")
             if hold_command_inflight:
                 raise RuntimeError("Pulse command is in progress. Wait a moment, then try again.")
             cancel_hold_timeout()
@@ -1879,6 +2464,8 @@ def main() -> None:
                 raise RuntimeError("Press Connect Arduino before using Hold.")
             if level_active:
                 stop_level_loop(update_status=False)
+            if pulse_cal_active:
+                raise RuntimeError("Wait for pulse calibration to finish first.")
             if hold_command_inflight:
                 raise RuntimeError("A pulse command is already in progress.")
             if hold_timeout_after_id is not None:
@@ -2031,6 +2618,8 @@ def main() -> None:
         try:
             if not run_active or run_ser is None:
                 raise RuntimeError("Press Connect Arduino before ending Hold.")
+            if pulse_cal_active:
+                raise RuntimeError("Wait for pulse calibration to finish first.")
             if hold_command_inflight:
                 raise RuntimeError("Pulse command is still ramping in. Wait a moment, then try ∅.")
             if hold_timeout_after_id is None:
@@ -2059,6 +2648,7 @@ def main() -> None:
         is_closing = True
         cancel_adjust_repeat()
         cancel_hold_timeout()
+        stop_pulse_calibration_runtime()
         stop_auto_session_runtime()
         if fc_poll_after_id is not None:
             try:
@@ -2089,6 +2679,7 @@ def main() -> None:
     import_blackbox_button.config(command=do_pull_blackbox_logs)
     analyze_blackbox_button.config(command=do_analyze_blackbox_logs)
     auto_session_button.config(command=do_auto_session_toggle)
+    pulse_calibrate_button.config(command=do_pulse_calibration_toggle)
     auto_open_selected_button.config(command=open_selected_report_file)
     auto_open_all_button.config(command=open_all_report_files)
     arduino_button.config(command=do_arduino_toggle)

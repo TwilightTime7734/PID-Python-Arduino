@@ -1,4 +1,4 @@
-"""Interactive roll trace viewer generation for Blackbox CSV logs."""
+"""Interactive trace viewer generation for Blackbox CSV logs."""
 
 from __future__ import annotations
 
@@ -114,21 +114,34 @@ def detect_time_column(columns: dict[str, np.ndarray]) -> str | None:
     return _pick_column(columns, ["time", "time (us)", "timeUs", "loopIteration"])
 
 
-def detect_roll_columns(columns: dict[str, np.ndarray]) -> dict[str, str | None]:
-    # Reminder (2026-06-01): do not use axisRate as the roll setpoint source here.
+def _detect_axis_columns(columns: dict[str, np.ndarray], axis_index: int, axis_name: str) -> dict[str, str | None]:
+    # Reminder (2026-06-01): do not use axisRate as the setpoint source here.
     # Keep this viewer on setpoint/RC vs gyro signals.
     return {
         "setpoint": _pick_column(
             columns,
-            ["setpoint[0]", "gyroSetpoint[0]", "rcCommand[0]"],
+            [f"setpoint[{axis_index}]", f"gyroSetpoint[{axis_index}]", f"rcCommand[{axis_index}]"],
         ),
         "gyro": _pick_column(
             columns,
-            ["gyroADC[0]", "gyroADC[roll]", "gyro[0]", "gyroData[0]"],
+            [
+                f"gyroADC[{axis_index}]",
+                f"gyroADC[{axis_name}]",
+                f"gyro[{axis_index}]",
+                f"gyroData[{axis_index}]",
+            ],
         ),
-        "rc": _pick_column(columns, ["rcCommand[0]", "rcData[0]"]),
+        "rc": _pick_column(columns, [f"rcCommand[{axis_index}]", f"rcData[{axis_index}]"]),
         "throttle": _pick_column(columns, ["throttle", "rcCommand[3]"]),
     }
+
+
+def detect_roll_columns(columns: dict[str, np.ndarray]) -> dict[str, str | None]:
+    return _detect_axis_columns(columns, 0, "roll")
+
+
+def detect_pitch_columns(columns: dict[str, np.ndarray]) -> dict[str, str | None]:
+    return _detect_axis_columns(columns, 1, "pitch")
 
 
 def _time_axis(columns: dict[str, np.ndarray]) -> tuple[np.ndarray, str]:
@@ -173,13 +186,13 @@ def _add_trace(fig: Any, *, row: int, x: np.ndarray, y: np.ndarray, name: str, c
     )
 
 
-def build_roll_trace_viewer(csv_path: str | Path, output_dir: str | Path) -> Path:
-    """Generate a Blackbox-Explorer-style HTML viewer for roll traces."""
+def _build_axis_trace_viewer(csv_path: str | Path, output_dir: str | Path, axis_name: str, axis_index: int) -> Path:
+    """Generate a Blackbox-Explorer-style HTML viewer for one axis."""
     try:
         from plotly.subplots import make_subplots
     except Exception as exc:
         raise RuntimeError(
-            "Plotly is required for roll trace viewer generation. Install with: pip install plotly"
+            f"Plotly is required for {axis_name} trace viewer generation. Install with: pip install plotly"
         ) from exc
 
     csv_path = Path(csv_path)
@@ -187,17 +200,18 @@ def build_roll_trace_viewer(csv_path: str | Path, output_dir: str | Path) -> Pat
     output_path.mkdir(parents=True, exist_ok=True)
 
     columns = load_blackbox_csv(csv_path)
-    detected = detect_roll_columns(columns)
+    detected = _detect_axis_columns(columns, axis_index, axis_name)
     setpoint_col = detected["setpoint"]
     gyro_col = detected["gyro"]
+    axis_title = axis_name.title()
 
     if setpoint_col is None or gyro_col is None:
         available = ", ".join(columns.keys())
         axisrate_hint = ""
-        if setpoint_col is None and _pick_column(columns, ["axisRate[0]"]) is not None:
-            axisrate_hint = "\nNote: axisRate[0] is intentionally ignored for setpoint selection."
+        if setpoint_col is None and _pick_column(columns, [f"axisRate[{axis_index}]"]) is not None:
+            axisrate_hint = f"\nNote: axisRate[{axis_index}] is intentionally ignored for setpoint selection."
         raise RuntimeError(
-            "Could not find required roll columns.\n"
+            f"Could not find required {axis_name} columns.\n"
             f"Detected setpoint: {setpoint_col}\n"
             f"Detected gyro: {gyro_col}\n"
             f"Available columns: {available}{axisrate_hint}"
@@ -206,7 +220,7 @@ def build_roll_trace_viewer(csv_path: str | Path, output_dir: str | Path) -> Pat
     x, x_label = _time_axis(columns)
     setpoint = _replace_invalid(columns[setpoint_col])
     gyro = _replace_invalid(columns[gyro_col])
-    roll_error = setpoint - gyro
+    axis_error = setpoint - gyro
 
     rc_series: np.ndarray | None = None
     throttle_series: np.ndarray | None = None
@@ -223,7 +237,11 @@ def build_roll_trace_viewer(csv_path: str | Path, output_dir: str | Path) -> Pat
     has_aux = rc_series is not None or throttle_series is not None
     rows = 3 if has_aux else 2
     heights = [0.56, 0.27, 0.17] if has_aux else [0.68, 0.32]
-    titles = ("Roll setpoint vs gyro", "Roll error", "RC / Throttle") if has_aux else ("Roll setpoint vs gyro", "Roll error")
+    titles = (
+        (f"{axis_title} setpoint vs gyro", f"{axis_title} error", "RC / Throttle")
+        if has_aux
+        else (f"{axis_title} setpoint vs gyro", f"{axis_title} error")
+    )
     fig = make_subplots(
         rows=rows,
         cols=1,
@@ -235,7 +253,7 @@ def build_roll_trace_viewer(csv_path: str | Path, output_dir: str | Path) -> Pat
 
     _add_trace(fig, row=1, x=x, y=setpoint, name=f"Setpoint ({setpoint_col})", color="#f59e0b", width=1.0)
     _add_trace(fig, row=1, x=x, y=gyro, name=f"Gyro ({gyro_col})", color="#2563eb", width=1.0)
-    _add_trace(fig, row=2, x=x, y=roll_error, name="Roll error", color="#dc2626", width=0.8)
+    _add_trace(fig, row=2, x=x, y=axis_error, name=f"{axis_title} error", color="#dc2626", width=0.8)
 
     if has_aux:
         if rc_series is not None and detected["rc"] is not None:
@@ -247,7 +265,7 @@ def build_roll_trace_viewer(csv_path: str | Path, output_dir: str | Path) -> Pat
     fig.update_layout(
         template="plotly_white",
         hovermode="x unified",
-        title=f"Roll Trace Viewer: {csv_path.name}",
+        title=f"{axis_title} Trace Viewer: {csv_path.name}",
         height=920 if has_aux else 760,
         legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0.01},
         margin={"l": 60, "r": 20, "t": 90, "b": 50},
@@ -258,7 +276,7 @@ def build_roll_trace_viewer(csv_path: str | Path, output_dir: str | Path) -> Pat
     if has_aux:
         fig.update_yaxes(title_text="Input", row=3, col=1)
 
-    html_path = output_path / "roll_trace_viewer.html"
+    html_path = output_path / f"{axis_name}_trace_viewer.html"
     fig.write_html(
         str(html_path),
         include_plotlyjs="cdn",
@@ -274,6 +292,16 @@ def build_roll_trace_viewer(csv_path: str | Path, output_dir: str | Path) -> Pat
     return html_path
 
 
+def build_roll_trace_viewer(csv_path: str | Path, output_dir: str | Path) -> Path:
+    """Generate a Blackbox-Explorer-style HTML viewer for roll traces."""
+    return _build_axis_trace_viewer(csv_path, output_dir, "roll", 0)
+
+
+def build_pitch_trace_viewer(csv_path: str | Path, output_dir: str | Path) -> Path:
+    """Generate a Blackbox-Explorer-style HTML viewer for pitch traces."""
+    return _build_axis_trace_viewer(csv_path, output_dir, "pitch", 1)
+
+
 def open_trace_viewer(html_path: Path) -> None:
-    """Open a generated roll trace HTML viewer in the default browser."""
+    """Open a generated trace HTML viewer in the default browser."""
     webbrowser.open_new_tab(html_path.resolve().as_uri())

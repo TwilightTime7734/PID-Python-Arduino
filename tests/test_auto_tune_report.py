@@ -39,8 +39,9 @@ class AutoTuneReportTests(unittest.TestCase):
             self.assertTrue(Path(report.summary_json).exists())
             self.assertTrue(Path(report.combined_chart_sheet).exists())
             self.assertTrue(str(report.combined_chart_sheet).endswith(".html"))
-            self.assertEqual(len(report.chart_paths), 1)
+            self.assertEqual(len(report.chart_paths), 2)
             self.assertTrue(str(report.chart_paths[0]).endswith("roll_trace_viewer.html"))
+            self.assertTrue(str(report.chart_paths[1]).endswith("pitch_trace_viewer.html"))
             for item in report.chart_paths:
                 self.assertTrue(Path(item).exists())
 
@@ -49,22 +50,27 @@ class AutoTuneReportTests(unittest.TestCase):
             "loopIteration",
             "time (us)",
             "gyroADC[0]",
+            "gyroADC[1]",
             "axisP[0]",
             "axisI[0]",
             "axisD[0]",
             "axisF[0]",
             "rcCommand[0]",
+            "rcCommand[1]",
             "motor[0]",
             "motor[1]",
             "motor[2]",
             "motor[3]",
             "gyroRaw[0]",
+            "gyroRaw[1]",
         ]
         rows = [",".join(header)]
         for i in range(1200):
             t_us = i * 1000
             setpoint = 160.0 if (i // 100) % 2 == 0 else -140.0
             actual = setpoint * 0.82
+            pitch_setpoint = -120.0 if (i // 120) % 2 == 0 else 135.0
+            pitch_actual = pitch_setpoint * 0.78
             axp = setpoint * 0.12
             axi = setpoint * 0.03
             axd = setpoint * 0.05
@@ -74,20 +80,24 @@ class AutoTuneReportTests(unittest.TestCase):
             m2 = 1110 + ((i % 30) * 7)
             m3 = 1130 + ((i % 28) * 4)
             gyro = actual + (12.0 if (i % 50) < 5 else -9.0)
+            pitch_gyro = pitch_actual + (10.0 if (i % 45) < 5 else -7.0)
             row = [
                 str(i),
                 str(t_us),
                 f"{actual:.3f}",
+                f"{pitch_actual:.3f}",
                 f"{axp:.3f}",
                 f"{axi:.3f}",
                 f"{axd:.3f}",
                 f"{axf:.3f}",
                 f"{setpoint:.3f}",
+                f"{pitch_setpoint:.3f}",
                 f"{m0:.3f}",
                 f"{m1:.3f}",
                 f"{m2:.3f}",
                 f"{m3:.3f}",
                 f"{gyro:.3f}",
+                f"{pitch_gyro:.3f}",
             ]
             rows.append(",".join(row))
         path.write_text("\n".join(rows) + "\n", encoding="utf-8")

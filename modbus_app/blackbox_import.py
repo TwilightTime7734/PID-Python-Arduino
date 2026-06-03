@@ -24,6 +24,13 @@ RAW_BLACKBOX_EXTENSIONS = {".txt", ".bbl", ".bfl", ".bbs"}
 CSV_EXTENSIONS = {".csv"}
 TOOLKIT_ANALYZE_EXTENSIONS = RAW_BLACKBOX_EXTENSIONS | CSV_EXTENSIONS
 LOG_SEARCH_DIR_NAMES = {"blackbox", "logs", "log", "inav"}
+REPO_ROOT = Path(__file__).resolve().parents[1]
+LOCAL_DECODER_CANDIDATES = (
+    REPO_ROOT / "tools" / "blackbox_decode_INAV.exe",
+    REPO_ROOT / "tools" / "blackbox_decode_INAV",
+    REPO_ROOT / "tools" / "blackbox_decode.exe",
+    REPO_ROOT / "tools" / "blackbox_decode",
+)
 DECODER_FALLBACK_CANDIDATES = (
     Path(r"C:\Program Files\PIDtoolbox\application\blackbox_decode_INAV.exe"),
     Path(r"C:\Program Files\PIDtoolbox\application\blackbox_decode.exe"),
@@ -1027,6 +1034,7 @@ def _decode_raw_logs(raw_paths: list[Path], destination: Path) -> tuple[list[Pat
     warnings: list[str] = []
     decoded: list[Path] = []
     for raw in raw_paths:
+        raw = raw.resolve()
         before = {p.resolve() for p in destination.glob(f"{raw.stem}*.csv")}
         try:
             completed = subprocess.run(
@@ -1060,6 +1068,10 @@ def _decode_raw_logs(raw_paths: list[Path], destination: Path) -> tuple[list[Pat
 
 
 def _find_blackbox_decoder() -> Path | None:
+    for candidate in LOCAL_DECODER_CANDIDATES:
+        if candidate.exists():
+            return candidate
+
     which_candidates = (
         "blackbox_decode_INAV.exe",
         "blackbox_decode_INAV",

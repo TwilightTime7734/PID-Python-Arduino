@@ -29,16 +29,21 @@ class AdaptiveSessionConfig:
     control_interval_s: float = 0.070
     settle_deadband_deg: float = 2.5
     force_min_us: int = 100
-    force_max_us: int = 260
+    force_max_us: int = 360
     hold_min_s: float = 0.25
-    hold_max_s: float = 0.45
-    settle_max_s: float = 0.55
+    hold_max_s: float = 0.65
+    settle_max_s: float = 0.85
     min_runtime_s: float = 45.0
     max_runtime_s: float = 180.0
     target_peak_min_deg: float = 8.0
     target_peak_max_deg: float = 25.0
     target_valid_events: int = 6
     target_settle_ratio: float = 0.80
+    throttle_start_us: int = 1350
+    throttle_max_us: int = 1600
+    throttle_step_us: int = 25
+    throttle_boost_peak_deg: float = 4.0
+    throttle_trim_peak_deg: float = 28.0
 
 
 @dataclass(frozen=True)
@@ -165,6 +170,29 @@ class AdaptiveExcitationController:
         if coverage is None:
             return
         coverage.register_event(event, self.config)
+
+    def initial_throttle(self, current_throttle_us: int) -> tuple[int, str]:
+        current = max(1000, min(2000, int(current_throttle_us)))
+        target = max(self.config.throttle_start_us, current)
+        target = min(self.config.throttle_max_us, target)
+        if target == current:
+            return current, ""
+        if target > current:
+            return target, f"auto throttle floor {target}us"
+        return target, f"auto throttle capped {target}us"
+
+    def throttle_after_event(self, current_throttle_us: int, event: ExcitationEvent) -> tuple[int, str]:
+        current = max(1000, min(2000, int(current_throttle_us)))
+        peak = abs(float(event.peak_delta_deg))
+        if peak < self.config.throttle_boost_peak_deg:
+            target = min(self.config.throttle_max_us, max(current, self.config.throttle_start_us) + self.config.throttle_step_us)
+            if target > current:
+                return target, f"boost throttle to {target}us; weak {peak:.1f}deg response"
+        elif peak > self.config.throttle_trim_peak_deg:
+            target = max(self.config.throttle_start_us, current - self.config.throttle_step_us)
+            if target < current:
+                return target, f"trim throttle to {target}us; large {peak:.1f}deg response"
+        return current, ""
 
     def axis_confidence(self, axis: str) -> float:
         pos = self._coverage[(axis, +1)].confidence(self.config)

@@ -74,6 +74,25 @@ class AdaptiveControllerTests(unittest.TestCase):
         self.assertTrue(abort)
         self.assertIn("Hard safety limit", reason)
 
+    def test_initial_throttle_applies_floor_and_cap(self) -> None:
+        target, reason = self.controller.initial_throttle(1200)
+        self.assertEqual(self.cfg.throttle_start_us, target)
+        self.assertIn("floor", reason)
+
+        target, reason = self.controller.initial_throttle(1700)
+        self.assertEqual(self.cfg.throttle_max_us, target)
+        self.assertIn("capped", reason)
+
+    def test_throttle_boosts_after_weak_response(self) -> None:
+        target, reason = self.controller.throttle_after_event(1300, self._event("roll", 1, 1.5))
+        self.assertEqual(self.cfg.throttle_start_us + self.cfg.throttle_step_us, target)
+        self.assertIn("weak", reason)
+
+    def test_throttle_trims_after_large_response(self) -> None:
+        target, reason = self.controller.throttle_after_event(1450, self._event("pitch", -1, 32.0))
+        self.assertEqual(1450 - self.cfg.throttle_step_us, target)
+        self.assertIn("large", reason)
+
 
 if __name__ == "__main__":
     unittest.main()
