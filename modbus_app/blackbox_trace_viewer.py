@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import csv
-import webbrowser
 from pathlib import Path
 from typing import Any
 
@@ -300,8 +299,3 @@ def build_roll_trace_viewer(csv_path: str | Path, output_dir: str | Path) -> Pat
 def build_pitch_trace_viewer(csv_path: str | Path, output_dir: str | Path) -> Path:
     """Generate a Blackbox-Explorer-style HTML viewer for pitch traces."""
     return _build_axis_trace_viewer(csv_path, output_dir, "pitch", 1)
-
-
-def open_trace_viewer(html_path: Path) -> None:
-    """Open a generated trace HTML viewer in the default browser."""
-    webbrowser.open_new_tab(html_path.resolve().as_uri())

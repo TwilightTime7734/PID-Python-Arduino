@@ -347,11 +347,6 @@ def _summarize_with_inav_toolkit(
     return "", "", warnings + load_warnings, None
 
 
-def summarize_blackbox_with_toolkit(log_path: str | Path, analyzer) -> str:
-    summary, _ = analyze_blackbox_with_toolkit(log_path, analyzer)
-    return summary
-
-
 def analyze_blackbox_with_toolkit(log_path: str | Path, analyzer) -> tuple[str, BlackboxPidReport]:
     path = Path(log_path)
     ext = path.suffix.lower()
@@ -411,7 +406,6 @@ def _load_toolkit_analyzer_with_warnings() -> tuple[object | None, list[str]]:
         warnings.append(
             f"INAV-Toolkit import failed in '{sys.executable}': {type(exc).__name__}: {exc}"
         )
-        pass
 
     for root in TOOLKIT_ROOT_CANDIDATES:
         if not root:
@@ -760,11 +754,6 @@ def _compact_text(text: str, max_len: int = 96) -> str:
     if max_len <= 3:
         return text[:max_len]
     return text[: max_len - 3].rstrip() + "..."
-
-
-def summarize_blackbox_csv(csv_path: str | Path) -> str:
-    summary, _ = analyze_blackbox_csv(csv_path)
-    return summary
 
 
 def analyze_blackbox_csv(csv_path: str | Path) -> tuple[str, BlackboxPidReport]:

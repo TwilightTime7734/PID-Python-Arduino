@@ -25,7 +25,6 @@ from .constants import (
     ADJUST_REPEAT_INITIAL_MS,
     ADJUST_REPEAT_INTERVAL_MS,
     CHANNEL_DEFAULTS,
-    FC_BAUD_DEFAULT,
     FC_DEVICE_ID,
     FC_DEVICE_PID,
     FC_DEVICE_VID,
@@ -67,7 +66,6 @@ from .adaptive_session import (
     AdaptiveCommand,
     AdaptiveExcitationController,
     AdaptiveSessionConfig,
-    AdaptiveSessionResult,
     AdaptiveSessionState,
     ExcitationEvent,
     axis_channel_index,
@@ -202,22 +200,30 @@ def main() -> None:
         ("pitch", PITCH_CHANNEL_INDEX, 1),
         ("pitch", PITCH_CHANNEL_INDEX, -1),
     )
-    pulse_cal_target_angle_deg = 30.0
+    pulse_cal_target_angle_deg = 25.0
     pulse_cal_start_strength_us = 100
     pulse_cal_start_duration_s = 0.30
     pulse_cal_strength_step_us = 25
     pulse_cal_duration_step_s = 0.05
-    pulse_cal_max_strength_us = 500
-    pulse_cal_max_duration_s = 1.20
-    pulse_cal_observe_extra_s = 0.25
-    pulse_cal_recenter_timeout_s = 8.0
-    pulse_cal_safety_limit_deg = 43.0
+    pulse_cal_max_strength_us = 425
+    pulse_cal_max_duration_s = 0.55
+    pulse_cal_observe_extra_s = 0.65
+    pulse_cal_recenter_timeout_s = 10.0
+    pulse_cal_safety_limit_deg = 39.0
+    pulse_cal_recenter_dwell_s = 1.25
+    pulse_cal_recenter_rate_limit_dps = 5.0
+    pulse_cal_recenter_release_delay_ms = 250
     pulse_cal_active = False
     pulse_cal_after_id: str | None = None
     pulse_cal_pulse_inflight = False
     pulse_cal_recenter_inflight = False
     pulse_cal_after_recenter: Callable[[], None] | None = None
     pulse_cal_recenter_deadline_s: float | None = None
+    pulse_cal_recenter_stable_since_s: float | None = None
+    pulse_cal_recenter_last_stamp = None
+    pulse_cal_recenter_last_sample_s: float | None = None
+    pulse_cal_recenter_last_roll_deg: float | None = None
+    pulse_cal_recenter_last_pitch_deg: float | None = None
     pulse_cal_target_index = 0
     pulse_cal_attempt = 0
     pulse_cal_current_axis: str | None = None
@@ -227,6 +233,9 @@ def main() -> None:
     pulse_cal_current_duration_s = pulse_cal_start_duration_s
     pulse_cal_baseline = 0.0
     pulse_cal_peak_delta = 0.0
+    pulse_cal_test_started_s = 0.0
+    pulse_cal_target_hit_duration_s: float | None = None
+    pulse_cal_hold_end_requested = False
     pulse_cal_observing = False
     pulse_cal_results: dict[int, tuple[int, float]] = {}
 
@@ -328,46 +337,12 @@ def main() -> None:
         auto_roll_conf_var.set(max(0.0, min(100.0, metrics.axis_confidence["roll"] * 100.0)))
         auto_pitch_conf_var.set(max(0.0, min(100.0, metrics.axis_confidence["pitch"] * 100.0)))
 
-    def format_auto_metrics_line() -> str:
-        if auto_controller is None:
-            return "Command: --"
-        metrics = auto_controller.coverage_metrics()
-        roll_conf = metrics.axis_confidence["roll"] * 100.0
-        pitch_conf = metrics.axis_confidence["pitch"] * 100.0
-        return f"Command: {auto_command_var.get().replace('Command: ', '')} | Conf roll {roll_conf:.0f}% pitch {pitch_conf:.0f}%"
-
     def set_auto_state(next_state: AdaptiveSessionState, safety_text: str = "") -> None:
         nonlocal auto_state
         auto_state = next_state
         auto_state_var.set(f"State: {next_state.value}")
         if safety_text:
             auto_safety_var.set(f"Safety: {safety_text}")
-
-    def reset_auto_runtime_state() -> None:
-        nonlocal auto_session_start_s, auto_last_tick_s, auto_tick_after_id, auto_pulse_inflight
-        nonlocal auto_settle_until_s, auto_recovery_mode, auto_active_command, auto_event_peak_delta
-        nonlocal auto_event_response_delay_s, auto_event_baseline, auto_event_start_s, auto_original_base_outputs
-        nonlocal auto_start_throttle_us, auto_current_throttle_us, auto_peak_throttle_us
-        auto_session_start_s = None
-        auto_last_tick_s = None
-        auto_pulse_inflight = False
-        auto_settle_until_s = None
-        auto_recovery_mode = False
-        auto_active_command = None
-        auto_event_peak_delta = 0.0
-        auto_event_response_delay_s = None
-        auto_event_baseline = 0.0
-        auto_event_start_s = 0.0
-        auto_original_base_outputs = None
-        auto_start_throttle_us = base_channel_outputs[THROTTLE_CHANNEL_INDEX]
-        auto_current_throttle_us = base_channel_outputs[THROTTLE_CHANNEL_INDEX]
-        auto_peak_throttle_us = base_channel_outputs[THROTTLE_CHANNEL_INDEX]
-        if auto_tick_after_id is not None:
-            try:
-                root.after_cancel(auto_tick_after_id)
-            except Exception:
-                pass
-            auto_tick_after_id = None
 
     def auto_session_payload() -> dict[str, object]:
         metrics: dict[str, object] = {}
@@ -456,8 +431,19 @@ def main() -> None:
             if directed_delta >= threshold_deg:
                 auto_event_response_delay_s = max(0.0, time.monotonic() - auto_event_start_s)
 
+    def request_pulse_calibration_hold_end() -> None:
+        if not pulse_cal_active or not run_active or run_ser is None:
+            return
+        worker.submit(_task_hold_end, pulse_cal_current_channel)
+
+    def schedule_pulse_calibration_evaluation(delay_s: float) -> None:
+        nonlocal pulse_cal_after_id
+        cancel_pulse_calibration_timer()
+        pulse_cal_after_id = root.after(max(1, round(delay_s * 1000.0)), evaluate_pulse_calibration_test)
+
     def record_pulse_calibration_sample(sample) -> None:
-        nonlocal pulse_cal_peak_delta
+        nonlocal pulse_cal_peak_delta, pulse_cal_target_hit_duration_s, pulse_cal_hold_end_requested
+        nonlocal pulse_cal_pulse_inflight
         if not pulse_cal_active or not pulse_cal_observing or pulse_cal_current_axis is None:
             return
         if abs(sample.roll_deg) >= pulse_cal_safety_limit_deg or abs(sample.pitch_deg) >= pulse_cal_safety_limit_deg:
@@ -467,6 +453,17 @@ def main() -> None:
             return
         axis_value = pulse_axis_value(sample, pulse_cal_current_axis)
         pulse_cal_peak_delta = max(pulse_cal_peak_delta, abs(axis_value - pulse_cal_baseline))
+        if (
+            pulse_cal_peak_delta >= pulse_cal_target_angle_deg
+            and pulse_cal_pulse_inflight
+            and not pulse_cal_hold_end_requested
+        ):
+            pulse_cal_target_hit_duration_s = max(0.05, time.monotonic() - pulse_cal_test_started_s)
+            pulse_cal_hold_end_requested = True
+            pulse_cal_pulse_inflight = False
+            set_live_channel_outputs(base_channel_outputs)
+            request_pulse_calibration_hold_end()
+            schedule_pulse_calibration_evaluation(pulse_cal_observe_extra_s)
 
     def draw_channel_output(index: int, value: int) -> None:
         clamped = max(1000, min(2000, value))
@@ -1412,12 +1409,22 @@ def main() -> None:
     def stop_pulse_calibration_runtime() -> None:
         nonlocal pulse_cal_active, pulse_cal_pulse_inflight, pulse_cal_recenter_inflight
         nonlocal pulse_cal_after_recenter, pulse_cal_recenter_deadline_s, pulse_cal_observing
+        nonlocal pulse_cal_recenter_stable_since_s, pulse_cal_recenter_last_stamp
+        nonlocal pulse_cal_recenter_last_sample_s, pulse_cal_recenter_last_roll_deg, pulse_cal_recenter_last_pitch_deg
+        nonlocal pulse_cal_target_hit_duration_s, pulse_cal_hold_end_requested
         cancel_pulse_calibration_timer()
         pulse_cal_active = False
         pulse_cal_pulse_inflight = False
         pulse_cal_recenter_inflight = False
         pulse_cal_after_recenter = None
         pulse_cal_recenter_deadline_s = None
+        pulse_cal_recenter_stable_since_s = None
+        pulse_cal_recenter_last_stamp = None
+        pulse_cal_recenter_last_sample_s = None
+        pulse_cal_recenter_last_roll_deg = None
+        pulse_cal_recenter_last_pitch_deg = None
+        pulse_cal_target_hit_duration_s = None
+        pulse_cal_hold_end_requested = False
         pulse_cal_observing = False
         restore_pulse_calibration_state_label()
         if hold_timeout_after_id is None and not level_active:
@@ -1426,6 +1433,8 @@ def main() -> None:
 
     def abort_pulse_calibration(reason: str) -> None:
         was_active = pulse_cal_active
+        if was_active:
+            request_pulse_calibration_hold_end()
         stop_pulse_calibration_runtime()
         if was_active and not is_closing:
             update_auto_command_text("pulse calibration aborted")
@@ -1489,6 +1498,49 @@ def main() -> None:
             f"Pitch {pitch_strength}us/{pulse_cal_duration_text(pitch_duration)}s."
         )
 
+    def reset_pulse_calibration_recenter_stability() -> None:
+        nonlocal pulse_cal_recenter_stable_since_s, pulse_cal_recenter_last_stamp
+        nonlocal pulse_cal_recenter_last_sample_s, pulse_cal_recenter_last_roll_deg, pulse_cal_recenter_last_pitch_deg
+        pulse_cal_recenter_stable_since_s = None
+        pulse_cal_recenter_last_stamp = None
+        pulse_cal_recenter_last_sample_s = None
+        pulse_cal_recenter_last_roll_deg = None
+        pulse_cal_recenter_last_pitch_deg = None
+
+    def pulse_calibration_recenter_is_stable(sample) -> bool:
+        nonlocal pulse_cal_recenter_stable_since_s, pulse_cal_recenter_last_stamp
+        nonlocal pulse_cal_recenter_last_sample_s, pulse_cal_recenter_last_roll_deg, pulse_cal_recenter_last_pitch_deg
+
+        stamp = getattr(sample, "timestamp_local", None)
+        if stamp is not None and stamp == pulse_cal_recenter_last_stamp:
+            return False
+
+        now_s = time.monotonic()
+        rate_ok = False
+        if (
+            pulse_cal_recenter_last_sample_s is not None
+            and pulse_cal_recenter_last_roll_deg is not None
+            and pulse_cal_recenter_last_pitch_deg is not None
+        ):
+            dt_s = max(0.001, now_s - pulse_cal_recenter_last_sample_s)
+            roll_rate = abs(float(sample.roll_deg) - pulse_cal_recenter_last_roll_deg) / dt_s
+            pitch_rate = abs(float(sample.pitch_deg) - pulse_cal_recenter_last_pitch_deg) / dt_s
+            rate_ok = max(roll_rate, pitch_rate) <= pulse_cal_recenter_rate_limit_dps
+
+        pulse_cal_recenter_last_stamp = stamp
+        pulse_cal_recenter_last_sample_s = now_s
+        pulse_cal_recenter_last_roll_deg = float(sample.roll_deg)
+        pulse_cal_recenter_last_pitch_deg = float(sample.pitch_deg)
+
+        settled = is_level_attitude_settled(sample.roll_deg, sample.pitch_deg)
+        if settled and rate_ok:
+            if pulse_cal_recenter_stable_since_s is None:
+                pulse_cal_recenter_stable_since_s = now_s
+            return now_s - pulse_cal_recenter_stable_since_s >= pulse_cal_recenter_dwell_s
+
+        pulse_cal_recenter_stable_since_s = None
+        return False
+
     def schedule_pulse_calibration_recenter(delay_ms: int = LEVEL_LOOP_INTERVAL_MS) -> None:
         nonlocal pulse_cal_after_id
         cancel_pulse_calibration_timer()
@@ -1498,6 +1550,7 @@ def main() -> None:
         nonlocal pulse_cal_after_recenter, pulse_cal_recenter_deadline_s
         if not pulse_cal_active:
             return
+        reset_pulse_calibration_recenter_stability()
         pulse_cal_after_recenter = next_step
         pulse_cal_recenter_deadline_s = time.monotonic() + pulse_cal_recenter_timeout_s
         update_auto_command_text(reason)
@@ -1525,12 +1578,12 @@ def main() -> None:
                 f"safety limit reached while recentering (roll={sample.roll_deg:+.1f}, pitch={sample.pitch_deg:+.1f})"
             )
             return
-        if is_level_attitude_settled(sample.roll_deg, sample.pitch_deg):
+        if pulse_calibration_recenter_is_stable(sample):
             set_live_channel_outputs(base_channel_outputs)
             next_step = pulse_cal_after_recenter
             pulse_cal_after_recenter = None
             if next_step is not None:
-                pulse_cal_after_id = root.after(100, next_step)
+                pulse_cal_after_id = root.after(pulse_cal_recenter_release_delay_ms, next_step)
             return
         if pulse_cal_recenter_deadline_s is not None and time.monotonic() >= pulse_cal_recenter_deadline_s:
             abort_pulse_calibration(
@@ -1594,7 +1647,8 @@ def main() -> None:
     def issue_pulse_calibration_test() -> None:
         nonlocal pulse_cal_after_id, pulse_cal_pulse_inflight, pulse_cal_observing
         nonlocal pulse_cal_current_axis, pulse_cal_current_channel, pulse_cal_current_direction
-        nonlocal pulse_cal_baseline, pulse_cal_peak_delta
+        nonlocal pulse_cal_baseline, pulse_cal_peak_delta, pulse_cal_test_started_s
+        nonlocal pulse_cal_target_hit_duration_s, pulse_cal_hold_end_requested
         pulse_cal_after_id = None
         if not pulse_cal_active:
             return
@@ -1632,6 +1686,9 @@ def main() -> None:
         pulse_cal_current_direction = direction
         pulse_cal_baseline = pulse_axis_value(sample, axis)
         pulse_cal_peak_delta = 0.0
+        pulse_cal_test_started_s = time.monotonic()
+        pulse_cal_target_hit_duration_s = None
+        pulse_cal_hold_end_requested = False
         pulse_cal_observing = True
         pulse_cal_pulse_inflight = True
 
@@ -1650,22 +1707,36 @@ def main() -> None:
         active_outputs[channel_index] = target_us
         set_live_channel_outputs(active_outputs)
 
-        def on_test_done(ok: bool, res: object) -> None:
+        def on_test_hold_elapsed() -> None:
             nonlocal pulse_cal_pulse_inflight, pulse_cal_after_id
+            pulse_cal_after_id = None
+            if not pulse_cal_active:
+                return
             pulse_cal_pulse_inflight = False
             set_live_channel_outputs(base_channel_outputs)
+            schedule_pulse_calibration_evaluation(pulse_cal_observe_extra_s)
+
+        def on_test_done(ok: bool, res: object) -> None:
+            nonlocal pulse_cal_pulse_inflight, pulse_cal_after_id
             if not pulse_cal_active:
                 return
             if not ok:
+                pulse_cal_pulse_inflight = False
+                set_live_channel_outputs(base_channel_outputs)
                 abort_pulse_calibration(str(res) if not isinstance(res, Exception) else str(res))
                 return
             if not isinstance(res, int):
+                pulse_cal_pulse_inflight = False
+                set_live_channel_outputs(base_channel_outputs)
                 abort_pulse_calibration("unexpected test pulse result")
                 return
             if res == PULSE_STATUS_REJECTED:
+                pulse_cal_pulse_inflight = False
+                set_live_channel_outputs(base_channel_outputs)
                 abort_pulse_calibration("firmware rejected calibration pulse")
                 return
-            pulse_cal_after_id = root.after(round(pulse_cal_observe_extra_s * 1000), evaluate_pulse_calibration_test)
+            if pulse_cal_target_hit_duration_s is None:
+                pulse_cal_after_id = root.after(round(pulse_cal_current_duration_s * 1000.0), on_test_hold_elapsed)
 
         worker.submit(
             _task_hold,
@@ -1687,15 +1758,20 @@ def main() -> None:
         label = pulse_cal_target_description(axis, pulse_cal_current_direction)
         peak = pulse_cal_peak_delta
         if peak >= pulse_cal_target_angle_deg:
+            calibrated_duration_s = min(
+                pulse_cal_current_duration_s,
+                pulse_cal_target_hit_duration_s if pulse_cal_target_hit_duration_s is not None else pulse_cal_current_duration_s,
+            )
+            calibrated_duration_s = max(0.05, round(calibrated_duration_s, 2))
             store_pulse_calibration_result(
                 pulse_cal_current_channel,
                 pulse_cal_current_strength_us,
-                pulse_cal_current_duration_s,
+                calibrated_duration_s,
             )
             status.set(
                 f"Pulse calibration {label}: target hit at {peak:.1f} deg "
                 f"with {pulse_cal_current_strength_us}us/"
-                f"{pulse_cal_duration_text(pulse_cal_current_duration_s)}s."
+                f"{pulse_cal_duration_text(calibrated_duration_s)}s."
             )
             pulse_cal_target_index += 1
             if pulse_cal_target_index >= len(pulse_cal_sequence):
@@ -1715,14 +1791,16 @@ def main() -> None:
             )
             return
 
-        pulse_cal_current_strength_us = min(
-            pulse_cal_max_strength_us,
-            pulse_cal_current_strength_us + pulse_cal_strength_step_us,
-        )
-        pulse_cal_current_duration_s = min(
-            pulse_cal_max_duration_s,
-            round(pulse_cal_current_duration_s + pulse_cal_duration_step_s, 2),
-        )
+        if pulse_cal_current_strength_us < pulse_cal_max_strength_us:
+            pulse_cal_current_strength_us = min(
+                pulse_cal_max_strength_us,
+                pulse_cal_current_strength_us + pulse_cal_strength_step_us,
+            )
+        else:
+            pulse_cal_current_duration_s = min(
+                pulse_cal_max_duration_s,
+                round(pulse_cal_current_duration_s + pulse_cal_duration_step_s, 2),
+            )
         pulse_cal_attempt += 1
         update_auto_command_text(
             f"{label} peak {peak:.1f} deg; next {pulse_cal_current_strength_us}us/"
@@ -1738,6 +1816,7 @@ def main() -> None:
         nonlocal pulse_cal_active, pulse_cal_target_index, pulse_cal_results
         nonlocal pulse_cal_current_axis, pulse_cal_current_channel, pulse_cal_current_direction
         nonlocal pulse_cal_baseline, pulse_cal_peak_delta, pulse_cal_observing
+        nonlocal pulse_cal_test_started_s, pulse_cal_target_hit_duration_s, pulse_cal_hold_end_requested
         if blackbox_import_inflight:
             raise RuntimeError("Blackbox import/analyze is in progress.")
         if auto_is_running() or auto_state == AdaptiveSessionState.import_analyze:
@@ -1784,7 +1863,11 @@ def main() -> None:
         pulse_cal_current_direction = 1
         pulse_cal_baseline = 0.0
         pulse_cal_peak_delta = 0.0
+        pulse_cal_test_started_s = 0.0
+        pulse_cal_target_hit_duration_s = None
+        pulse_cal_hold_end_requested = False
         pulse_cal_observing = False
+        reset_pulse_calibration_recenter_stability()
         reset_pulse_calibration_attempt()
         auto_state_var.set("State: pulse calibration")
         update_auto_command_text("pulse calibration starting")

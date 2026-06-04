@@ -87,16 +87,6 @@ class CoverageMetrics:
     axis_confidence: dict[str, float]
 
 
-@dataclass(frozen=True)
-class AdaptiveSessionResult:
-    state: AdaptiveSessionState
-    stop_reason: str
-    warning: str
-    elapsed_s: float
-    metrics: CoverageMetrics
-    report_dir: str = ""
-
-
 @dataclass
 class _DirectionCoverage:
     peak_angles: deque[float] = field(default_factory=lambda: deque(maxlen=64))

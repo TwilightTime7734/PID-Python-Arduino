@@ -189,18 +189,8 @@ def run_ppm_on_serial(ser: serial.Serial, channels: list[int], offsets: list[int
     return quant, max_count, firmware_version_warning_on_serial(ser, max_count)
 
 
-def run_ppm(port: str, channels: list[int], offsets: list[int]) -> None:
-    with open_serial(port) as ser:
-        run_ppm_on_serial(ser, channels, offsets)
-
-
 def stop_ppm_on_serial(ser: serial.Serial) -> None:
     write_regs(ser, REG_STATE, [0])
-
-
-def stop_ppm(port: str) -> None:
-    with open_serial(port) as ser:
-        stop_ppm_on_serial(ser)
 
 
 def send_pulse_command_on_serial(ser: serial.Serial, max_count: int, chl: int, value_ticks: int, duration_us: int) -> None:
