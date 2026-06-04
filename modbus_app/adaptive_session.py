@@ -32,6 +32,12 @@ class AdaptiveSessionConfig:
     force_max_us: int = 360
     hold_min_s: float = 0.25
     hold_max_s: float = 0.65
+    roll_force_us: int = 425
+    pitch_force_us: int = 425
+    roll_hold_s: float = 0.45
+    pitch_hold_s: float = 0.35
+    roll_target_peak_deg: float = 25.0
+    pitch_target_peak_deg: float = 25.0
     settle_max_s: float = 0.85
     min_runtime_s: float = 45.0
     max_runtime_s: float = 180.0
@@ -44,6 +50,18 @@ class AdaptiveSessionConfig:
     throttle_step_us: int = 25
     throttle_boost_peak_deg: float = 4.0
     throttle_trim_peak_deg: float = 28.0
+
+    def axis_force_us(self, axis: str) -> int:
+        return self.roll_force_us if axis == "roll" else self.pitch_force_us
+
+    def axis_hold_s(self, axis: str) -> float:
+        return self.roll_hold_s if axis == "roll" else self.pitch_hold_s
+
+    def axis_target_peak_max_deg(self, axis: str) -> float:
+        return self.roll_target_peak_deg if axis == "roll" else self.pitch_target_peak_deg
+
+    def axis_target_peak_min_deg(self, axis: str) -> float:
+        return min(self.target_peak_min_deg, self.axis_target_peak_max_deg(axis))
 
 
 @dataclass(frozen=True)
@@ -102,7 +120,7 @@ class _DirectionCoverage:
         if event.response_delay_s is not None:
             self.response_delays.append(float(event.response_delay_s))
 
-        in_band = cfg.target_peak_min_deg <= peak <= cfg.target_peak_max_deg
+        in_band = cfg.axis_target_peak_min_deg(event.axis) <= peak <= cfg.axis_target_peak_max_deg(event.axis)
         if in_band:
             self.valid_count += 1
         if event.settle_success:
@@ -118,25 +136,29 @@ class _DirectionCoverage:
             return 0.0
         return float(median(self.peak_angles))
 
-    def target_met(self, cfg: AdaptiveSessionConfig) -> bool:
+    def target_met(self, cfg: AdaptiveSessionConfig, axis: str) -> bool:
+        target_min = cfg.axis_target_peak_min_deg(axis)
+        target_max = cfg.axis_target_peak_max_deg(axis)
         return (
             self.valid_count >= cfg.target_valid_events
-            and cfg.target_peak_min_deg <= self.median_peak() <= cfg.target_peak_max_deg
+            and target_min <= self.median_peak() <= target_max
             and self.settle_ratio() >= cfg.target_settle_ratio
         )
 
-    def confidence(self, cfg: AdaptiveSessionConfig) -> float:
+    def confidence(self, cfg: AdaptiveSessionConfig, axis: str) -> float:
+        target_min = cfg.axis_target_peak_min_deg(axis)
+        target_max = cfg.axis_target_peak_max_deg(axis)
         valid_score = min(1.0, self.valid_count / float(max(1, cfg.target_valid_events)))
         peak = self.median_peak()
         if peak <= 0:
             peak_score = 0.0
-        elif cfg.target_peak_min_deg <= peak <= cfg.target_peak_max_deg:
+        elif target_min <= peak <= target_max:
             peak_score = 1.0
-        elif peak < cfg.target_peak_min_deg:
-            peak_score = max(0.0, peak / max(0.1, cfg.target_peak_min_deg))
+        elif peak < target_min:
+            peak_score = max(0.0, peak / max(0.1, target_min))
         else:
-            overflow = peak - cfg.target_peak_max_deg
-            span = max(1.0, cfg.target_peak_max_deg)
+            overflow = peak - target_max
+            span = max(1.0, target_max)
             peak_score = max(0.0, 1.0 - (overflow / span))
         settle_score = min(1.0, self.settle_ratio() / max(0.01, cfg.target_settle_ratio))
         return max(0.0, min(1.0, (valid_score * 0.5) + (peak_score * 0.25) + (settle_score * 0.25)))
@@ -185,12 +207,12 @@ class AdaptiveExcitationController:
         return current, ""
 
     def axis_confidence(self, axis: str) -> float:
-        pos = self._coverage[(axis, +1)].confidence(self.config)
-        neg = self._coverage[(axis, -1)].confidence(self.config)
+        pos = self._coverage[(axis, +1)].confidence(self.config, axis)
+        neg = self._coverage[(axis, -1)].confidence(self.config, axis)
         return (pos + neg) / 2.0
 
     def direction_confidence(self, axis: str, direction: int) -> float:
-        return self._coverage[(axis, 1 if direction >= 0 else -1)].confidence(self.config)
+        return self._coverage[(axis, 1 if direction >= 0 else -1)].confidence(self.config, axis)
 
     def coverage_metrics(self) -> CoverageMetrics:
         direction: dict[str, DirectionSnapshot] = {}
@@ -202,8 +224,8 @@ class AdaptiveExcitationController:
                     valid_count=raw.valid_count,
                     settle_ratio=raw.settle_ratio(),
                     median_peak_deg=raw.median_peak(),
-                    confidence=raw.confidence(self.config),
-                    target_met=raw.target_met(self.config),
+                    confidence=raw.confidence(self.config, axis),
+                    target_met=raw.target_met(self.config, axis),
                 )
         return CoverageMetrics(
             direction=direction,
@@ -219,8 +241,12 @@ class AdaptiveExcitationController:
         if elapsed_s < self.config.min_runtime_s:
             return False, "", ""
 
-        roll_ok = self._coverage[("roll", -1)].target_met(self.config) and self._coverage[("roll", +1)].target_met(self.config)
-        pitch_ok = self._coverage[("pitch", -1)].target_met(self.config) and self._coverage[("pitch", +1)].target_met(self.config)
+        roll_ok = self._coverage[("roll", -1)].target_met(self.config, "roll") and self._coverage[
+            ("roll", +1)
+        ].target_met(self.config, "roll")
+        pitch_ok = self._coverage[("pitch", -1)].target_met(self.config, "pitch") and self._coverage[
+            ("pitch", +1)
+        ].target_met(self.config, "pitch")
         if roll_ok and pitch_ok:
             return True, "Coverage confidence targets reached.", ""
         return False, "", ""
@@ -250,8 +276,8 @@ class AdaptiveExcitationController:
         if force <= 0:
             return None
 
-        hold = self._force_to_hold(force)
-        settle = min(self.config.settle_max_s, hold + 0.12)
+        hold = self.config.axis_hold_s(axis)
+        settle = self.config.settle_max_s
         return AdaptiveCommand(
             axis=axis,
             direction=direction,
@@ -282,11 +308,8 @@ class AdaptiveExcitationController:
         return -1 if neg_conf <= pos_conf else +1
 
     def _compute_force(self, axis: str, direction: int, current_angle: float) -> int:
-        # Prefer stronger pulses on under-covered directions, but damp near soft limit.
-        conf = self.direction_confidence(axis, direction)
-        deficit = max(0.0, 1.0 - conf)
-        span = self.config.force_max_us - self.config.force_min_us
-        force = int(round(self.config.force_min_us + (span * deficit)))
+        # Use the configured axis pulse, but damp commands that would push farther from center near limits.
+        force = int(self.config.axis_force_us(axis))
 
         # If commanding away from center and already tilted, reduce assertiveness.
         away_from_center = (current_angle >= 0 and direction > 0) or (current_angle < 0 and direction < 0)
@@ -303,12 +326,7 @@ class AdaptiveExcitationController:
         if away_from_center and (abs_angle + predicted_delta) >= self.config.hard_limit_deg:
             return 0
 
-        return max(self.config.force_min_us, min(self.config.force_max_us, force))
-
-    def _force_to_hold(self, force_us: int) -> float:
-        ratio = (force_us - self.config.force_min_us) / max(1.0, float(self.config.force_max_us - self.config.force_min_us))
-        ratio = max(0.0, min(1.0, ratio))
-        return self.config.hold_min_s + ((self.config.hold_max_s - self.config.hold_min_s) * ratio)
+        return max(1, min(500, force))
 
     def _recovery_command(self, roll_deg: float, pitch_deg: float) -> AdaptiveCommand:
         if abs(roll_deg) >= abs(pitch_deg):
@@ -319,11 +337,9 @@ class AdaptiveExcitationController:
             angle = float(pitch_deg)
 
         direction = -1 if angle > 0 else +1
-        magnitude = min(self.config.hard_limit_deg, abs(angle))
-        scaled = int(round(self.config.force_min_us + (magnitude / self.config.hard_limit_deg) * (self.config.force_max_us - self.config.force_min_us)))
-        force = max(self.config.force_min_us, min(self.config.force_max_us, scaled))
-        hold = min(self.config.hold_max_s, max(self.config.hold_min_s, 0.20 + (abs(angle) / 90.0)))
-        settle = min(self.config.settle_max_s, hold + 0.12)
+        force = max(1, min(500, int(self.config.axis_force_us(axis))))
+        hold = self.config.axis_hold_s(axis)
+        settle = self.config.settle_max_s
         return AdaptiveCommand(
             axis=axis,
             direction=direction,
