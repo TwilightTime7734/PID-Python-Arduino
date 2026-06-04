@@ -349,7 +349,7 @@ def build_main_gui(root: tk.Tk) -> MainUi:
 
     auto_frame = tk.LabelFrame(layout_grid, text="Auto Tune Session", padx=8, pady=8)
     auto_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(6, 0))
-    auto_frame.grid_columnconfigure(0, weight=2)
+    auto_frame.grid_columnconfigure(0, weight=0)
     auto_frame.grid_columnconfigure(1, weight=1)
 
     auto_status_frame = tk.Frame(auto_frame)
