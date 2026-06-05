@@ -1,3 +1,4 @@
+import random
 import unittest
 
 from modbus_app.adaptive_session import (
@@ -9,8 +10,8 @@ from modbus_app.adaptive_session import (
 
 class AdaptiveControllerTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.cfg = AdaptiveSessionConfig(min_runtime_s=1.0, max_runtime_s=10.0)
-        self.controller = AdaptiveExcitationController(self.cfg)
+        self.cfg = AdaptiveSessionConfig(max_runtime_s=60.0)
+        self.controller = AdaptiveExcitationController(self.cfg, rng=random.Random(7))
 
     def _event(self, axis: str, direction: int, peak: float, settle_success: bool = True) -> ExcitationEvent:
         return ExcitationEvent(
@@ -26,47 +27,40 @@ class AdaptiveControllerTests(unittest.TestCase):
             final_error_deg=0.8,
         )
 
-    def test_axis_preference_favors_lower_coverage(self) -> None:
-        for _ in range(8):
-            self.controller.record_event(self._event("roll", -1, 10.0))
-            self.controller.record_event(self._event("roll", +1, 11.0))
-        command = self.controller.next_command(roll_deg=0.0, pitch_deg=0.0, recovery_mode=False)
+    def test_random_cycle_queues_roll_and_pitch_commands(self) -> None:
+        first = self.controller.next_command(roll_deg=0.0, pitch_deg=0.0, recovery_mode=False)
+        second = self.controller.next_command(roll_deg=0.0, pitch_deg=0.0, recovery_mode=False)
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertEqual({"roll", "pitch"}, {first.axis, second.axis})
+        for command in (first, second):
+            self.assertGreaterEqual(command.force_us, self.cfg.force_min_us)
+            self.assertLessEqual(command.force_us, self.cfg.force_max_us)
+            self.assertGreaterEqual(command.hold_s, self.cfg.hold_min_s)
+            self.assertLessEqual(command.hold_s, self.cfg.hold_max_s)
+            self.assertGreaterEqual(command.target_peak_deg, self.cfg.target_peak_min_deg)
+
+    def test_unsafe_away_from_limit_direction_is_flipped_toward_center(self) -> None:
+        command = self.controller._random_command_for_axis("roll", current_angle=42.0, direction=1)
+
         self.assertIsNotNone(command)
-        self.assertEqual("pitch", command.axis)
+        self.assertEqual(-1, command.direction)
 
-    def test_direction_bias_moves_toward_center_when_tilted(self) -> None:
-        command = self.controller.next_command(roll_deg=24.0, pitch_deg=0.0, recovery_mode=False)
+    def test_command_peak_is_bounded_by_remaining_angle_margin(self) -> None:
+        command = self.controller._random_command_for_axis("roll", current_angle=30.0, direction=1)
+
         self.assertIsNotNone(command)
-        if command.axis == "roll":
-            self.assertEqual(-1, command.direction)
+        safe_limit = self.cfg.hard_limit_deg - self.cfg.safety_margin_deg
+        self.assertLessEqual(command.target_peak_deg, safe_limit - 30.0)
 
-    def test_force_is_clamped_and_reduced_near_limit(self) -> None:
-        low_angle = self.controller.next_command(roll_deg=0.0, pitch_deg=0.0, recovery_mode=False)
-        high_angle = self.controller.next_command(roll_deg=37.0, pitch_deg=0.0, recovery_mode=False)
-        self.assertIsNotNone(low_angle)
-        self.assertIsNotNone(high_angle)
-        self.assertGreaterEqual(low_angle.force_us, self.cfg.force_min_us)
-        self.assertLessEqual(low_angle.force_us, self.cfg.force_max_us)
-        if high_angle.axis == "roll" and high_angle.direction > 0:
-            self.assertLessEqual(high_angle.force_us, low_angle.force_us)
-
-    def test_recovery_entry_and_exit_rules(self) -> None:
-        self.assertTrue(self.controller.should_recover(43.5, 2.0))
-        self.assertFalse(self.controller.recovery_complete(21.0, 0.0))
-        self.assertTrue(self.controller.recovery_complete(10.0, 15.0))
-
-    def test_stop_rule_needs_min_runtime_then_confidence(self) -> None:
-        ready, _, _ = self.controller.stop_ready(0.5)
+    def test_stop_rule_ends_at_sixty_seconds(self) -> None:
+        ready, _, _ = self.controller.stop_ready(59.9)
         self.assertFalse(ready)
 
-        for axis in ("roll", "pitch"):
-            for direction in (-1, +1):
-                for _ in range(self.cfg.target_valid_events):
-                    self.controller.record_event(self._event(axis, direction, 12.0, settle_success=True))
-
-        ready, reason, warning = self.controller.stop_ready(2.0)
+        ready, reason, warning = self.controller.stop_ready(60.0)
         self.assertTrue(ready)
-        self.assertIn("Coverage confidence", reason)
+        self.assertIn("60-second", reason)
         self.assertEqual("", warning)
 
     def test_abort_on_hard_limit(self) -> None:
@@ -83,15 +77,18 @@ class AdaptiveControllerTests(unittest.TestCase):
         self.assertEqual(self.cfg.throttle_max_us, target)
         self.assertIn("capped", reason)
 
-    def test_throttle_boosts_after_weak_response(self) -> None:
+    def test_throttle_is_not_changed_after_random_events(self) -> None:
         target, reason = self.controller.throttle_after_event(1300, self._event("roll", 1, 1.5))
-        self.assertEqual(self.cfg.throttle_start_us + self.cfg.throttle_step_us, target)
-        self.assertIn("weak", reason)
 
-    def test_throttle_trims_after_large_response(self) -> None:
-        target, reason = self.controller.throttle_after_event(1450, self._event("pitch", -1, 32.0))
-        self.assertEqual(1450 - self.cfg.throttle_step_us, target)
-        self.assertIn("large", reason)
+        self.assertEqual(1300, target)
+        self.assertEqual("", reason)
+
+    def test_metrics_record_random_events(self) -> None:
+        self.controller.record_event(self._event("roll", 1, 10.0))
+        metrics = self.controller.coverage_metrics()
+
+        self.assertEqual(1, metrics.direction["roll_pos"].total_count)
+        self.assertGreater(metrics.axis_confidence["roll"], 0.0)
 
 
 if __name__ == "__main__":

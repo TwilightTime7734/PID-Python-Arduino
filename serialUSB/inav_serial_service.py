@@ -12,10 +12,12 @@ import serial
 MSP_API_VERSION = 1
 MSP_FC_VARIANT = 2
 MSP_FC_VERSION = 3
+MSP_STATUS = 101
 MSP_ATTITUDE = 108
 MSP2_COMMON_SETTING = 0x1003
 MSP2_COMMON_SET_SETTING = 0x1004
 MSP2_COMMON_SETTING_INFO = 0x1007
+ARM_MODE_FLAG = 0x00000001
 
 PID_SETTING_NAME = {
     ("roll", "p"): "mc_p_roll",
@@ -227,6 +229,13 @@ def _parse_attitude_payload(payload: bytes) -> AttitudeSample:
     )
 
 
+def _parse_armed_status_payload(payload: bytes) -> bool:
+    if len(payload) < 10:
+        raise RuntimeError(f"Invalid MSP_STATUS payload length: {len(payload)}")
+    mode_flags = int.from_bytes(payload[6:10], byteorder="little", signed=False)
+    return (mode_flags & ARM_MODE_FLAG) != 0
+
+
 def send_cli_msc_command(
     port_name: str,
     baud_rate: int = 115200,
@@ -377,6 +386,10 @@ class InavSerialService:
     def latest_attitude(self) -> AttitudeSample | None:
         with self._attitude_sync:
             return self._latest_attitude
+
+    def is_armed(self, timeout_seconds: float = 0.8) -> bool:
+        payload = self._request(MSP_STATUS, b"", timeout_seconds)
+        return _parse_armed_status_payload(payload)
 
     def read_roll_pitch_pid_ff(self, timeout_seconds: float = 1.0) -> tuple[AxisPidFf, AxisPidFf]:
         roll = AxisPidFf(

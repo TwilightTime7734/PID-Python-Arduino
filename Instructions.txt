@@ -1,0 +1,49 @@
+Start with only P & D
+Set I/FF to 0
+Set D to 17, 23, 42
+Set P to Roll:45 Pitch:47 Yaw:45
+
+Keep battery fresh.
+
+Arm once for all logs on one file
+log with D:17
+log with D:23
+log with D:42
+
+Open PIDToolbox and Select all log files
+make sure the first log file in chosen in dropdown and click Tri... to trim.
+do the same for all log files
+
+Hit the 'Step Response Tool'
+Select log file
+Always remember to:
+  Hit the 'Y Correction when using the Step Response Tool'
+Hit 'Run'
+Set the D term to the best chart following the set point.
+
+With the Correct D term set
+
+           R    P    Y
+log with I:28,  30,  28    .3
+log with I:58,  60,  58    .6
+log with I:89,  90,  89    .9
+log with I:118, 120, 118  1.2
+
+Always remember to:
+  Hit the 'Y Correction when using the Step Response Tool'
+Open logs with the 'Step Response Tool'
+Hit 'Run'
+Set the I term to the best chart following the set point.
+
+With the Correct D & I set
+
+           R      P    Y
+log with FF:43,   44,   43    .3
+log with FF:86,   89,   86    .6
+log with FF:129, 134,  129    .9
+log with FF:172, 179,  172   1.2
+
+No need to use any tools except the main screen of PIDToolbox
+Click on the axis graph
+Select the zoom magnifying glass
+Set the FF term to the best chart following the set point.

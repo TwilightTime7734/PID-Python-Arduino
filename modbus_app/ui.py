@@ -135,26 +135,12 @@ class MainUi:
     analyze_blackbox_button: tk.Button
     arduino_button: tk.Button
     auto_session_button: tk.Button
-    auto_state_var: tk.StringVar
-    auto_command_var: tk.StringVar
-    auto_safety_var: tk.StringVar
-    auto_roll_conf_var: tk.DoubleVar
-    auto_pitch_conf_var: tk.DoubleVar
-    auto_roll_conf_bar: ttk.Progressbar
-    auto_pitch_conf_bar: ttk.Progressbar
     auto_report_text: tk.Text
     auto_report_listbox: tk.Listbox
     auto_open_selected_button: tk.Button
     auto_open_all_button: tk.Button
-    pulse_calibrate_button: tk.Button
-    pulse_calculate_missing_button: tk.Button
-    auto_roll_pulse_entry: tk.Entry
-    auto_roll_time_entry: tk.Entry
-    auto_roll_angle_entry: tk.Entry
-    auto_pitch_pulse_entry: tk.Entry
-    auto_pitch_time_entry: tk.Entry
-    auto_pitch_angle_entry: tk.Entry
-    auto_throttle_entry: tk.Entry
+    auto_clear_reports_button: tk.Button
+    step_response_button: tk.Button
 
 def build_main_gui(root: tk.Tk) -> MainUi:
     root.title("PPM Modbus")
@@ -349,69 +335,18 @@ def build_main_gui(root: tk.Tk) -> MainUi:
 
     auto_frame = tk.LabelFrame(layout_grid, text="Auto Tune Session", padx=8, pady=8)
     auto_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(6, 0))
-    auto_frame.grid_columnconfigure(0, weight=0)
-    auto_frame.grid_columnconfigure(1, weight=1)
+    auto_frame.grid_columnconfigure(0, weight=1)
+    auto_frame.grid_rowconfigure(1, weight=1)
 
-    auto_status_frame = tk.Frame(auto_frame)
-    auto_status_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-    auto_state_var = tk.StringVar(value="State: idle")
-    auto_command_var = tk.StringVar(value="Command: --")
-    auto_safety_var = tk.StringVar(value="Safety: --")
-    tk.Label(auto_status_frame, textvariable=auto_state_var, anchor="w").grid(row=0, column=0, sticky="w")
-    tk.Label(auto_status_frame, textvariable=auto_command_var, anchor="w").grid(row=1, column=0, sticky="w")
-    tk.Label(auto_status_frame, textvariable=auto_safety_var, anchor="w").grid(row=2, column=0, sticky="w")
-
-    auto_session_button = tk.Button(auto_status_frame, text="Start Auto Session", width=18)
-    auto_session_button.grid(row=0, column=1, rowspan=2, padx=(10, 0), sticky="e")
-    pulse_calibrate_button = tk.Button(auto_status_frame, text="Calculate Pulse", width=18)
-    pulse_calibrate_button.grid(row=2, column=1, padx=(10, 0), pady=(2, 0), sticky="e")
-    pulse_calculate_missing_button = tk.Button(auto_status_frame, text="Calculate Missing", width=18)
-    pulse_calculate_missing_button.grid(row=3, column=1, padx=(10, 0), pady=(2, 0), sticky="e")
-
-    auto_pulse_frame = tk.LabelFrame(auto_status_frame, text="Calculated Pulse", padx=6, pady=4)
-    auto_pulse_frame.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
-    for col, label in enumerate(("Axis", "Pulse (us)", "Time (s)", "Angle (deg)")):
-        tk.Label(auto_pulse_frame, text=label).grid(row=0, column=col, padx=(0, 6), sticky="w")
-
-    def make_auto_pulse_entry(row: int, col: int, default: str) -> tk.Entry:
-        entry = tk.Entry(auto_pulse_frame, width=8)
-        entry.insert(0, default)
-        entry.grid(row=row, column=col, padx=(0, 6), pady=1, sticky="w")
-        return entry
-
-    tk.Label(auto_pulse_frame, text="Roll").grid(row=1, column=0, padx=(0, 6), pady=1, sticky="w")
-    auto_roll_pulse_entry = make_auto_pulse_entry(1, 1, "425")
-    auto_roll_time_entry = make_auto_pulse_entry(1, 2, "0.45")
-    auto_roll_angle_entry = make_auto_pulse_entry(1, 3, "25")
-
-    tk.Label(auto_pulse_frame, text="Pitch").grid(row=2, column=0, padx=(0, 6), pady=1, sticky="w")
-    auto_pitch_pulse_entry = make_auto_pulse_entry(2, 1, "425")
-    auto_pitch_time_entry = make_auto_pulse_entry(2, 2, "0.35")
-    auto_pitch_angle_entry = make_auto_pulse_entry(2, 3, "25")
-
-    tk.Label(auto_pulse_frame, text="Throttle").grid(row=3, column=0, padx=(0, 6), pady=(4, 1), sticky="w")
-    auto_throttle_entry = make_auto_pulse_entry(3, 1, "1350")
-
-    auto_roll_conf_var = tk.DoubleVar(value=0.0)
-    auto_pitch_conf_var = tk.DoubleVar(value=0.0)
-    tk.Label(auto_status_frame, text="Roll confidence").grid(row=5, column=0, sticky="w", pady=(6, 0))
-    auto_roll_conf_bar = ttk.Progressbar(
-        auto_status_frame, orient="horizontal", mode="determinate", maximum=100.0, variable=auto_roll_conf_var, length=220
-    )
-    auto_roll_conf_bar.grid(row=6, column=0, columnspan=2, sticky="we")
-    tk.Label(auto_status_frame, text="Pitch confidence").grid(row=7, column=0, sticky="w", pady=(4, 0))
-    auto_pitch_conf_bar = ttk.Progressbar(
-        auto_status_frame, orient="horizontal", mode="determinate", maximum=100.0, variable=auto_pitch_conf_var, length=220
-    )
-    auto_pitch_conf_bar.grid(row=8, column=0, columnspan=2, sticky="we")
-
-    auto_report_text = tk.Text(auto_status_frame, width=70, height=7, wrap="word")
-    auto_report_text.insert("1.0", "Report summary will appear here after an auto session.")
-    auto_report_text.config(state="disabled")
-    auto_report_text.grid(row=9, column=0, columnspan=2, sticky="we", pady=(8, 0))
+    auto_action_frame = tk.Frame(auto_frame)
+    auto_action_frame.grid(row=0, column=0, sticky="w", pady=(0, 6))
+    auto_session_button = tk.Button(auto_action_frame, text="Start Auto Session", width=18)
+    auto_session_button.pack(side="left", padx=(0, 4))
+    step_response_button = tk.Button(auto_action_frame, text="Chart Step Response", width=18)
+    step_response_button.pack(side="left")
 
     auto_list_frame = tk.Frame(auto_frame)
-    auto_list_frame.grid(row=0, column=1, sticky="nsew")
+    auto_list_frame.grid(row=1, column=0, sticky="nsew")
     tk.Label(auto_list_frame, text="Report Files").grid(row=0, column=0, sticky="w")
     auto_report_listbox = tk.Listbox(auto_list_frame, width=48, height=10)
     auto_report_listbox.grid(row=1, column=0, sticky="nsew")
@@ -422,11 +357,18 @@ def build_main_gui(root: tk.Tk) -> MainUi:
     auto_list_frame.grid_columnconfigure(0, weight=1)
 
     auto_buttons = tk.Frame(auto_list_frame)
-    auto_buttons.grid(row=2, column=0, columnspan=2, sticky="we", pady=(6, 0))
+    auto_buttons.grid(row=1, column=2, sticky="ns", padx=(8, 0))
     auto_open_selected_button = tk.Button(auto_buttons, text="Open Selected", width=13)
-    auto_open_selected_button.pack(side="left", padx=(0, 4))
+    auto_open_selected_button.pack(fill="x", pady=(0, 4))
     auto_open_all_button = tk.Button(auto_buttons, text="Open All", width=10)
-    auto_open_all_button.pack(side="left")
+    auto_open_all_button.pack(fill="x", pady=(0, 4))
+    auto_clear_reports_button = tk.Button(auto_buttons, text="Clear", width=10)
+    auto_clear_reports_button.pack(fill="x")
+
+    auto_report_text = tk.Text(auto_frame, width=100, height=7, wrap="word")
+    auto_report_text.insert("1.0", "Report summary will appear here after an auto session.")
+    auto_report_text.config(state="disabled")
+    auto_report_text.grid(row=2, column=0, sticky="we", pady=(8, 0))
 
     tk.Label(
         root,
@@ -466,24 +408,10 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         analyze_blackbox_button=analyze_blackbox_button,
         arduino_button=arduino_button,
         auto_session_button=auto_session_button,
-        auto_state_var=auto_state_var,
-        auto_command_var=auto_command_var,
-        auto_safety_var=auto_safety_var,
-        auto_roll_conf_var=auto_roll_conf_var,
-        auto_pitch_conf_var=auto_pitch_conf_var,
-        auto_roll_conf_bar=auto_roll_conf_bar,
-        auto_pitch_conf_bar=auto_pitch_conf_bar,
         auto_report_text=auto_report_text,
         auto_report_listbox=auto_report_listbox,
         auto_open_selected_button=auto_open_selected_button,
         auto_open_all_button=auto_open_all_button,
-        pulse_calibrate_button=pulse_calibrate_button,
-        pulse_calculate_missing_button=pulse_calculate_missing_button,
-        auto_roll_pulse_entry=auto_roll_pulse_entry,
-        auto_roll_time_entry=auto_roll_time_entry,
-        auto_roll_angle_entry=auto_roll_angle_entry,
-        auto_pitch_pulse_entry=auto_pitch_pulse_entry,
-        auto_pitch_time_entry=auto_pitch_time_entry,
-        auto_pitch_angle_entry=auto_pitch_angle_entry,
-        auto_throttle_entry=auto_throttle_entry,
+        auto_clear_reports_button=auto_clear_reports_button,
+        step_response_button=step_response_button,
     )

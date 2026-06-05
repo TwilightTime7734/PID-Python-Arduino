@@ -1,0 +1,60 @@
+{
+  "report_dir": "D:\\Coding\\Python\\Modbus\\blackbox_imports\\reports\\step_response_20260605_003520",
+  "html_path": "D:\\Coding\\Python\\Modbus\\blackbox_imports\\reports\\step_response_20260605_003520\\pidtoolbox_step_response_detail.html",
+  "summary_json": "D:\\Coding\\Python\\Modbus\\blackbox_imports\\reports\\step_response_20260605_003520\\pidtoolbox_step_response_summary.json",
+  "decoder": "D:\\Coding\\Python\\Modbus\\tools\\blackbox_decode_INAV.exe",
+  "decoder_options": [
+    "--unit-rotation",
+    "deg/s"
+  ],
+  "settings": {
+    "smooth_level": 0,
+    "y_correction": false,
+    "segment_seconds": 2.0,
+    "response_ms": 500.0,
+    "steady_start_ms": 200.0,
+    "peak_window_ms": 150.0,
+    "min_input_deg_s": 20.0,
+    "subsample_factor": 9
+  },
+  "logs": [
+    {
+      "label": "LOG00001",
+      "color": "#0891b2",
+      "source_log": "D:\\Coding\\Python\\Modbus\\blackbox_imports\\reports\\step_response_20260605_003520\\01_LOG00001.TXT",
+      "decoded_csv": "D:\\Coding\\Python\\Modbus\\blackbox_imports\\reports\\step_response_20260605_003520\\01_LOG00001.01.csv",
+      "axes": {
+        "roll": {
+          "setpoint_column": "axisRate[0]",
+          "gyro_column": "gyroADC[0] (deg/s)",
+          "accepted_traces": 98,
+          "sample_rate_hz": 993.0486593843099,
+          "peak": 1.3889372107005635,
+          "peak_time_ms": 147.022,
+          "latency_half_height_ms": 30.209999999999997,
+          "error": ""
+        },
+        "pitch": {
+          "setpoint_column": "axisRate[1]",
+          "gyro_column": "gyroADC[1] (deg/s)",
+          "accepted_traces": 59,
+          "sample_rate_hz": 993.0486593843099,
+          "peak": 1.1373286088368408,
+          "peak_time_ms": 136.952,
+          "latency_half_height_ms": 59.413,
+          "error": ""
+        },
+        "yaw": {
+          "setpoint_column": "axisRate[2]",
+          "gyro_column": "gyroADC[2] (deg/s)",
+          "accepted_traces": 0,
+          "sample_rate_hz": 993.0486593843099,
+          "peak": null,
+          "peak_time_ms": null,
+          "latency_half_height_ms": null,
+          "error": ""
+        }
+      }
+    }
+  ]
+}

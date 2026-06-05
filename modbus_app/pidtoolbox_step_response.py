@@ -74,6 +74,7 @@ def compute_pidtoolbox_step_response(
     peak_window_ms: float = 150.0,
     regularization: float = 0.0001,
     pad_length: int = 100,
+    subsample_factor: Optional[int] = None,
 ) -> StepResponseResult:
     """
     Compute a PIDtoolbox-style normalized step response from setpoint and gyro.
@@ -92,6 +93,11 @@ def compute_pidtoolbox_step_response(
         Mimics PIDtoolbox's optional steady-state Y correction.
     min_input_deg_s:
         Segments with smaller setpoint magnitude are ignored.
+    subsample_factor:
+        Optional overlap density for the 2-second analysis segments. Higher
+        values use more overlapping segments and can preserve more detail in
+        the averaged response. If omitted, the PIDtoolbox-style duration-based
+        default is used.
 
     Returns
     -------
@@ -129,14 +135,16 @@ def compute_pidtoolbox_step_response(
     t_ms = np.arange(wnd + 1, dtype=float) / samples_per_ms
 
     file_dur_sec = n / sample_rate_hz
-    if file_dur_sec <= 20:
-        subsample_factor = 10
+    if subsample_factor is not None:
+        effective_subsample_factor = max(1, int(subsample_factor))
+    elif file_dur_sec <= 20:
+        effective_subsample_factor = 10
     elif file_dur_sec <= 60:
-        subsample_factor = 7
+        effective_subsample_factor = 7
     else:
-        subsample_factor = 3
+        effective_subsample_factor = 3
 
-    step = max(1, int(round(segment_len / subsample_factor)))
+    step = max(1, int(round(segment_len / effective_subsample_factor)))
     starts = np.arange(0, n - segment_len, step, dtype=int)
 
     traces = []
