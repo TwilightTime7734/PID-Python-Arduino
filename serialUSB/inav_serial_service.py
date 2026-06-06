@@ -26,10 +26,14 @@ PID_SETTING_NAME = {
     ("pitch", "p"): "mc_p_pitch",
     ("pitch", "i"): "mc_i_pitch",
     ("pitch", "d"): "mc_d_pitch",
+    ("yaw", "p"): "mc_p_yaw",
+    ("yaw", "i"): "mc_i_yaw",
+    ("yaw", "d"): "mc_d_yaw",
 }
 FF_SETTING_NAME = {
     "roll": "mc_cd_roll",
     "pitch": "mc_cd_pitch",
+    "yaw": "mc_cd_yaw",
 }
 
 

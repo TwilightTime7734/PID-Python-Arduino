@@ -1,49 +1,81 @@
+For the Betafpv Pavo Pico 2 start with
+Roll:  P 40, D 17, I 0, FF 0
+Pitch: P 42, D 17, I 0, FF 0
+Yaw:   leave low/not tested for now
+
+Now sweep upward:
+Roll P: 40, 42, 45, 48
+Pitch P: 42, 44, 47, 50
+
+```text
 Start with only P & D
-Set I/FF to 0
-Set D to 17, 23, 42
-Set P to Roll:45 Pitch:47 Yaw:45
+Set I = 0
+Set FF = 0
+
+Start:
+Roll:  P 45, D 17
+Pitch: P 47, D 17
+Yaw:   P 45, D low/0
 
 Keep battery fresh.
 
-Arm once for all logs on one file
-log with D:17
-log with D:23
-log with D:42
+Arm once for all logs if possible.
 
-Open PIDToolbox and Select all log files
-make sure the first log file in chosen in dropdown and click Tri... to trim.
-do the same for all log files
+D tuning:
+Log with D 17
+Log with D 23
+Log with D 30
+Log with D 36
+Optional D 42 only if needed and motors stay cool.
 
-Hit the 'Step Response Tool'
-Select log file
-Always remember to:
-  Hit the 'Y Correction when using the Step Response Tool'
-Hit 'Run'
-Set the D term to the best chart following the set point.
+Open PIDToolbox.
+Trim each log.
+Use Step Response Tool.
+Always hit Y Correction.
+Hit Run.
+Pick the D value with best damping and least overshoot.
 
-With the Correct D term set
+P tuning:
+Keep chosen D.
+Log with lower P.
+Log with current P.
+Log with higher P.
+Log with still higher P if safe.
 
+Example:
+Roll P: 40, 45, 50, 55
+Pitch P: 42, 47, 52, 57
+Yaw P: 40, 45, 50, 55
+
+Use Step Response Tool.
+Always hit Y Correction.
+Pick the highest P that tracks well without ringing or oscillation.
+
+Re-check D:
+With chosen P, test D slightly lower/current/higher.
+Pick best P/D combination.
+
+I tuning:
+With correct P & D set:
            R    P    Y
-log with I:28,  30,  28    .3
-log with I:58,  60,  58    .6
-log with I:89,  90,  89    .9
-log with I:118, 120, 118  1.2
+log with I:35,  40,  35
+log with I:60,  65,  60
+log with I:85,  90,  85
+log with I:110,115, 110
 
-Always remember to:
-  Hit the 'Y Correction when using the Step Response Tool'
-Open logs with the 'Step Response Tool'
-Hit 'Run'
-Set the I term to the best chart following the set point.
+Use Step Response Tool, but also inspect main trace.
+Pick the value that holds attitude without slow wobble or bounce-back.
 
-With the Correct D & I set
+FF tuning:
+With correct P, D, and I set:
+           R      P      Y
+log with FF:43,   44,   43
+log with FF:86,   89,   86
+log with FF:129, 134,  129
+log with FF:172, 179,  172
 
-           R      P    Y
-log with FF:43,   44,   43    .3
-log with FF:86,   89,   86    .6
-log with FF:129, 134,  129    .9
-log with FF:172, 179,  172   1.2
-
-No need to use any tools except the main screen of PIDToolbox
-Click on the axis graph
-Select the zoom magnifying glass
-Set the FF term to the best chart following the set point.
+Use main PIDToolbox graph.
+Click axis graph.
+Use zoom magnifying glass.
+Pick FF where gyro starts with setpoint without jumping ahead.
+```

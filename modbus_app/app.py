@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import os
+import math
 from pathlib import Path
 import queue
 import shutil
 import time
 import tkinter as tk
 from collections.abc import Callable, Sequence
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog
 
 import serial
 from serial.tools import list_ports
@@ -78,6 +79,16 @@ from .blackbox_import import (
     analyze_pulled_blackbox_logs,
     import_blackbox_logs_from_msc,
 )
+from .pid_tuning_workflow import (
+    LoadedPIDTuningPlan,
+    PAVO_PICO_II_PRESET_INPUTS,
+    PStartInputs,
+    find_latest_pid_tuning_plan,
+    generate_pid_tuning_plan_report,
+    load_pid_tuning_plan,
+    safe_p_start_information_needed,
+    suggest_starting_p,
+)
 from .step_response_report import (
     MAX_STEP_RESPONSE_LOGS,
     StepResponseReport,
@@ -129,7 +140,10 @@ def main() -> None:
     auto_open_selected_button = ui.auto_open_selected_button
     auto_open_all_button = ui.auto_open_all_button
     auto_clear_reports_button = ui.auto_clear_reports_button
+    fly_log_button = ui.fly_log_button
+    simulate_auto_session_button = ui.simulate_auto_session_button
     step_response_button = ui.step_response_button
+    pid_tuning_plan_button = ui.pid_tuning_plan_button
 
     run_active = False
     start_pending = False
@@ -184,10 +198,36 @@ def main() -> None:
     auto_report_files: list[str] = []
     auto_import_result: BlackboxImportResult | None = None
     auto_latest_imported_log: str = ""
+    sim_active = False
+    sim_after_id: str | None = None
+    sim_plan: LoadedPIDTuningPlan | None = None
+    sim_plan_steps: list[dict[str, object]] = []
+    sim_plan_step_index = 0
+    sim_waiting_for_fly_log = False
+    sim_fly_log_active = False
+    sim_step_started_s: float | None = None
+    sim_step_duration_s = 7.5
+    sim_roll_deg = 0.0
+    sim_pitch_deg = 0.0
+    sim_last_report_second = -1
     blackbox_import_inflight = False
     blackbox_import_dir = (Path(__file__).resolve().parent.parent / "blackbox_imports").resolve()
     blackbox_msc_mount_timeout_s = 12.0
     blackbox_msc_mount_poll_s = 1.0
+    requested_pid_plan_path = (
+        blackbox_import_dir / "reports" / "pid_tuning_plan_20260605_201036" / "pid_tuning_plan.txt"
+    )
+    pid_plan_active = False
+    pid_plan: LoadedPIDTuningPlan | None = None
+    pid_plan_phase = "idle"
+    pid_plan_index = 0
+    pid_plan_selected_d: int | None = None
+    pid_plan_selected_p: dict[str, int] | None = None
+    pid_plan_selected_i: dict[str, int] | None = None
+    pid_plan_selected_ff: dict[str, int] | None = None
+    pid_plan_waiting_for_fly_log = False
+    pid_plan_current_candidate_title = ""
+    pid_plan_fly_log_active = False
     pid_ff_labels = ("P", "I", "D", "FF")
     pid_ff_adjust_fields = [
         ("roll", "p"),
@@ -233,6 +273,18 @@ def main() -> None:
             var.set(f"{label}: --")
         for label, var in zip(pid_ff_labels, pitch_pidff_vars):
             var.set(f"{label}: --")
+
+    def refresh_fly_log_button_state() -> None:
+        if pid_plan_fly_log_active:
+            fly_log_button.config(text="Abort Fly/Log", state="normal")
+        elif sim_fly_log_active:
+            fly_log_button.config(text="Stop Sim Fly/Log", state="normal")
+        elif pid_plan_active and pid_plan_waiting_for_fly_log:
+            fly_log_button.config(text="Fly/Log", state="normal")
+        elif sim_plan is not None and sim_waiting_for_fly_log:
+            fly_log_button.config(text="Fly/Log", state="normal")
+        else:
+            fly_log_button.config(text="Fly/Log", state="disabled")
 
     def set_pid_ff_displays(roll_values: AxisPidFf, pitch_values: AxisPidFf) -> None:
         roll_series = (roll_values.p, roll_values.i, roll_values.d, roll_values.ff)
@@ -880,6 +932,756 @@ def main() -> None:
                 lines.append(f"- {warning}")
         return "\n".join(lines)
 
+    def parse_optional_float_input(value: str, label: str) -> float | None:
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            parsed = float(text)
+        except ValueError as exc:
+            raise RuntimeError(f"{label} must be a number or blank.") from exc
+        if parsed <= 0:
+            raise RuntimeError(f"{label} must be greater than zero or blank.")
+        return parsed
+
+    def parse_optional_int_input(value: str, label: str) -> int | None:
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            parsed = int(text)
+        except ValueError as exc:
+            raise RuntimeError(f"{label} must be an integer or blank.") from exc
+        if parsed <= 0:
+            raise RuntimeError(f"{label} must be greater than zero or blank.")
+        return parsed
+
+    def ask_pid_tuning_inputs() -> PStartInputs | None:
+        dialog = tk.Toplevel(root)
+        dialog.title("PID Tuning Plan")
+        dialog.transient(root)
+        dialog.resizable(False, False)
+        dialog.grab_set()
+
+        result: dict[str, PStartInputs | None] = {"value": None}
+        body = tk.Frame(dialog, padx=12, pady=10)
+        body.grid(row=0, column=0, sticky="nsew")
+        body.grid_columnconfigure(1, weight=1)
+
+        needed = "\n".join(f"- {item}" for item in safe_p_start_information_needed())
+        tk.Label(
+            body,
+            text=(
+                "The plan estimates a first safe P from build specs, tunes roll/pitch only, "
+                "and gives yaw a conservative final PID/FF value without testing yaw.\n\n"
+                f"Useful inputs:\n{needed}"
+            ),
+            justify="left",
+            wraplength=560,
+        ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 10))
+
+        auw_var = tk.StringVar()
+        motor_count_var = tk.StringVar(value="4")
+        motor_kv_var = tk.StringVar()
+        battery_cells_var = tk.StringVar()
+        prop_var = tk.StringVar()
+        pitch_var = tk.StringVar()
+        chemistry_var = tk.StringVar(value="LiPo")
+        chemistry_options = {"LiPo": "lipo", "LiHV": "lihv", "Li-ion": "liion"}
+        chemistry_labels = {value: label for label, value in chemistry_options.items()}
+        pavo_pico_ii_var = tk.BooleanVar(value=False)
+
+        def apply_pavo_pico_ii_preset() -> None:
+            if not pavo_pico_ii_var.get():
+                return
+            preset = PAVO_PICO_II_PRESET_INPUTS
+            auw_var.set("" if preset.all_up_weight_g is None else str(preset.all_up_weight_g))
+            motor_count_var.set(str(preset.motor_count))
+            motor_kv_var.set("" if preset.motor_kv is None else str(preset.motor_kv))
+            battery_cells_var.set("" if preset.battery_cells is None else str(preset.battery_cells))
+            prop_var.set("" if preset.prop_diameter_in is None else f"{preset.prop_diameter_in:g}")
+            pitch_var.set("" if preset.prop_pitch_in is None else f"{preset.prop_pitch_in:g}")
+            chemistry_var.set(chemistry_labels.get(preset.battery_chemistry, "LiPo"))
+
+        tk.Label(body, text="AUW grams").grid(row=1, column=0, sticky="e", padx=(0, 6), pady=2)
+        tk.Entry(body, width=10, textvariable=auw_var).grid(row=1, column=1, sticky="w", pady=2)
+        tk.Label(body, text="Motors").grid(row=1, column=2, sticky="e", padx=(8, 6), pady=2)
+        tk.Entry(body, width=10, textvariable=motor_count_var).grid(row=1, column=3, sticky="w", pady=2)
+
+        tk.Label(body, text="Motor KV").grid(row=2, column=0, sticky="e", padx=(0, 6), pady=2)
+        tk.Entry(body, width=10, textvariable=motor_kv_var).grid(row=2, column=1, sticky="w", pady=2)
+        tk.Label(body, text="Battery S").grid(row=2, column=2, sticky="e", padx=(8, 6), pady=2)
+        tk.Entry(body, width=10, textvariable=battery_cells_var).grid(row=2, column=3, sticky="w", pady=2)
+
+        tk.Label(body, text="Prop dia (in)").grid(row=3, column=0, sticky="e", padx=(0, 6), pady=2)
+        tk.Entry(body, width=10, textvariable=prop_var).grid(row=3, column=1, sticky="w", pady=2)
+        tk.Label(body, text="Prop pitch (in)").grid(row=3, column=2, sticky="e", padx=(8, 6), pady=2)
+        tk.Entry(body, width=10, textvariable=pitch_var).grid(row=3, column=3, sticky="w", pady=2)
+
+        tk.Label(body, text="Chemistry").grid(row=4, column=0, sticky="e", padx=(0, 6), pady=2)
+        chemistry_menu = tk.OptionMenu(body, chemistry_var, *chemistry_options.keys())
+        chemistry_menu.config(width=10)
+        chemistry_menu.grid(row=4, column=1, sticky="w", pady=2)
+        tk.Checkbutton(
+            body,
+            text="Pavo Pico 2",
+            variable=pavo_pico_ii_var,
+            command=apply_pavo_pico_ii_preset,
+        ).grid(row=4, column=2, sticky="w", padx=(8, 6), pady=2)
+        tk.Label(
+            body,
+            text="BETAFPV O4 + LAVA II 580mAh",
+            fg="#374151",
+        ).grid(row=4, column=3, sticky="w", pady=2)
+
+        tk.Label(
+            body,
+            text="Blank fields keep the instruction baselines. Motor count defaults to 4.",
+            justify="left",
+            wraplength=560,
+            fg="#374151",
+        ).grid(row=5, column=0, columnspan=4, sticky="w", pady=(8, 0))
+
+        buttons = tk.Frame(body)
+        buttons.grid(row=6, column=0, columnspan=4, sticky="e", pady=(10, 0))
+
+        def on_cancel() -> None:
+            result["value"] = None
+            dialog.destroy()
+
+        def on_ok() -> None:
+            try:
+                motor_count = parse_optional_int_input(motor_count_var.get(), "Motors")
+                result["value"] = PStartInputs(
+                    all_up_weight_g=parse_optional_int_input(auw_var.get(), "AUW grams"),
+                    motor_kv=parse_optional_int_input(motor_kv_var.get(), "Motor KV"),
+                    prop_diameter_in=parse_optional_float_input(prop_var.get(), "Prop inches"),
+                    prop_pitch_in=parse_optional_float_input(pitch_var.get(), "Prop pitch"),
+                    battery_cells=parse_optional_int_input(battery_cells_var.get(), "Battery S"),
+                    battery_chemistry=chemistry_options[chemistry_var.get()],
+                    motor_count=4 if motor_count is None else motor_count,
+                )
+            except Exception as exc:
+                messagebox.showerror("PID tuning input", str(exc), parent=dialog)
+                return
+            dialog.destroy()
+
+        tk.Button(buttons, text="Cancel", width=10, command=on_cancel).pack(side="right", padx=(6, 0))
+        tk.Button(buttons, text="Generate Plan", width=14, command=on_ok).pack(side="right")
+        dialog.protocol("WM_DELETE_WINDOW", on_cancel)
+        dialog.wait_window()
+        return result["value"]
+
+    def do_pid_tuning_plan() -> None:
+        nonlocal auto_report_files
+        try:
+            if blackbox_import_inflight:
+                status.set("Blackbox/report task already in progress.")
+                return
+            if auto_is_running():
+                status.set("Wait for the auto session/pipeline to finish first.")
+                return
+
+            inputs = ask_pid_tuning_inputs()
+            if inputs is None:
+                status.set("PID tuning plan canceled.")
+                return
+
+            recommendation = suggest_starting_p(inputs)
+            report = generate_pid_tuning_plan_report(blackbox_import_dir, recommendation)
+            auto_report_files = [report.text_path, report.summary_json]
+            refresh_auto_report_file_list()
+            set_auto_report_text(Path(report.text_path).read_text(encoding="utf-8", errors="replace"))
+            status.set(f"PID tuning plan generated: {report.report_dir}")
+        except Exception as exc:
+            set_error("PID tuning plan error", exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
+
+    def locate_pid_tuning_plan_file() -> Path:
+        if requested_pid_plan_path.exists():
+            return requested_pid_plan_path
+        latest = find_latest_pid_tuning_plan(blackbox_import_dir)
+        if latest is not None:
+            return latest
+        raise RuntimeError(
+            "No PID tuning plan file was found. Generate a PID Tuning Plan first."
+        )
+
+    def read_fc_pid_ff_values(axes: tuple[str, ...] = ("roll", "pitch", "yaw")) -> dict[str, dict[str, int]]:
+        values: dict[str, dict[str, int]] = {}
+        for axis in axes:
+            values[axis] = {
+                "p": int(fc_service.get_setting_int(PID_SETTING_NAME[(axis, "p")], timeout_seconds=1.0)),
+                "i": int(fc_service.get_setting_int(PID_SETTING_NAME[(axis, "i")], timeout_seconds=1.0)),
+                "d": int(fc_service.get_setting_int(PID_SETTING_NAME[(axis, "d")], timeout_seconds=1.0)),
+                "ff": int(fc_service.get_setting_int(FF_SETTING_NAME[axis], timeout_seconds=1.0)),
+            }
+        return values
+
+    def format_pid_values(values: dict[str, dict[str, int]]) -> str:
+        lines: list[str] = []
+        for axis in ("roll", "pitch", "yaw"):
+            gains = values.get(axis)
+            if not gains:
+                continue
+            lines.append(
+                f"{axis.title():5} P {gains['p']:3d}, I {gains['i']:3d}, "
+                f"D {gains['d']:3d}, FF {gains['ff']:3d}"
+            )
+        return "\n".join(lines)
+
+    def format_pid_target_check(
+        current: dict[str, dict[str, int]],
+        target: dict[str, dict[str, int]],
+    ) -> str:
+        lines: list[str] = []
+        for axis in ("roll", "pitch", "yaw"):
+            if axis not in target:
+                continue
+            parts: list[str] = []
+            for gain in ("p", "i", "d", "ff"):
+                target_value = int(target[axis][gain])
+                current_value = current.get(axis, {}).get(gain)
+                if current_value == target_value:
+                    parts.append(f"{gain.upper()} {target_value} OK")
+                else:
+                    parts.append(f"{gain.upper()} {current_value} -> {target_value}")
+            lines.append(f"{axis.title()}: " + ", ".join(parts))
+        return "\n".join(lines)
+
+    def set_pid_plan_report_text(
+        plan: LoadedPIDTuningPlan,
+        title: str,
+        target: dict[str, dict[str, int]] | None = None,
+        current: dict[str, dict[str, int]] | None = None,
+    ) -> None:
+        lines = [
+            title,
+            f"Plan file: {plan.text_path}",
+        ]
+        if current:
+            lines.extend(["", "Current FC PID/FF", format_pid_values(current)])
+        if target:
+            lines.extend(["", "Target for this step", format_pid_values(target)])
+        lines.extend(["", plan.text])
+        set_auto_report_text("\n".join(lines))
+
+    def ensure_disarmed_before_pid_write() -> bool:
+        while True:
+            try:
+                is_armed = fc_service.is_armed(timeout_seconds=0.8)
+            except Exception as exc:
+                prompt = (
+                    "Could not verify whether the drone is armed.\n\n"
+                    f"{exc}\n\n"
+                    "Cancel to stop, or continue only if you have confirmed the drone is disarmed."
+                )
+                return messagebox.askokcancel("Arm State Unknown", prompt, icon="warning", parent=root)
+
+            if not is_armed:
+                return True
+
+            retry = messagebox.askretrycancel(
+                "Drone Armed",
+                "The FC reports the drone is armed.\n\n"
+                "Disarm it before writing PID/FF values, then click Retry.",
+                icon="warning",
+                parent=root,
+            )
+            if not retry:
+                return False
+
+    def write_fc_pid_ff_values(target: dict[str, dict[str, int]]) -> None:
+        for axis in ("roll", "pitch", "yaw"):
+            gains = target.get(axis)
+            if not gains:
+                continue
+            for gain in ("p", "i", "d", "ff"):
+                value = int(gains[gain])
+                if value < 0 or value > 255:
+                    raise RuntimeError(f"{axis.title()} {gain.upper()} target {value} is outside 0-255.")
+                setting_name = FF_SETTING_NAME[axis] if gain == "ff" else PID_SETTING_NAME[(axis, gain)]
+                confirmed = int(fc_service.set_setting_int(setting_name, value, timeout_seconds=1.2))
+                if confirmed != value:
+                    raise RuntimeError(
+                        f"{axis.title()} {gain.upper()} write verified as {confirmed}, expected {value}."
+                    )
+
+    def roll_pitch_target(
+        roll_p: int,
+        pitch_p: int,
+        roll_d: int,
+        pitch_d: int,
+        roll_i: int,
+        pitch_i: int,
+        roll_ff: int,
+        pitch_ff: int,
+    ) -> dict[str, dict[str, int]]:
+        return {
+            "roll": {"p": int(roll_p), "i": int(roll_i), "d": int(roll_d), "ff": int(roll_ff)},
+            "pitch": {"p": int(pitch_p), "i": int(pitch_i), "d": int(pitch_d), "ff": int(pitch_ff)},
+        }
+
+    def ask_pid_value(title: str, prompt: str, initial: int) -> int | None:
+        return simpledialog.askinteger(
+            title,
+            prompt,
+            initialvalue=int(initial),
+            minvalue=0,
+            maxvalue=255,
+            parent=root,
+        )
+
+    def ask_pid_pair(title: str, gain: str, initial_roll: int, initial_pitch: int) -> dict[str, int] | None:
+        roll_value = ask_pid_value(title, f"Enter chosen Roll {gain.upper()} value.", initial_roll)
+        if roll_value is None:
+            return None
+        pitch_value = ask_pid_value(title, f"Enter chosen Pitch {gain.upper()} value.", initial_pitch)
+        if pitch_value is None:
+            return None
+        return {"roll": int(roll_value), "pitch": int(pitch_value)}
+
+    def pid_plan_d_candidates() -> tuple[int, ...]:
+        if pid_plan is None:
+            return ()
+        if len(pid_plan.d_sweep) <= 1:
+            return ()
+        return tuple(int(value) for value in pid_plan.d_sweep[1:])
+
+    def pid_plan_p_candidates() -> tuple[dict[str, int], ...]:
+        if pid_plan is None:
+            return ()
+        return tuple(
+            {"roll": int(roll), "pitch": int(pitch)}
+            for roll, pitch in zip(pid_plan.p_sweep.get("roll", ()), pid_plan.p_sweep.get("pitch", ()))
+        )
+
+    def pid_plan_d_recheck_candidates() -> tuple[int, ...]:
+        if pid_plan_selected_d is None:
+            return ()
+        delta = 6
+        values = (pid_plan_selected_d - delta, pid_plan_selected_d, pid_plan_selected_d + delta)
+        return tuple(dict.fromkeys(max(0, min(255, int(value))) for value in values))
+
+    def complete_pid_tuning_plan(message: str) -> None:
+        nonlocal pid_plan_active, pid_plan_phase, pid_plan_index, pid_plan_waiting_for_fly_log
+        nonlocal pid_plan_current_candidate_title
+        pid_plan_active = False
+        pid_plan_phase = "complete"
+        pid_plan_index = 0
+        pid_plan_waiting_for_fly_log = False
+        pid_plan_current_candidate_title = ""
+        set_auto_button_idle()
+        refresh_fly_log_button_state()
+        status.set(message)
+
+    def prepare_pid_plan_next_step() -> bool:
+        nonlocal pid_plan_phase, pid_plan_index, pid_plan_selected_d, pid_plan_selected_p
+        nonlocal pid_plan_selected_i, pid_plan_selected_ff
+        if pid_plan is None:
+            raise RuntimeError("PID tuning plan is not loaded.")
+
+        while True:
+            if pid_plan_phase == "safe_start":
+                return True
+
+            if pid_plan_phase == "d_sweep" and pid_plan_index >= len(pid_plan_d_candidates()):
+                optional_d = pid_plan.optional_d
+                if optional_d is not None and optional_d not in pid_plan.d_sweep:
+                    if messagebox.askyesno(
+                        "Optional D Step",
+                        f"The normal D sweep is complete.\n\nRun optional D {optional_d} before choosing D?",
+                        parent=root,
+                    ):
+                        pid_plan_phase = "d_optional"
+                        pid_plan_index = 0
+                        return True
+                chosen = ask_pid_value("Choose D", "Enter the best Roll/Pitch D from the D sweep.", pid_plan.d_sweep[0])
+                if chosen is None:
+                    status.set("PID plan paused; D winner is required before P sweep.")
+                    return False
+                pid_plan_selected_d = int(chosen)
+                pid_plan_phase = "p_sweep"
+                pid_plan_index = 0
+                continue
+
+            if pid_plan_phase == "d_optional" and pid_plan_index >= 1:
+                initial = pid_plan.optional_d if pid_plan.optional_d is not None else pid_plan.d_sweep[0]
+                chosen = ask_pid_value("Choose D", "Enter the best Roll/Pitch D from the D sweep.", int(initial))
+                if chosen is None:
+                    status.set("PID plan paused; D winner is required before P sweep.")
+                    return False
+                pid_plan_selected_d = int(chosen)
+                pid_plan_phase = "p_sweep"
+                pid_plan_index = 0
+                continue
+
+            if pid_plan_phase == "p_sweep" and pid_plan_index >= len(pid_plan_p_candidates()):
+                candidates = pid_plan_p_candidates()
+                initial = candidates[-1] if candidates else pid_plan.start_p
+                selected = ask_pid_pair("Choose P", "P", initial["roll"], initial["pitch"])
+                if selected is None:
+                    status.set("PID plan paused; P winners are required before D re-check.")
+                    return False
+                pid_plan_selected_p = selected
+                pid_plan_phase = "d_recheck"
+                pid_plan_index = 0
+                continue
+
+            if pid_plan_phase == "d_recheck" and pid_plan_index >= len(pid_plan_d_recheck_candidates()):
+                initial = pid_plan_selected_d if pid_plan_selected_d is not None else pid_plan.d_sweep[0]
+                chosen = ask_pid_value("Choose Final D", "Enter the best Roll/Pitch D after re-check.", int(initial))
+                if chosen is None:
+                    status.set("PID plan paused; final D is required before I sweep.")
+                    return False
+                pid_plan_selected_d = int(chosen)
+                pid_plan_phase = "i_sweep"
+                pid_plan_index = 0
+                continue
+
+            if pid_plan_phase == "i_sweep" and pid_plan_index >= len(pid_plan.i_sweep):
+                initial = pid_plan.i_sweep[-1] if pid_plan.i_sweep else {"roll": 60, "pitch": 65}
+                selected = ask_pid_pair("Choose I", "I", initial["roll"], initial["pitch"])
+                if selected is None:
+                    status.set("PID plan paused; I winners are required before FF sweep.")
+                    return False
+                pid_plan_selected_i = selected
+                pid_plan_phase = "ff_sweep"
+                pid_plan_index = 0
+                continue
+
+            if pid_plan_phase == "ff_sweep" and pid_plan_index >= len(pid_plan.ff_sweep):
+                initial = pid_plan.ff_sweep[-1] if pid_plan.ff_sweep else {"roll": 86, "pitch": 89}
+                selected = ask_pid_pair("Choose FF", "FF", initial["roll"], initial["pitch"])
+                if selected is None:
+                    status.set("PID plan paused; FF winners are required before final write.")
+                    return False
+                pid_plan_selected_ff = selected
+                pid_plan_phase = "final_write"
+                pid_plan_index = 0
+                continue
+
+            return True
+
+    def current_pid_plan_step() -> tuple[str, str, dict[str, dict[str, int]]] | None:
+        if pid_plan is None:
+            raise RuntimeError("PID tuning plan is not loaded.")
+        start_d = int(pid_plan.d_sweep[0]) if pid_plan.d_sweep else 17
+
+        if pid_plan_phase == "safe_start":
+            target = roll_pitch_target(
+                pid_plan.start_p["roll"],
+                pid_plan.start_p["pitch"],
+                start_d,
+                start_d,
+                0,
+                0,
+                0,
+                0,
+            )
+            return (
+                "Safe start / first D log",
+                "This writes the safe starting P values with I = 0, FF = 0, and the first D value.",
+                target,
+            )
+
+        if pid_plan_phase == "d_sweep":
+            candidates = pid_plan_d_candidates()
+            if pid_plan_index >= len(candidates):
+                return None
+            d_value = candidates[pid_plan_index]
+            target = roll_pitch_target(
+                pid_plan.start_p["roll"],
+                pid_plan.start_p["pitch"],
+                d_value,
+                d_value,
+                0,
+                0,
+                0,
+                0,
+            )
+            return (f"D sweep {pid_plan_index + 2}/{len(pid_plan.d_sweep)}", f"Log Roll/Pitch D {d_value}.", target)
+
+        if pid_plan_phase == "d_optional":
+            if pid_plan.optional_d is None or pid_plan_index >= 1:
+                return None
+            d_value = int(pid_plan.optional_d)
+            target = roll_pitch_target(
+                pid_plan.start_p["roll"],
+                pid_plan.start_p["pitch"],
+                d_value,
+                d_value,
+                0,
+                0,
+                0,
+                0,
+            )
+            return ("Optional D sweep", f"Log optional Roll/Pitch D {d_value}.", target)
+
+        if pid_plan_phase == "p_sweep":
+            if pid_plan_selected_d is None:
+                return None
+            candidates = pid_plan_p_candidates()
+            if pid_plan_index >= len(candidates):
+                return None
+            row = candidates[pid_plan_index]
+            target = roll_pitch_target(row["roll"], row["pitch"], pid_plan_selected_d, pid_plan_selected_d, 0, 0, 0, 0)
+            return (
+                f"P sweep {pid_plan_index + 1}/{len(candidates)}",
+                f"Log Roll P {row['roll']} and Pitch P {row['pitch']} with D {pid_plan_selected_d}.",
+                target,
+            )
+
+        if pid_plan_phase == "d_recheck":
+            if pid_plan_selected_p is None:
+                return None
+            candidates = pid_plan_d_recheck_candidates()
+            if pid_plan_index >= len(candidates):
+                return None
+            d_value = candidates[pid_plan_index]
+            target = roll_pitch_target(
+                pid_plan_selected_p["roll"],
+                pid_plan_selected_p["pitch"],
+                d_value,
+                d_value,
+                0,
+                0,
+                0,
+                0,
+            )
+            return (
+                f"D re-check {pid_plan_index + 1}/{len(candidates)}",
+                f"Log Roll/Pitch D {d_value} with chosen P.",
+                target,
+            )
+
+        if pid_plan_phase == "i_sweep":
+            if pid_plan_selected_p is None or pid_plan_selected_d is None:
+                return None
+            if pid_plan_index >= len(pid_plan.i_sweep):
+                return None
+            row = pid_plan.i_sweep[pid_plan_index]
+            target = roll_pitch_target(
+                pid_plan_selected_p["roll"],
+                pid_plan_selected_p["pitch"],
+                pid_plan_selected_d,
+                pid_plan_selected_d,
+                row["roll"],
+                row["pitch"],
+                0,
+                0,
+            )
+            return (
+                f"I sweep {pid_plan_index + 1}/{len(pid_plan.i_sweep)}",
+                f"Log Roll I {row['roll']} and Pitch I {row['pitch']}.",
+                target,
+            )
+
+        if pid_plan_phase == "ff_sweep":
+            if pid_plan_selected_p is None or pid_plan_selected_d is None or pid_plan_selected_i is None:
+                return None
+            if pid_plan_index >= len(pid_plan.ff_sweep):
+                return None
+            row = pid_plan.ff_sweep[pid_plan_index]
+            target = roll_pitch_target(
+                pid_plan_selected_p["roll"],
+                pid_plan_selected_p["pitch"],
+                pid_plan_selected_d,
+                pid_plan_selected_d,
+                pid_plan_selected_i["roll"],
+                pid_plan_selected_i["pitch"],
+                row["roll"],
+                row["pitch"],
+            )
+            return (
+                f"FF sweep {pid_plan_index + 1}/{len(pid_plan.ff_sweep)}",
+                f"Log Roll FF {row['roll']} and Pitch FF {row['pitch']}.",
+                target,
+            )
+
+        return None
+
+    def advance_pid_plan_after_step() -> None:
+        nonlocal pid_plan_phase, pid_plan_index
+        if pid_plan_phase == "safe_start":
+            pid_plan_phase = "d_sweep"
+            pid_plan_index = 0
+            return
+        pid_plan_index += 1
+
+    def run_pid_plan_final_write() -> None:
+        if (
+            pid_plan is None
+            or pid_plan_selected_p is None
+            or pid_plan_selected_d is None
+            or pid_plan_selected_i is None
+            or pid_plan_selected_ff is None
+        ):
+            raise RuntimeError("PID plan final values are incomplete.")
+
+        roll_pitch = roll_pitch_target(
+            pid_plan_selected_p["roll"],
+            pid_plan_selected_p["pitch"],
+            pid_plan_selected_d,
+            pid_plan_selected_d,
+            pid_plan_selected_i["roll"],
+            pid_plan_selected_i["pitch"],
+            pid_plan_selected_ff["roll"],
+            pid_plan_selected_ff["pitch"],
+        )
+        with_yaw = dict(roll_pitch)
+        with_yaw["yaw"] = dict(pid_plan.yaw_final_pid_ff)
+        current = read_fc_pid_ff_values()
+        set_pid_plan_report_text(pid_plan, "PID plan final write", with_yaw, current)
+        prompt = (
+            "The roll/pitch sweeps are complete.\n\n"
+            "DISARM before writing final PID/FF values. The app will verify disarmed state before writing.\n\n"
+            "Yes: write chosen roll/pitch values and the conservative yaw recommendation while disarmed.\n"
+            "No: write chosen roll/pitch values only while disarmed.\n"
+            "Cancel: stop without writing final values.\n\n"
+            "Current vs target:\n"
+            f"{format_pid_target_check(current, with_yaw)}"
+        )
+        choice = messagebox.askyesnocancel("PID Plan Final Values", prompt, parent=root)
+        if choice is None:
+            complete_pid_tuning_plan("PID tuning plan stopped before final write.")
+            return
+        if not ensure_disarmed_before_pid_write():
+            status.set("PID final write canceled; disarm before writing values.")
+            return
+        write_fc_pid_ff_values(with_yaw if choice else roll_pitch)
+        refresh_pid_ff_from_fc(update_status=False)
+        complete_pid_tuning_plan("PID tuning plan complete.")
+        messagebox.showinfo(
+            "PID Plan Complete",
+            "Final selected values were written. Review and save in INAV only when you are satisfied.",
+            parent=root,
+        )
+
+    def continue_pid_tuning_plan() -> None:
+        nonlocal pid_plan_waiting_for_fly_log, pid_plan_current_candidate_title
+        if not pid_plan_active:
+            return
+        if pid_plan is None:
+            raise RuntimeError("PID tuning plan is not loaded.")
+        if pid_plan_waiting_for_fly_log:
+            messagebox.showinfo(
+                "Fly/Log Needed",
+                f"{pid_plan_current_candidate_title or 'The current candidate'} is ready.\n\n"
+                "Arm the drone, press Fly/Log, then disarm the drone before pressing Next PID Plan Step.",
+                parent=root,
+            )
+            status.set("Press Fly/Log for the current candidate before moving to the next step.")
+            return
+        if not prepare_pid_plan_next_step():
+            return
+        if pid_plan_phase == "final_write":
+            run_pid_plan_final_write()
+            return
+
+        step = current_pid_plan_step()
+        if step is None:
+            status.set("PID plan is waiting for the next stage choice.")
+            return
+        title, instruction, target = step
+        if pid_plan_phase == "safe_start":
+            set_pid_plan_report_text(pid_plan, f"PID plan step: {title}", target)
+            if not ensure_disarmed_before_pid_write():
+                status.set("Safe-start PID write waiting; disarm the drone before starting the plan.")
+                return
+            current = read_fc_pid_ff_values(tuple(target.keys()))
+            set_pid_plan_report_text(pid_plan, f"PID plan step: {title}", target, current)
+            write_fc_pid_ff_values(target)
+            refresh_pid_ff_from_fc(update_status=False)
+            advance_pid_plan_after_step()
+            pid_plan_waiting_for_fly_log = True
+            pid_plan_current_candidate_title = title
+            auto_session_button.config(text="Next PID Plan Step", state="normal")
+            refresh_fly_log_button_state()
+            status.set("Safe-start PID/FF values written while disarmed.")
+            messagebox.showinfo(
+                "Safe Start Ready",
+                "Safe-start PID/FF values were written while the drone was disarmed.\n\n"
+                "Now arm the drone, press Fly/Log, then disarm the drone before pressing Next PID Plan Step.",
+                parent=root,
+            )
+            return
+
+        if not ensure_disarmed_before_pid_write():
+            status.set("PID plan paused; disarm the drone before moving to the next candidate.")
+            return
+        current = read_fc_pid_ff_values(tuple(target.keys()))
+        set_pid_plan_report_text(pid_plan, f"PID plan step: {title}", target, current)
+        prompt = (
+            f"{title}\n\n"
+            f"{instruction}\n\n"
+            "Required sequence for this candidate:\n"
+            "1. DISARM the drone.\n"
+            "2. Write/check these PID/FF values only while disarmed.\n"
+            "3. Arm, then press Fly/Log for this candidate.\n"
+            "4. Land and DISARM before pressing Next PID Plan Step.\n\n"
+            "Yes: write these target values now after the app confirms the FC is disarmed.\n"
+            "No: skip this write and mark the step done.\n"
+            "Cancel: stop the guided PID plan.\n\n"
+            "Current vs target:\n"
+            f"{format_pid_target_check(current, target)}"
+        )
+        choice = messagebox.askyesnocancel("PID Plan Step", prompt, parent=root)
+        if choice is None:
+            complete_pid_tuning_plan("PID tuning plan stopped by user.")
+            return
+        if choice:
+            if not ensure_disarmed_before_pid_write():
+                status.set("PID write canceled; disarm before writing values.")
+                return
+            write_fc_pid_ff_values(target)
+            refresh_pid_ff_from_fc(update_status=False)
+            pid_plan_waiting_for_fly_log = True
+            pid_plan_current_candidate_title = title
+            status.set(f"PID plan step written: {title}")
+        else:
+            pid_plan_waiting_for_fly_log = False
+            pid_plan_current_candidate_title = ""
+            status.set(f"PID plan step skipped: {title}")
+        advance_pid_plan_after_step()
+        auto_session_button.config(text="Next PID Plan Step", state="normal")
+        refresh_fly_log_button_state()
+        messagebox.showinfo(
+            "PID Plan Step Ready",
+            (
+                "Values are ready for this candidate.\n\n"
+                "Now arm the drone, press Fly/Log, then disarm the drone before pressing Next PID Plan Step."
+                if choice
+                else "This candidate was skipped. Press Next PID Plan Step when ready for the next candidate."
+            ),
+            parent=root,
+        )
+
+    def start_pid_tuning_plan_session() -> None:
+        nonlocal pid_plan_active, pid_plan, pid_plan_phase, pid_plan_index
+        nonlocal pid_plan_selected_d, pid_plan_selected_p, pid_plan_selected_i, pid_plan_selected_ff
+        nonlocal pid_plan_waiting_for_fly_log, pid_plan_current_candidate_title
+        nonlocal auto_report_files
+        plan_path = locate_pid_tuning_plan_file()
+        pid_plan = load_pid_tuning_plan(plan_path)
+        pid_plan_active = True
+        pid_plan_phase = "safe_start"
+        pid_plan_index = 0
+        pid_plan_selected_d = None
+        pid_plan_selected_p = None
+        pid_plan_selected_i = None
+        pid_plan_selected_ff = None
+        pid_plan_waiting_for_fly_log = False
+        pid_plan_current_candidate_title = ""
+        auto_report_files = [
+            path for path in (pid_plan.text_path, pid_plan.summary_json) if path
+        ]
+        refresh_auto_report_file_list()
+        set_pid_plan_report_text(pid_plan, "PID tuning plan loaded")
+        auto_session_button.config(text="Next PID Plan Step", state="normal")
+        refresh_fly_log_button_state()
+        status.set(f"PID tuning plan loaded: {pid_plan.text_path}")
+        continue_pid_tuning_plan()
+
     def read_fc_armed_state_for_blackbox_import(selected_port: str, selected_baud: int) -> bool:
         if fc_service.is_connected:
             return fc_service.is_armed(timeout_seconds=0.8)
@@ -1187,9 +1989,14 @@ def main() -> None:
         set_auto_state(next_state, warning or reason)
 
     def auto_abort(reason: str, warning: str = "", continue_pipeline: bool = False) -> None:
+        nonlocal pid_plan_fly_log_active
         complete_auto_session(AdaptiveSessionState.aborted, reason, warning)
+        pid_plan_fly_log_active = False
+        refresh_fly_log_button_state()
         status.set(f"Auto session aborted: {reason}")
         set_auto_button_idle()
+        if pid_plan_active:
+            auto_session_button.config(text="Next PID Plan Step", state="normal")
         if continue_pipeline:
             begin_auto_pipeline()
 
@@ -1200,62 +2007,30 @@ def main() -> None:
         nonlocal auto_start_throttle_us, auto_current_throttle_us, auto_peak_throttle_us
         if blackbox_import_inflight:
             raise RuntimeError("Blackbox import/analyze is in progress.")
-        if not run_active or run_ser is None:
-            raise RuntimeError("Connect Arduino output before starting auto session.")
         if not fc_service.is_connected:
             raise RuntimeError("Connect FC before starting auto session.")
         if level_active:
             raise RuntimeError("Stop auto-level before starting auto session.")
-        if hold_command_inflight or hold_timeout_after_id is not None:
-            raise RuntimeError("Wait for active pulse/hold command to complete first.")
         if fc_service.latest_attitude() is None:
             raise RuntimeError("No FC attitude sample yet. Wait for telemetry then retry.")
         auto_config = read_auto_tune_config()
 
         prompt = (
             "Confirm preflight:\n"
-            "- Drone physically armed and leveled on stand\n"
-            "- Transmitter switched to trainer mode\n"
-            "- Area is clear and stand is secure\n\n"
-            "The app will run randomized roll/pitch pulses for 60 seconds. "
-            "Each cycle picks random directions, bounds force/time from live attitude, "
-            "recenters the stick after each pulse, and stops any pulse before the "
-            f"{auto_config.hard_limit_deg:.0f} degree safety envelope.\n\n"
-            f"Limits: roll up to {auto_config.roll_force_us}us/{auto_config.roll_hold_s:.2f}s/"
-            f"{auto_config.roll_target_peak_deg:.0f}deg, pitch up to {auto_config.pitch_force_us}us/"
-            f"{auto_config.pitch_hold_s:.2f}s/{auto_config.pitch_target_peak_deg:.0f}deg, "
-            f"throttle {auto_config.throttle_start_us}us.\n\n"
-            "Start randomized auto tune session now?"
+            "- FC is connected and attitude telemetry is live\n"
+            "- Drone is disarmed before any PID/FF write\n"
+            "- You will write/check values only while disarmed\n"
+            "- You are ready to arm and press Fly/Log for one candidate at a time\n"
+            "- You will land and disarm before pressing Next PID Plan Step\n\n"
+            "The app will load pid_tuning_plan.txt, compare the current FC PID/FF values "
+            "to the next plan target, and ask before writing each step.\n\n"
+            "It will not run randomized stick pulses and it will not save final values automatically.\n\n"
+            "Start guided PID tuning plan now?"
         )
         if not messagebox.askyesno("Start Auto Session", prompt):
             status.set("Auto session start canceled.")
             return
-
-        auto_controller = AdaptiveExcitationController(auto_config)
-        auto_original_base_outputs = base_channel_outputs.copy()
-        auto_start_throttle_us = base_channel_outputs[THROTTLE_CHANNEL_INDEX]
-        auto_current_throttle_us = auto_start_throttle_us
-        auto_peak_throttle_us = auto_start_throttle_us
-        auto_stop_reason = ""
-        auto_warning = ""
-        auto_latest_report = None
-        auto_report_files = []
-        auto_import_result = None
-        auto_latest_imported_log = ""
-        refresh_auto_report_file_list()
-        set_auto_report_text(
-            "Randomized auto session started.\n"
-            "Duration: 60 seconds.\n"
-            "The app will pick bounded random roll/pitch directions, pulse, recenter, and repeat."
-        )
-        auto_session_start_s = time.monotonic()
-        auto_last_tick_s = auto_session_start_s
-        auto_last_sample_s = auto_session_start_s
-        set_auto_state(AdaptiveSessionState.adaptive_run, "Active")
-        throttle_prepared = prepare_auto_throttle()
-        auto_session_button.config(text="Abort Auto Session", state="normal")
-        status.set("Randomized auto session active for 60 seconds.")
-        schedule_auto_tick(delay_ms=250 if throttle_prepared else None)
+        start_pid_tuning_plan_session()
 
     def finalize_auto_event() -> None:
         nonlocal auto_active_command, auto_hold_end_requested, auto_event_peak_delta, auto_event_response_delay_s
@@ -1352,7 +2127,8 @@ def main() -> None:
         worker.submit(_task_hold, channel_index, target, offsets[channel_index], command.hold_s, callback=on_auto_hold_done)
 
     def run_auto_tick() -> None:
-        nonlocal auto_tick_after_id, auto_recovery_mode
+        nonlocal auto_tick_after_id, auto_recovery_mode, pid_plan_fly_log_active, pid_plan_waiting_for_fly_log
+        nonlocal pid_plan_current_candidate_title
         auto_tick_after_id = None
         if not auto_is_running():
             return
@@ -1378,7 +2154,7 @@ def main() -> None:
 
         abort, abort_reason = auto_controller.should_abort(sample.roll_deg, sample.pitch_deg)
         if abort:
-            auto_abort(abort_reason, continue_pipeline=True)
+            auto_abort(abort_reason, continue_pipeline=not pid_plan_fly_log_active)
             return
 
         if auto_controller.should_recover(sample.roll_deg, sample.pitch_deg):
@@ -1402,9 +2178,25 @@ def main() -> None:
 
         ready, stop_reason, warning = auto_controller.stop_ready(auto_elapsed_s(now))
         if ready:
-            complete_auto_session(AdaptiveSessionState.finalize, stop_reason, warning)
-            status.set(f"Auto session complete: {stop_reason}")
-            begin_auto_pipeline()
+            if pid_plan_fly_log_active:
+                complete_auto_session(AdaptiveSessionState.report_ready, stop_reason, warning)
+                pid_plan_fly_log_active = False
+                pid_plan_waiting_for_fly_log = False
+                completed_title = pid_plan_current_candidate_title
+                pid_plan_current_candidate_title = ""
+                auto_session_button.config(text="Next PID Plan Step", state="normal")
+                refresh_fly_log_button_state()
+                status.set(f"Fly/Log complete: {completed_title or stop_reason}")
+                messagebox.showinfo(
+                    "Fly/Log Complete",
+                    "Fly/Log movement is complete.\n\n"
+                    "Disarm the drone now. After it is disarmed, press Next PID Plan Step.",
+                    parent=root,
+                )
+            else:
+                complete_auto_session(AdaptiveSessionState.finalize, stop_reason, warning)
+                status.set(f"Auto session complete: {stop_reason}")
+                begin_auto_pipeline()
             return
 
         command = auto_controller.next_command(sample.roll_deg, sample.pitch_deg, auto_recovery_mode)
@@ -1521,13 +2313,518 @@ def main() -> None:
             blackbox_import_inflight = False
             auto_abort("Unable to start auto blackbox pipeline.", warning=str(exc))
 
+    def fc_is_armed_for_fly_log() -> bool:
+        try:
+            if fc_service.is_armed(timeout_seconds=0.8):
+                return True
+        except Exception as exc:
+            messagebox.showerror("Fly/Log Arm Check", f"Could not verify armed state:\n\n{exc}", parent=root)
+            return False
+        messagebox.showwarning(
+            "Fly/Log Requires Armed",
+            "The FC reports the drone is not armed.\n\n"
+            "Arm the drone first, then press Fly/Log.",
+            parent=root,
+        )
+        return False
+
+    def start_pid_plan_fly_log() -> None:
+        nonlocal auto_config, auto_controller, auto_session_start_s, auto_last_tick_s, auto_last_sample_s
+        nonlocal auto_stop_reason, auto_warning, auto_original_base_outputs
+        nonlocal auto_start_throttle_us, auto_current_throttle_us, auto_peak_throttle_us
+        nonlocal pid_plan_fly_log_active
+        if not pid_plan_active or not pid_plan_waiting_for_fly_log:
+            status.set("No PID plan candidate is ready for Fly/Log.")
+            return
+        if blackbox_import_inflight:
+            status.set("Blackbox/report task already in progress.")
+            return
+        if auto_is_running():
+            status.set("Auto/FlyLog task already running.")
+            return
+        if sim_active:
+            status.set("Stop simulation before Fly/Log.")
+            return
+        if not run_active or run_ser is None:
+            raise RuntimeError("Connect Arduino output before Fly/Log.")
+        if not fc_service.is_connected:
+            raise RuntimeError("Connect FC before Fly/Log.")
+        if level_active:
+            raise RuntimeError("Stop auto-level before Fly/Log.")
+        if hold_command_inflight or hold_timeout_after_id is not None:
+            raise RuntimeError("Wait for active pulse/hold command to complete first.")
+        if fc_service.latest_attitude() is None:
+            raise RuntimeError("No FC attitude sample yet. Wait for telemetry then retry.")
+        if not fc_is_armed_for_fly_log():
+            return
+
+        auto_config = read_auto_tune_config()
+        prompt = (
+            f"Fly/Log candidate: {pid_plan_current_candidate_title or 'current PID plan step'}\n\n"
+            "The FC reports ARMED.\n\n"
+            "Pressing OK will send bounded roll/pitch stick movement through the Arduino output "
+            "for about 60 seconds so Blackbox has movement to log.\n\n"
+            "No PID/FF values will be written while armed.\n\n"
+            "Keep the drone secured, keep the area clear, and be ready to disarm."
+        )
+        if not messagebox.askokcancel("Start Fly/Log", prompt, icon="warning", parent=root):
+            status.set("Fly/Log canceled.")
+            return
+
+        auto_controller = AdaptiveExcitationController(auto_config)
+        auto_original_base_outputs = base_channel_outputs.copy()
+        auto_start_throttle_us = base_channel_outputs[THROTTLE_CHANNEL_INDEX]
+        auto_current_throttle_us = auto_start_throttle_us
+        auto_peak_throttle_us = auto_start_throttle_us
+        auto_stop_reason = ""
+        auto_warning = ""
+        auto_session_start_s = time.monotonic()
+        auto_last_tick_s = auto_session_start_s
+        auto_last_sample_s = auto_session_start_s
+        pid_plan_fly_log_active = True
+        set_auto_state(AdaptiveSessionState.adaptive_run, "Fly/Log active")
+        throttle_prepared = prepare_auto_throttle()
+        auto_session_button.config(text="Abort Fly/Log", state="normal")
+        refresh_fly_log_button_state()
+        status.set("Fly/Log movement active. Disarm after it completes.")
+        set_auto_report_text(
+            "Fly/Log active\n\n"
+            f"Candidate: {pid_plan_current_candidate_title or 'current PID plan step'}\n"
+            "The app is sending bounded roll/pitch movement for Blackbox logging.\n"
+            "No PID/FF values are being written while armed.\n\n"
+            "When complete, disarm the drone before pressing Next PID Plan Step."
+        )
+        schedule_auto_tick(delay_ms=250 if throttle_prepared else None)
+
+    def do_pid_plan_fly_log_toggle() -> None:
+        nonlocal pid_plan_fly_log_active
+        try:
+            if sim_fly_log_active:
+                stop_simulated_auto_session("Simulated Fly/Log stopped.", restore_display=False)
+                return
+            if sim_plan is not None and sim_waiting_for_fly_log:
+                start_simulated_fly_log()
+                return
+            if pid_plan_fly_log_active:
+                auto_abort("Fly/Log aborted by user.", continue_pipeline=False)
+                pid_plan_fly_log_active = False
+                refresh_fly_log_button_state()
+                return
+            start_pid_plan_fly_log()
+        except Exception as exc:
+            set_error("Fly/Log error", exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
+
+    def set_sim_attitude_display() -> None:
+        horizon.set_attitude(sim_roll_deg, sim_pitch_deg)
+        roll_text.set(f"Roll: {sim_roll_deg:6.1f} deg")
+        pitch_text.set(f"Pitch: {sim_pitch_deg:6.1f} deg")
+
+    def restore_neutral_sim_display() -> None:
+        horizon.set_attitude(0.0, 0.0)
+        roll_text.set("Roll: 0.0 deg")
+        pitch_text.set("Pitch: 0.0 deg")
+        clear_pid_ff_displays()
+
+    def set_sim_pid_ff_display(target: dict[str, dict[str, int]]) -> None:
+        for label, gain, var in zip(pid_ff_labels, ("p", "i", "d", "ff"), roll_pidff_vars):
+            value = target.get("roll", {}).get(gain)
+            var.set(f"{label}: --" if value is None else f"{label}: {value}")
+        for label, gain, var in zip(pid_ff_labels, ("p", "i", "d", "ff"), pitch_pidff_vars):
+            value = target.get("pitch", {}).get(gain)
+            var.set(f"{label}: --" if value is None else f"{label}: {value}")
+
+    def simulation_hardware_is_disconnected() -> bool:
+        if run_active or run_ser is not None:
+            messagebox.showwarning(
+                "Simulation Requires No Hardware",
+                "Disconnect Arduino output before using the simulator.",
+                parent=root,
+            )
+            return False
+        if fc_service.is_connected:
+            messagebox.showwarning(
+                "Simulation Requires No Hardware",
+                "Disconnect the FC before using the simulator. Simulation uses synthetic attitude and PID boxes only.",
+                parent=root,
+            )
+            return False
+        return True
+
+    def _sim_preview_d(plan: LoadedPIDTuningPlan) -> int:
+        if len(plan.d_sweep) >= 2:
+            return int(plan.d_sweep[1])
+        if plan.d_sweep:
+            return int(plan.d_sweep[0])
+        return 17
+
+    def _sim_preview_pair(rows: tuple[dict[str, int], ...], fallback: dict[str, int]) -> dict[str, int]:
+        if not rows:
+            return dict(fallback)
+        return dict(rows[min(1, len(rows) - 1)])
+
+    def build_simulated_pid_plan_steps(plan: LoadedPIDTuningPlan) -> list[dict[str, object]]:
+        start_d = int(plan.d_sweep[0]) if plan.d_sweep else 17
+        preview_d = _sim_preview_d(plan)
+        preview_p = _sim_preview_pair(tuple({"roll": r["roll"], "pitch": r["pitch"]} for r in pid_plan_p_candidates_for(plan)), plan.start_p)
+        preview_i = _sim_preview_pair(plan.i_sweep, {"roll": 60, "pitch": 65})
+        preview_ff = _sim_preview_pair(plan.ff_sweep, {"roll": 86, "pitch": 89})
+        steps: list[dict[str, object]] = []
+
+        def add(title: str, instruction: str, stage: str, target: dict[str, dict[str, int]], note: str = "") -> None:
+            steps.append({"title": title, "instruction": instruction, "stage": stage, "target": target, "note": note})
+
+        add(
+            "Safe start / first D log",
+            "Start P with I = 0, FF = 0, and the first D value.",
+            "d",
+            roll_pitch_target(plan.start_p["roll"], plan.start_p["pitch"], start_d, start_d, 0, 0, 0, 0),
+        )
+        for index, d_value in enumerate(plan.d_sweep[1:], start=2):
+            add(
+                f"D sweep {index}/{len(plan.d_sweep)}",
+                f"Compare damping with Roll/Pitch D {d_value}.",
+                "d",
+                roll_pitch_target(plan.start_p["roll"], plan.start_p["pitch"], int(d_value), int(d_value), 0, 0, 0, 0),
+            )
+        if plan.optional_d is not None and plan.optional_d not in plan.d_sweep:
+            add(
+                "Optional D sweep",
+                f"Optional comparison at Roll/Pitch D {plan.optional_d}.",
+                "d",
+                roll_pitch_target(plan.start_p["roll"], plan.start_p["pitch"], int(plan.optional_d), int(plan.optional_d), 0, 0, 0, 0),
+                "Real tuning should only run this if needed and motors stay cool.",
+            )
+        for index, row in enumerate(pid_plan_p_candidates_for(plan), start=1):
+            add(
+                f"P sweep {index}/{len(pid_plan_p_candidates_for(plan))}",
+                f"Compare tracking with Roll P {row['roll']} and Pitch P {row['pitch']}.",
+                "p",
+                roll_pitch_target(row["roll"], row["pitch"], preview_d, preview_d, 0, 0, 0, 0),
+                f"Simulation uses preview D {preview_d}; real tuning uses the D you choose from logs.",
+            )
+        for index, d_value in enumerate(simulated_d_recheck_values(preview_d), start=1):
+            add(
+                f"D re-check {index}/3",
+                f"Re-check damping with chosen P and Roll/Pitch D {d_value}.",
+                "d",
+                roll_pitch_target(preview_p["roll"], preview_p["pitch"], d_value, d_value, 0, 0, 0, 0),
+                f"Simulation uses preview P {preview_p['roll']}/{preview_p['pitch']}.",
+            )
+        for index, row in enumerate(plan.i_sweep, start=1):
+            add(
+                f"I sweep {index}/{len(plan.i_sweep)}",
+                f"Compare hold/recenter with Roll I {row['roll']} and Pitch I {row['pitch']}.",
+                "i",
+                roll_pitch_target(preview_p["roll"], preview_p["pitch"], preview_d, preview_d, row["roll"], row["pitch"], 0, 0),
+                "I is subtle in this short visual preview; real logs still decide the winner.",
+            )
+        for index, row in enumerate(plan.ff_sweep, start=1):
+            add(
+                f"FF sweep {index}/{len(plan.ff_sweep)}",
+                f"Compare initial response with Roll FF {row['roll']} and Pitch FF {row['pitch']}.",
+                "ff",
+                roll_pitch_target(
+                    preview_p["roll"],
+                    preview_p["pitch"],
+                    preview_d,
+                    preview_d,
+                    preview_i["roll"],
+                    preview_i["pitch"],
+                    row["roll"],
+                    row["pitch"],
+                ),
+                f"Simulation uses preview P/D/I {preview_p['roll']}/{preview_p['pitch']} / {preview_d} / {preview_i['roll']}/{preview_i['pitch']}.",
+            )
+        final_target = roll_pitch_target(
+            preview_p["roll"],
+            preview_p["pitch"],
+            preview_d,
+            preview_d,
+            preview_i["roll"],
+            preview_i["pitch"],
+            preview_ff["roll"],
+            preview_ff["pitch"],
+        )
+        add(
+            "Final preview",
+            "Preview the conservative final roll/pitch set. Yaw is listed in the plan but not shown in these boxes.",
+            "final",
+            final_target,
+            f"Yaw recommendation remains P {plan.yaw_final_pid_ff['p']}, I {plan.yaw_final_pid_ff['i']}, D {plan.yaw_final_pid_ff['d']}, FF {plan.yaw_final_pid_ff['ff']}.",
+        )
+        return steps
+
+    def pid_plan_p_candidates_for(plan: LoadedPIDTuningPlan) -> tuple[dict[str, int], ...]:
+        return tuple(
+            {"roll": int(roll), "pitch": int(pitch)}
+            for roll, pitch in zip(plan.p_sweep.get("roll", ()), plan.p_sweep.get("pitch", ()))
+        )
+
+    def simulated_d_recheck_values(selected_d: int) -> tuple[int, ...]:
+        return tuple(dict.fromkeys(max(0, min(255, int(value))) for value in (selected_d - 6, selected_d, selected_d + 6)))
+
+    def current_sim_step() -> dict[str, object] | None:
+        if sim_plan_step_index < 0 or sim_plan_step_index >= len(sim_plan_steps):
+            return None
+        return sim_plan_steps[sim_plan_step_index]
+
+    def _sim_axis_wave(elapsed_s: float, start_s: float, direction: int, gains: dict[str, int], stage: str) -> float:
+        local_s = elapsed_s - start_s
+        if local_s < 0.0:
+            return 0.0
+        p_value = float(gains.get("p", 0))
+        d_value = float(gains.get("d", 0))
+        i_value = float(gains.get("i", 0))
+        ff_value = float(gains.get("ff", 0))
+        damping = max(0.0, min(1.0, (d_value - 15.0) / 27.0))
+        tracking = max(0.62, min(1.18, 0.78 + ((p_value - 35.0) * 0.012) + (ff_value * 0.0008)))
+        target_deg = 18.0 * tracking
+        rise_rate = 1.65 + (p_value / 45.0) + min(1.2, ff_value / 120.0)
+        overshoot = max(0.02, 0.36 - (damping * 0.27) + max(0.0, p_value - 50.0) * 0.012)
+        if stage == "ff":
+            overshoot += max(0.0, ff_value - 129.0) * 0.0016
+        if stage == "i":
+            overshoot += max(0.0, 60.0 - i_value) * 0.002
+
+        if local_s <= 2.35:
+            rise = 1.0 - math.exp(-rise_rate * local_s)
+            ring = target_deg * overshoot * math.exp(-(1.0 + damping * 2.2) * local_s) * math.sin(local_s * 7.0)
+            return float(direction) * (target_deg * rise + ring)
+
+        release_s = local_s - 2.35
+        release_rate = 1.15 + (damping * 2.8) + min(0.65, i_value / 180.0)
+        residual = target_deg * math.exp(-release_rate * release_s)
+        bounce = target_deg * overshoot * 0.55 * math.exp(-(0.8 + damping * 2.0) * release_s) * math.sin(release_s * 8.5)
+        return float(direction) * (residual + bounce)
+
+    def update_simulated_plan_attitude(elapsed_s: float, step: dict[str, object]) -> None:
+        nonlocal sim_roll_deg, sim_pitch_deg
+        target = step["target"]
+        if not isinstance(target, dict):
+            sim_roll_deg = 0.0
+            sim_pitch_deg = 0.0
+            return
+        stage = str(step.get("stage", ""))
+        roll_gains = target.get("roll", {}) if isinstance(target.get("roll", {}), dict) else {}
+        pitch_gains = target.get("pitch", {}) if isinstance(target.get("pitch", {}), dict) else {}
+        sim_roll_deg = _sim_axis_wave(elapsed_s, 0.25, 1, roll_gains, stage)
+        sim_pitch_deg = _sim_axis_wave(elapsed_s, 3.85, -1, pitch_gains, stage)
+        limit = 35.0
+        sim_roll_deg = max(-limit, min(limit, sim_roll_deg))
+        sim_pitch_deg = max(-limit, min(limit, sim_pitch_deg))
+
+    def refresh_sim_report(
+        elapsed_s: float,
+        step: dict[str, object],
+        fly_log_running: bool = False,
+        step_number: int | None = None,
+    ) -> None:
+        target = step["target"]
+        target_text = format_pid_values(target) if isinstance(target, dict) else ""
+        note = str(step.get("note", "") or "")
+        mode_text = "Simulated Fly/Log movement running" if fly_log_running else "Simulated values staged"
+        display_step_number = sim_plan_step_index + 1 if step_number is None else step_number
+        lines = [
+            "Simulated PID tuning plan step",
+            f"Step {display_step_number} of {len(sim_plan_steps)}: {step['title']}",
+            f"Plan file: {sim_plan.text_path if sim_plan is not None else '--'}",
+            f"State: {mode_text}",
+            "",
+            str(step["instruction"]),
+            "",
+            "Hardware is intentionally disconnected for simulation. These values are written only to the UI PID boxes.",
+            "",
+            "Real-world sequence for this step:",
+            "1. Disarm before writing/checking these PID/FF values.",
+            "2. Write values only while disarmed.",
+            "3. Arm, then press Fly/Log for the candidate.",
+            "4. Land and disarm before moving to the next plan step.",
+            "",
+            "Simulated PID/FF boxes",
+            target_text,
+            "",
+            f"Elapsed: {elapsed_s:4.1f}s / {sim_step_duration_s:.1f}s",
+            f"Roll:  {sim_roll_deg:+5.1f} deg",
+            f"Pitch: {sim_pitch_deg:+5.1f} deg",
+        ]
+        if note:
+            lines.extend(["", note])
+        if fly_log_running:
+            lines.extend(["", "When simulated Fly/Log finishes, press Next Sim Step to preview the next tuning candidate."])
+        else:
+            lines.extend(["", "Press Fly/Log to stimulate the simulated drone for this candidate."])
+        set_auto_report_text("\n".join(lines))
+
+    def stop_simulated_auto_session(message: str = "", restore_display: bool = True, clear_walkthrough: bool = False) -> None:
+        nonlocal sim_active, sim_after_id, sim_step_started_s, sim_last_report_second
+        nonlocal sim_plan, sim_plan_steps, sim_plan_step_index, sim_waiting_for_fly_log, sim_fly_log_active
+        if sim_after_id is not None:
+            try:
+                root.after_cancel(sim_after_id)
+            except Exception:
+                pass
+        sim_active = False
+        sim_fly_log_active = False
+        sim_after_id = None
+        sim_step_started_s = None
+        sim_last_report_second = -1
+        if clear_walkthrough:
+            sim_plan = None
+            sim_plan_steps = []
+            sim_plan_step_index = 0
+            sim_waiting_for_fly_log = False
+        if sim_waiting_for_fly_log:
+            simulate_auto_session_button.config(text="Next Sim Step", state="disabled")
+        elif sim_plan is not None and sim_plan_step_index < len(sim_plan_steps):
+            simulate_auto_session_button.config(text="Next Sim Step", state="normal")
+        else:
+            simulate_auto_session_button.config(text="Simulate", state="normal")
+        refresh_fly_log_button_state()
+        if restore_display:
+            restore_neutral_sim_display()
+        if message and not is_closing:
+            status.set(message)
+
+    def finish_simulated_plan_step(step: dict[str, object]) -> None:
+        nonlocal sim_active, sim_after_id, sim_step_started_s, sim_plan_step_index
+        nonlocal sim_waiting_for_fly_log, sim_fly_log_active
+        completed_step_number = sim_plan_step_index + 1
+        sim_active = False
+        sim_fly_log_active = False
+        sim_waiting_for_fly_log = False
+        sim_after_id = None
+        sim_step_started_s = None
+        sim_plan_step_index += 1
+        if sim_plan_step_index >= len(sim_plan_steps):
+            simulate_auto_session_button.config(text="Simulate", state="normal")
+            refresh_fly_log_button_state()
+            status.set("PID plan simulation complete.")
+            refresh_sim_report(sim_step_duration_s, step, fly_log_running=False, step_number=completed_step_number)
+            return
+        simulate_auto_session_button.config(text="Next Sim Step", state="normal")
+        refresh_fly_log_button_state()
+        status.set(f"Simulation step complete. Next: {sim_plan_steps[sim_plan_step_index]['title']}")
+        refresh_sim_report(sim_step_duration_s, step, fly_log_running=False, step_number=completed_step_number)
+
+    def run_simulated_auto_tick() -> None:
+        nonlocal sim_after_id, sim_last_report_second
+        sim_after_id = None
+        if not sim_active:
+            return
+        step = current_sim_step()
+        if step is None or sim_step_started_s is None:
+            stop_simulated_auto_session("Simulation stopped: no plan step is loaded.", clear_walkthrough=True)
+            return
+
+        elapsed_s = max(0.0, time.monotonic() - sim_step_started_s)
+        update_simulated_plan_attitude(elapsed_s, step)
+        set_sim_attitude_display()
+        report_second = int(elapsed_s)
+        if report_second != sim_last_report_second:
+            sim_last_report_second = report_second
+            refresh_sim_report(elapsed_s, step, fly_log_running=True)
+        if elapsed_s >= sim_step_duration_s:
+            finish_simulated_plan_step(step)
+            return
+        sim_after_id = root.after(40, run_simulated_auto_tick)
+
+    def start_simulated_plan_step() -> None:
+        nonlocal sim_active, sim_step_started_s, sim_roll_deg, sim_pitch_deg, sim_last_report_second
+        nonlocal sim_waiting_for_fly_log, sim_fly_log_active
+        if not simulation_hardware_is_disconnected():
+            return
+        if auto_is_running() or pid_plan_active or blackbox_import_inflight:
+            status.set("Wait for the active auto/PID/log task to finish before simulating.")
+            return
+        step = current_sim_step()
+        if step is None:
+            stop_simulated_auto_session("PID plan simulation complete.", restore_display=True, clear_walkthrough=True)
+            return
+        target = step["target"]
+        if isinstance(target, dict):
+            set_sim_pid_ff_display(target)
+        sim_active = False
+        sim_fly_log_active = False
+        sim_waiting_for_fly_log = True
+        sim_step_started_s = None
+        sim_roll_deg = 0.0
+        sim_pitch_deg = 0.0
+        sim_last_report_second = -1
+        simulate_auto_session_button.config(text="Next Sim Step", state="disabled")
+        refresh_fly_log_button_state()
+        status.set(f"Simulated values staged: {step['title']}. Press Fly/Log.")
+        refresh_sim_report(0.0, step, fly_log_running=False)
+        set_sim_attitude_display()
+
+    def start_simulated_fly_log() -> None:
+        nonlocal sim_active, sim_step_started_s, sim_roll_deg, sim_pitch_deg, sim_last_report_second
+        nonlocal sim_waiting_for_fly_log, sim_fly_log_active
+        if not simulation_hardware_is_disconnected():
+            return
+        step = current_sim_step()
+        if step is None or not sim_waiting_for_fly_log:
+            status.set("No simulated candidate is staged for Fly/Log.")
+            return
+        sim_active = True
+        sim_fly_log_active = True
+        sim_step_started_s = time.monotonic()
+        sim_roll_deg = 0.0
+        sim_pitch_deg = 0.0
+        sim_last_report_second = -1
+        simulate_auto_session_button.config(text="Next Sim Step", state="disabled")
+        refresh_fly_log_button_state()
+        status.set(f"Simulated Fly/Log running: {step['title']}")
+        refresh_sim_report(0.0, step, fly_log_running=True)
+        set_sim_attitude_display()
+        run_simulated_auto_tick()
+
+    def start_simulated_auto_session() -> None:
+        nonlocal sim_plan, sim_plan_steps, sim_plan_step_index
+        if not simulation_hardware_is_disconnected():
+            return
+        plan_path = locate_pid_tuning_plan_file()
+        sim_plan = load_pid_tuning_plan(plan_path)
+        sim_plan_steps = build_simulated_pid_plan_steps(sim_plan)
+        sim_plan_step_index = 0
+        if not sim_plan_steps:
+            raise RuntimeError("PID tuning plan has no steps to simulate.")
+        auto_report_files[:] = [path for path in (sim_plan.text_path, sim_plan.summary_json) if path]
+        refresh_auto_report_file_list()
+        start_simulated_plan_step()
+
+    def do_simulated_auto_session_toggle() -> None:
+        try:
+            if sim_active:
+                stop_simulated_auto_session("Simulation stopped.")
+                return
+            if sim_waiting_for_fly_log:
+                messagebox.showinfo(
+                    "Simulated Fly/Log Needed",
+                    "The simulated PID/FF values are staged.\n\nPress Fly/Log to stimulate the simulated drone before moving to the next step.",
+                    parent=root,
+                )
+                status.set("Press Fly/Log before the next simulated step.")
+                return
+            if sim_plan is not None and sim_plan_step_index < len(sim_plan_steps):
+                start_simulated_plan_step()
+                return
+            start_simulated_auto_session()
+        except Exception as exc:
+            stop_simulated_auto_session("", restore_display=True, clear_walkthrough=True)
+            set_error("Simulation error", exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
+
     def do_auto_session_toggle() -> None:
         try:
+            if sim_active:
+                stop_simulated_auto_session("Simulation stopped.", clear_walkthrough=True)
             if auto_is_running():
-                auto_abort("Auto session aborted by user.", continue_pipeline=True)
+                auto_abort("Auto session aborted by user.", continue_pipeline=not pid_plan_fly_log_active)
                 return
             if auto_state == AdaptiveSessionState.import_analyze:
                 status.set("Auto pipeline is running; wait for completion.")
+                return
+            if pid_plan_active:
+                continue_pid_tuning_plan()
                 return
             start_auto_session()
         except Exception as exc:
@@ -1604,9 +2901,12 @@ def main() -> None:
         if auto_state == AdaptiveSessionState.import_analyze:
             auto_session_button.config(text="Running Analysis...", state="disabled")
         elif auto_is_running():
-            auto_session_button.config(text="Abort Auto Session", state="normal")
+            auto_session_button.config(text="Abort Fly/Log" if pid_plan_fly_log_active else "Abort Auto Session", state="normal")
+        elif pid_plan_active:
+            auto_session_button.config(text="Next PID Plan Step", state="normal")
         else:
             auto_session_button.config(text="Start Auto Session", state="normal")
+        refresh_fly_log_button_state()
 
     def cancel_hold_timeout() -> None:
         nonlocal hold_timeout_after_id
@@ -1839,9 +3139,10 @@ def main() -> None:
             sample = fc_service.latest_attitude()
             if sample is not None:
                 record_auto_session_sample(sample)
-                horizon.set_attitude(sample.roll_deg, sample.pitch_deg)
-                roll_text.set(f"Roll: {sample.roll_deg:6.1f} deg")
-                pitch_text.set(f"Pitch: {sample.pitch_deg:6.1f} deg")
+                if not sim_active:
+                    horizon.set_attitude(sample.roll_deg, sample.pitch_deg)
+                    roll_text.set(f"Roll: {sample.roll_deg:6.1f} deg")
+                    pitch_text.set(f"Pitch: {sample.pitch_deg:6.1f} deg")
         except Exception:
             pass
         fc_poll_after_id = root.after(60, poll_fc_attitude)
@@ -2346,6 +3647,7 @@ def main() -> None:
         cancel_adjust_repeat()
         cancel_hold_timeout()
         stop_auto_session_runtime()
+        stop_simulated_auto_session("", restore_display=False)
         if fc_poll_after_id is not None:
             try:
                 root.after_cancel(fc_poll_after_id)
@@ -2375,7 +3677,10 @@ def main() -> None:
     import_blackbox_button.config(command=do_pull_blackbox_logs)
     analyze_blackbox_button.config(command=do_analyze_blackbox_logs)
     auto_session_button.config(command=do_auto_session_toggle)
+    fly_log_button.config(command=do_pid_plan_fly_log_toggle)
+    simulate_auto_session_button.config(command=do_simulated_auto_session_toggle)
     step_response_button.config(command=do_step_response_report)
+    pid_tuning_plan_button.config(command=do_pid_tuning_plan)
     auto_open_selected_button.config(command=open_selected_report_file)
     auto_open_all_button.config(command=open_all_report_files)
     auto_clear_reports_button.config(command=do_clear_report_files)

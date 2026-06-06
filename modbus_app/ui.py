@@ -135,12 +135,15 @@ class MainUi:
     analyze_blackbox_button: tk.Button
     arduino_button: tk.Button
     auto_session_button: tk.Button
+    fly_log_button: tk.Button
+    simulate_auto_session_button: tk.Button
     auto_report_text: tk.Text
     auto_report_listbox: tk.Listbox
     auto_open_selected_button: tk.Button
     auto_open_all_button: tk.Button
     auto_clear_reports_button: tk.Button
     step_response_button: tk.Button
+    pid_tuning_plan_button: tk.Button
 
 def build_main_gui(root: tk.Tk) -> MainUi:
     root.title("PPM Modbus")
@@ -342,8 +345,14 @@ def build_main_gui(root: tk.Tk) -> MainUi:
     auto_action_frame.grid(row=0, column=0, sticky="w", pady=(0, 6))
     auto_session_button = tk.Button(auto_action_frame, text="Start Auto Session", width=18)
     auto_session_button.pack(side="left", padx=(0, 4))
+    fly_log_button = tk.Button(auto_action_frame, text="Fly/Log", width=10, state="disabled")
+    fly_log_button.pack(side="left", padx=(0, 4))
+    simulate_auto_session_button = tk.Button(auto_action_frame, text="Simulate", width=10)
+    simulate_auto_session_button.pack(side="left", padx=(0, 4))
     step_response_button = tk.Button(auto_action_frame, text="Chart Step Response", width=18)
-    step_response_button.pack(side="left")
+    step_response_button.pack(side="left", padx=(0, 4))
+    pid_tuning_plan_button = tk.Button(auto_action_frame, text="PID Tuning Plan", width=16)
+    pid_tuning_plan_button.pack(side="left")
 
     auto_list_frame = tk.Frame(auto_frame)
     auto_list_frame.grid(row=1, column=0, sticky="nsew")
@@ -408,10 +417,13 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         analyze_blackbox_button=analyze_blackbox_button,
         arduino_button=arduino_button,
         auto_session_button=auto_session_button,
+        fly_log_button=fly_log_button,
+        simulate_auto_session_button=simulate_auto_session_button,
         auto_report_text=auto_report_text,
         auto_report_listbox=auto_report_listbox,
         auto_open_selected_button=auto_open_selected_button,
         auto_open_all_button=auto_open_all_button,
         auto_clear_reports_button=auto_clear_reports_button,
         step_response_button=step_response_button,
+        pid_tuning_plan_button=pid_tuning_plan_button,
     )
