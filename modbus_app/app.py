@@ -116,6 +116,8 @@ class ModbusApp:
         self.roll_pidff_vars = self.ui.roll_pidff_vars
         self.pitch_pidff_vars = self.ui.pitch_pidff_vars
         self.pid_ff_adjust_canvases = self.ui.pid_ff_adjust_canvases
+        self.load_pid_ff_button = self.ui.load_pid_ff_button
+        self.save_pid_ff_button = self.ui.save_pid_ff_button
         self.fc_port_entry = self.ui.fc_port_entry
         self.fc_baud_entry = self.ui.fc_baud_entry
         self.scan_fc_button = self.ui.scan_fc_button
@@ -129,6 +131,7 @@ class ModbusApp:
         self.simulation_mode_var = self.ui.simulation_mode_var
         self.simulation_mode_checkbutton = self.ui.simulation_mode_checkbutton
         self.pid_progress_button = self.ui.pid_progress_button
+        self.cancel_auto_session_button = self.ui.cancel_auto_session_button
         self.step_response_button = self.ui.step_response_button
         self.pid_tuning_plan_button = self.ui.pid_tuning_plan_button
 
@@ -169,6 +172,7 @@ class ModbusApp:
         self.auto_hold_end_requested = False
         self.auto_settle_until_s: float | None = None
         self.auto_recovery_mode = False
+        self.auto_stop_after_recovery = False
         self.auto_active_command: AdaptiveCommand | None = None
         self.auto_event_peak_delta = 0.0
         self.auto_event_response_delay_s: float | None = None
@@ -313,9 +317,9 @@ class ModbusApp:
 
         def refresh_fly_log_button_state() -> None:
             if self.pid_plan_fly_log_active:
-                self.fly_log_button.config(text="Abort Fly/Log", state="normal")
+                self.fly_log_button.config(text="Fly/Log Active", state="disabled")
             elif simulation_mode_enabled() and self.sim_fly_log_active:
-                self.fly_log_button.config(text="Stop Sim Fly/Log", state="normal")
+                self.fly_log_button.config(text="Sim Fly/Log Active", state="disabled")
             elif self.pid_plan_active and self.pid_plan_waiting_for_fly_log:
                 self.fly_log_button.config(text="Fly/Log", state="normal")
             elif simulation_mode_enabled() and self.sim_plan is not None and self.sim_waiting_for_fly_log:
@@ -330,6 +334,34 @@ class ModbusApp:
                 var.set(f"{label}: {format_pid_ff_value(value)}")
             for label, value, var in zip(self.pid_ff_labels, pitch_series, self.pitch_pidff_vars):
                 var.set(f"{label}: {format_pid_ff_value(value)}")
+
+        def pid_ff_var(axis: str, gain: str) -> tk.StringVar:
+            index = {"p": 0, "i": 1, "d": 2, "ff": 3}[gain]
+            return self.roll_pidff_vars[index] if axis == "roll" else self.pitch_pidff_vars[index]
+
+        def parse_pid_ff_var(axis: str, gain: str) -> int:
+            raw = pid_ff_var(axis, gain).get().strip()
+            if ":" in raw:
+                raw = raw.split(":", 1)[1].strip()
+            if not raw or raw == "--":
+                raise RuntimeError(f"{axis.title()} {gain.upper()} is blank. Press Load or enter a value before saving.")
+            try:
+                value = int(round(float(raw)))
+            except ValueError as exc:
+                raise RuntimeError(f"{axis.title()} {gain.upper()} must be a number.") from exc
+            if value < 0 or value > 255:
+                raise RuntimeError(f"{axis.title()} {gain.upper()} must be between 0 and 255.")
+            return value
+
+        def set_pid_ff_var(axis: str, gain: str, value: int) -> None:
+            label = gain.upper()
+            pid_ff_var(axis, gain).set(f"{label}: {max(0, min(255, int(value)))}")
+
+        def staged_roll_pitch_pid_ff_values() -> dict[str, dict[str, int]]:
+            return {
+                axis: {gain: parse_pid_ff_var(axis, gain) for gain in ("p", "i", "d", "ff")}
+                for axis in ("roll", "pitch")
+            }
 
         def set_auto_report_text(text: str) -> None:
             self.auto_report_text.config(state="normal")
@@ -419,6 +451,87 @@ class ModbusApp:
                 self.status.set(f"FC connected: {connected_port} @ {connected_baud}. PID/FF loaded.")
 
             self.worker.submit(_task_fc_read_pid_ff, callback=on_pid_ff_read_done)
+
+        def do_load_pid_ff_from_fc() -> None:
+            try:
+                if not self.fc_service.is_connected:
+                    self.status.set("Connect FC before loading PID/FF.")
+                    return
+                self.load_pid_ff_button.config(state="disabled")
+                self.status.set("Loading PID/FF from FC...")
+
+                def on_pid_ff_load_done(ok: bool, res: object) -> None:
+                    self.load_pid_ff_button.config(state="normal")
+                    if not ok:
+                        set_error("PID/FF load error", res if isinstance(res, Exception) else RuntimeError(res))
+                        return
+                    if (
+                        not isinstance(res, tuple)
+                        or len(res) != 2
+                        or not isinstance(res[0], AxisPidFf)
+                        or not isinstance(res[1], AxisPidFf)
+                    ):
+                        set_error("PID/FF load error", RuntimeError("Unexpected PID/FF load result."))
+                        return
+                    set_pid_ff_displays(res[0], res[1])
+                    self.status.set("PID/FF loaded from FC.")
+
+                self.worker.submit(_task_fc_read_pid_ff, callback=on_pid_ff_load_done)
+            except Exception as exc:
+                self.load_pid_ff_button.config(state="normal")
+                set_error("PID/FF load error", exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
+
+        def write_staged_pid_ff_values_to_fc(target: dict[str, dict[str, int]]) -> None:
+            for axis in ("roll", "pitch"):
+                gains = target.get(axis)
+                if not gains:
+                    continue
+                for gain in ("p", "i", "d", "ff"):
+                    value = int(gains[gain])
+                    setting_name = FF_SETTING_NAME[axis] if gain == "ff" else PID_SETTING_NAME[(axis, gain)]
+                    confirmed = int(self.fc_service.set_setting_int(setting_name, value, timeout_seconds=1.2))
+                    if confirmed != value:
+                        raise RuntimeError(
+                            f"{axis.title()} {gain.upper()} write verified as {confirmed}, expected {value}."
+                        )
+            self.fc_service.save_settings(timeout_seconds=1.5)
+
+        def do_save_pid_ff_to_fc() -> None:
+            try:
+                if not self.fc_service.is_connected:
+                    self.status.set("Connect FC before saving PID/FF.")
+                    return
+                target = staged_roll_pitch_pid_ff_values()
+                if not ensure_disarmed_before_pid_write():
+                    self.status.set("PID/FF save canceled; disarm before saving.")
+                    return
+                summary = format_pid_values(target)
+                prompt = (
+                    "Write these Roll/Pitch PID/FF values to the FC and save them?\n\n"
+                    f"{summary}\n\n"
+                    "The FC may reboot after saving."
+                )
+                if not messagebox.askyesno("Save PID/FF", prompt, icon="warning", parent=self.root):
+                    self.status.set("PID/FF save canceled.")
+                    return
+
+                self.save_pid_ff_button.config(state="disabled")
+                self.status.set("Saving PID/FF to FC...")
+
+                def on_pid_ff_save_done(ok: bool, res: object) -> None:
+                    self.save_pid_ff_button.config(state="normal")
+                    if not ok:
+                        set_error("PID/FF save error", res if isinstance(res, Exception) else RuntimeError(res))
+                        return
+                    self.status.set("PID/FF written and saved to FC.")
+
+                self.worker.submit(
+                    lambda _worker_self: write_staged_pid_ff_values_to_fc(target),
+                    callback=on_pid_ff_save_done,
+                )
+            except Exception as exc:
+                self.save_pid_ff_button.config(state="normal")
+                set_error("PID/FF save error", exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
 
         def record_auto_session_sample(sample) -> None:
             self.auto_last_sample_s = time.monotonic()
@@ -604,22 +717,14 @@ class ModbusApp:
                 return
             if delta == 0:
                 return
-            if not self.fc_service.is_connected:
-                self.status.set("Connect FC before adjusting PID/FF.")
-                return
             axis, gain = self.pid_ff_adjust_fields[index]
-            setting_name = FF_SETTING_NAME[axis] if gain == "ff" else PID_SETTING_NAME[(axis, gain)]
             try:
-                current = int(self.fc_service.get_setting_int(setting_name, timeout_seconds=0.8))
+                current = parse_pid_ff_var(axis, gain)
                 target = max(0, min(255, current + delta))
                 if target == current:
                     return
-                _ = self.fc_service.set_setting_int(setting_name, target, timeout_seconds=0.9)
-                if not refresh_pid_ff_from_fc(update_status=False):
-                    raise RuntimeError("Failed to refresh PID/FF from FC after update.")
-                self.status.set(
-                    f"{axis.title()} {gain.upper()} set to {target} on FC."
-                )
+                set_pid_ff_var(axis, gain, target)
+                self.status.set(f"{axis.title()} {gain.upper()} staged at {target}. Press Save to write to FC.")
             except Exception as exc:
                 set_error("PID/FF adjust error", exc)
 
@@ -1111,8 +1216,8 @@ class ModbusApp:
             if self.pid_plan_waiting_for_fly_log:
                 return "Arm, press Fly/Log, land, disarm, review the log, then press Next PID Plan Step."
             if self.pid_plan_phase == "final_write":
-                return "Choose final values. The app will verify disarmed state before writing."
-            return "Press Next PID Plan Step and follow the prompt. Write/check values only while disarmed."
+                return "Choose final values, then use the FC / INAV Save button when ready."
+            return "Press Next PID Plan Step and follow the prompt. Values are staged first; Save is the only FC write."
 
         def format_pid_progress_selection() -> str:
             selected_p = (
@@ -1325,8 +1430,8 @@ class ModbusApp:
                 if not retry:
                     return False
 
-        def write_fc_pid_ff_values(target: dict[str, dict[str, int]]) -> None:
-            for axis in ("roll", "pitch", "yaw"):
+        def stage_pid_ff_values(target: dict[str, dict[str, int]]) -> None:
+            for axis in ("roll", "pitch"):
                 gains = target.get(axis)
                 if not gains:
                     continue
@@ -1334,12 +1439,7 @@ class ModbusApp:
                     value = int(gains[gain])
                     if value < 0 or value > 255:
                         raise RuntimeError(f"{axis.title()} {gain.upper()} target {value} is outside 0-255.")
-                    setting_name = FF_SETTING_NAME[axis] if gain == "ff" else PID_SETTING_NAME[(axis, gain)]
-                    confirmed = int(self.fc_service.set_setting_int(setting_name, value, timeout_seconds=1.2))
-                    if confirmed != value:
-                        raise RuntimeError(
-                            f"{axis.title()} {gain.upper()} write verified as {confirmed}, expected {value}."
-                        )
+                    set_pid_ff_var(axis, gain, value)
 
         def roll_pitch_target(
             roll_p: int,
@@ -1513,14 +1613,14 @@ class ModbusApp:
                     self.pid_plan.start_p["pitch"],
                     start_d,
                     start_d,
-                    0,
-                    0,
+                    self.pid_plan.start_i["roll"],
+                    self.pid_plan.start_i["pitch"],
                     0,
                     0,
                 )
                 return (
                     "Safe start / first D log",
-                    "This writes the safe starting P values with I = 0, FF = 0, and the first D value.",
+                    f"This writes safe starting P values with Roll I {self.pid_plan.start_i['roll']}, Pitch I {self.pid_plan.start_i['pitch']}, FF = 0, and the first D value.",
                     target,
                 )
 
@@ -1534,8 +1634,8 @@ class ModbusApp:
                     self.pid_plan.start_p["pitch"],
                     d_value,
                     d_value,
-                    0,
-                    0,
+                    self.pid_plan.start_i["roll"],
+                    self.pid_plan.start_i["pitch"],
                     0,
                     0,
                 )
@@ -1550,8 +1650,8 @@ class ModbusApp:
                     self.pid_plan.start_p["pitch"],
                     d_value,
                     d_value,
-                    0,
-                    0,
+                    self.pid_plan.start_i["roll"],
+                    self.pid_plan.start_i["pitch"],
                     0,
                     0,
                 )
@@ -1564,7 +1664,16 @@ class ModbusApp:
                 if self.pid_plan_index >= len(candidates):
                     return None
                 row = candidates[self.pid_plan_index]
-                target = roll_pitch_target(row["roll"], row["pitch"], self.pid_plan_selected_d, self.pid_plan_selected_d, 0, 0, 0, 0)
+                target = roll_pitch_target(
+                    row["roll"],
+                    row["pitch"],
+                    self.pid_plan_selected_d,
+                    self.pid_plan_selected_d,
+                    self.pid_plan.start_i["roll"],
+                    self.pid_plan.start_i["pitch"],
+                    0,
+                    0,
+                )
                 return (
                     f"P sweep {self.pid_plan_index + 1}/{len(candidates)}",
                     f"Log Roll P {row['roll']} and Pitch P {row['pitch']} with D {self.pid_plan_selected_d}.",
@@ -1583,8 +1692,8 @@ class ModbusApp:
                     self.pid_plan_selected_p["pitch"],
                     d_value,
                     d_value,
-                    0,
-                    0,
+                    self.pid_plan.start_i["roll"],
+                    self.pid_plan.start_i["pitch"],
                     0,
                     0,
                 )
@@ -1667,33 +1776,27 @@ class ModbusApp:
                 self.pid_plan_selected_ff["roll"],
                 self.pid_plan_selected_ff["pitch"],
             )
-            with_yaw = dict(roll_pitch)
-            with_yaw["yaw"] = dict(self.pid_plan.yaw_final_pid_ff)
             current = read_fc_pid_ff_values()
-            set_pid_plan_report_text(self.pid_plan, "PID plan final write", with_yaw, current)
+            set_pid_plan_report_text(self.pid_plan, "PID plan final values", roll_pitch, current)
             prompt = (
                 "The roll/pitch sweeps are complete.\n\n"
-                "DISARM before writing final PID/FF values. The app will verify disarmed state before writing.\n\n"
-                "Yes: write chosen roll/pitch values and the conservative yaw recommendation while disarmed.\n"
-                "No: write chosen roll/pitch values only while disarmed.\n"
-                "Cancel: stop without writing final values.\n\n"
+                "Yes: stage the chosen roll/pitch values in the FC / INAV PID boxes.\n"
+                "No: leave the current boxes unchanged and mark the plan complete.\n"
+                "Cancel: stop without staging final values.\n\n"
+                "Use the FC / INAV Save button to write and save staged values to the flight controller.\n\n"
                 "Current vs target:\n"
-                f"{format_pid_target_check(current, with_yaw)}"
+                f"{format_pid_target_check(current, roll_pitch)}"
             )
             choice = messagebox.askyesnocancel("PID Plan Final Values", prompt, parent=self.root)
             if choice is None:
-                complete_pid_tuning_plan("PID tuning plan stopped before final write.")
+                complete_pid_tuning_plan("PID tuning plan stopped before final values were staged.")
                 return
-            if not ensure_disarmed_before_pid_write():
-                self.status.set("PID final write canceled; disarm before writing values.")
-                update_pid_progress_window()
-                return
-            write_fc_pid_ff_values(with_yaw if choice else roll_pitch)
-            refresh_pid_ff_from_fc(update_status=False)
+            if choice:
+                stage_pid_ff_values(roll_pitch)
             complete_pid_tuning_plan("PID tuning plan complete.")
             messagebox.showinfo(
                 "PID Plan Complete",
-                "Final selected values were written. Review and save in INAV only when you are satisfied.",
+                "Final selected roll/pitch values are staged in the PID boxes. Press Save in the FC / INAV section to write and save them.",
                 parent=self.root,
             )
 
@@ -1731,14 +1834,9 @@ class ModbusApp:
             update_pid_progress_window()
             if self.pid_plan_phase == "safe_start":
                 set_pid_plan_report_text(self.pid_plan, f"PID plan step: {title}", target)
-                if not ensure_disarmed_before_pid_write():
-                    self.status.set("Safe-start PID write waiting; disarm the drone before starting the plan.")
-                    update_pid_progress_window()
-                    return
                 current = read_fc_pid_ff_values(tuple(target.keys()))
                 set_pid_plan_report_text(self.pid_plan, f"PID plan step: {title}", target, current)
-                write_fc_pid_ff_values(target)
-                refresh_pid_ff_from_fc(update_status=False)
+                stage_pid_ff_values(target)
                 advance_pid_plan_after_step()
                 self.pid_plan_waiting_for_fly_log = True
                 self.pid_plan_current_candidate_title = title
@@ -1746,20 +1844,16 @@ class ModbusApp:
                 self.pid_plan_current_candidate_target = target
                 self.auto_session_button.config(text="Next PID Plan Step", state="normal")
                 refresh_fly_log_button_state()
-                self.status.set("Safe-start PID/FF values written while disarmed.")
+                self.status.set("Safe-start PID/FF values staged. Press Save before Fly/Log.")
                 update_pid_progress_window()
                 messagebox.showinfo(
                     "Safe Start Ready",
-                    "Safe-start PID/FF values were written while the drone was disarmed.\n\n"
-                    "Now arm the drone, press Fly/Log, then disarm the drone before pressing Next PID Plan Step.",
+                    "Safe-start PID/FF values are staged in the FC / INAV boxes.\n\n"
+                    "Press Save while disarmed, then arm the drone, press Fly/Log, and disarm before pressing Next PID Plan Step.",
                     parent=self.root,
                 )
                 return
 
-            if not ensure_disarmed_before_pid_write():
-                self.status.set("PID plan paused; disarm the drone before moving to the next candidate.")
-                update_pid_progress_window()
-                return
             current = read_fc_pid_ff_values(tuple(target.keys()))
             set_pid_plan_report_text(self.pid_plan, f"PID plan step: {title}", target, current)
             prompt = (
@@ -1767,11 +1861,12 @@ class ModbusApp:
                 f"{instruction}\n\n"
                 "Required sequence for this candidate:\n"
                 "1. DISARM the drone.\n"
-                "2. Write/check these PID/FF values only while disarmed.\n"
-                "3. Arm, then press Fly/Log for this candidate.\n"
-                "4. Land and DISARM before pressing Next PID Plan Step.\n\n"
-                "Yes: write these target values now after the app confirms the FC is disarmed.\n"
-                "No: skip this write and mark the step done.\n"
+                "2. Stage these PID/FF values into the FC / INAV boxes.\n"
+                "3. Press Save in the FC / INAV section while disarmed.\n"
+                "4. Arm, then press Fly/Log for this candidate.\n"
+                "5. Land and DISARM before pressing Next PID Plan Step.\n\n"
+                "Yes: stage these target values in the boxes.\n"
+                "No: skip this step and mark it done.\n"
                 "Cancel: stop the guided PID plan.\n\n"
                 "Current vs target:\n"
                 f"{format_pid_target_check(current, target)}"
@@ -1781,17 +1876,12 @@ class ModbusApp:
                 complete_pid_tuning_plan("PID tuning plan stopped by user.")
                 return
             if choice:
-                if not ensure_disarmed_before_pid_write():
-                    self.status.set("PID write canceled; disarm before writing values.")
-                    update_pid_progress_window()
-                    return
-                write_fc_pid_ff_values(target)
-                refresh_pid_ff_from_fc(update_status=False)
+                stage_pid_ff_values(target)
                 self.pid_plan_waiting_for_fly_log = True
                 self.pid_plan_current_candidate_title = title
                 self.pid_plan_current_candidate_phase = step_phase
                 self.pid_plan_current_candidate_target = target
-                self.status.set(f"PID plan step written: {title}")
+                self.status.set(f"PID plan step staged: {title}. Press Save before Fly/Log.")
             else:
                 self.pid_plan_waiting_for_fly_log = False
                 self.pid_plan_current_candidate_title = ""
@@ -1806,7 +1896,7 @@ class ModbusApp:
                 "PID Plan Step Ready",
                 (
                     "Values are ready for this candidate.\n\n"
-                    "Now arm the drone, press Fly/Log, then disarm the drone before pressing Next PID Plan Step."
+                    "Press Save while disarmed, then arm the drone, press Fly/Log, and disarm before pressing Next PID Plan Step."
                     if choice
                     else "This candidate was skipped. Press Next PID Plan Step when ready for the next candidate."
                 ),
@@ -2103,6 +2193,8 @@ class ModbusApp:
             self.auto_hold_end_requested = False
             self.auto_settle_until_s = None
             self.auto_active_command = None
+            self.auto_recovery_mode = False
+            self.auto_stop_after_recovery = False
 
         def set_auto_button_idle() -> None:
             self.auto_session_button.config(text="Start Auto Session", state="normal")
@@ -2145,13 +2237,13 @@ class ModbusApp:
             prompt = (
                 "Confirm preflight:\n"
                 "- FC is connected and attitude telemetry is live\n"
-                "- Drone is disarmed before any PID/FF write\n"
-                "- You will write/check values only while disarmed\n"
+                "- Drone is disarmed before pressing Save for PID/FF values\n"
+                "- Guided plan steps only stage PID/FF values in the boxes\n"
                 "- You are ready to arm and press Fly/Log for one candidate at a time\n"
                 "- You will land and disarm before pressing Next PID Plan Step\n\n"
                 "The app will load pid_tuning_plan.txt, compare the current FC PID/FF values "
-                "to the next plan target, and ask before writing each step.\n\n"
-                "It will not run randomized stick pulses and it will not save final values automatically.\n\n"
+                "to the next plan target, and ask before staging each step in the PID boxes.\n\n"
+                "It will not run randomized stick pulses and it will not write or save PID/FF values automatically.\n\n"
                 "Start guided PID tuning plan now?"
             )
             if not messagebox.askyesno("Start Auto Session", prompt):
@@ -2273,15 +2365,29 @@ class ModbusApp:
 
             abort, abort_reason = self.auto_controller.should_abort(sample.roll_deg, sample.pitch_deg)
             if abort:
-                auto_abort(abort_reason, continue_pipeline=not self.pid_plan_fly_log_active)
-                return
+                self.auto_recovery_mode = True
+                self.auto_stop_after_recovery = True
+                set_auto_state(AdaptiveSessionState.recovery, f"{abort_reason} Recovering toward center.")
+                if self.auto_pulse_inflight and self.auto_active_command is not None:
+                    request_auto_angle_hold_end(self.auto_active_command)
+                    schedule_auto_tick()
+                    return
 
             if self.auto_controller.should_recover(sample.roll_deg, sample.pitch_deg):
                 self.auto_recovery_mode = True
                 set_auto_state(AdaptiveSessionState.recovery, "Recovery mode")
             elif self.auto_recovery_mode and self.auto_controller.recovery_complete(sample.roll_deg, sample.pitch_deg):
                 self.auto_recovery_mode = False
+                if self.auto_stop_after_recovery:
+                    self.auto_stop_after_recovery = False
+                    auto_abort("Auto session stopped after recovering from hard safety limit.", continue_pipeline=False)
+                    return
                 set_auto_state(AdaptiveSessionState.adaptive_run, "Active")
+
+            if self.auto_recovery_mode and not self.auto_pulse_inflight:
+                self.auto_active_command = None
+                self.auto_hold_end_requested = False
+                self.auto_settle_until_s = None
 
             if self.auto_pulse_inflight:
                 schedule_auto_tick()
@@ -2474,7 +2580,7 @@ class ModbusApp:
                 "has movement to log.\n\n"
                 "The app will first let the throttle settle briefly, then channel 8 will switch "
                 "high as the beeper log marker. Channel 8 switches low when Fly/Log completes "
-                "or aborts.\n\n"
+                "or is canceled.\n\n"
                 "No PID/FF values will be written while armed.\n\n"
                 "Keep the drone secured, keep the area clear, and be ready to disarm."
             )
@@ -2493,10 +2599,12 @@ class ModbusApp:
             self.auto_last_tick_s = self.auto_session_start_s
             self.auto_last_sample_s = self.auto_session_start_s
             self.pid_plan_fly_log_active = True
+            self.auto_stop_after_recovery = False
             set_auto_state(AdaptiveSessionState.adaptive_run, "Fly/Log active")
             throttle_prepared = prepare_auto_throttle(send_update=False)
             self.beeper_marker_active = False
-            self.auto_session_button.config(text="Abort Fly/Log", state="normal")
+            self.auto_session_button.config(text="Fly/Log Active", state="disabled")
+            self.cancel_auto_session_button.config(state="normal")
             refresh_fly_log_button_state()
             spinup_delay_s = BEEPER_MARKER_SPINUP_DELAY_MS / 1000.0
             self.status.set(f"Preparing Fly/Log outputs. CH8 marker starts after {spinup_delay_s:.1f}s spin-up.")
@@ -2564,16 +2672,13 @@ class ModbusApp:
         def do_pid_plan_fly_log_toggle() -> None:
             try:
                 if self.sim_fly_log_active:
-                    stop_simulated_auto_session("Simulated Fly/Log stopped.", restore_display=False)
+                    self.status.set("Use Cancel Auto Session to stop simulated Fly/Log.")
                     return
                 if self.sim_plan is not None and self.sim_waiting_for_fly_log:
                     start_simulated_fly_log()
                     return
                 if self.pid_plan_fly_log_active:
-                    auto_abort("Fly/Log aborted by user.", continue_pipeline=False)
-                    self.pid_plan_fly_log_active = False
-                    refresh_fly_log_button_state()
-                    update_pid_progress_window()
+                    self.status.set("Use Cancel Auto Session to stop Fly/Log.")
                     return
                 start_pid_plan_fly_log()
             except Exception as exc:
@@ -2640,23 +2745,50 @@ class ModbusApp:
 
             add(
                 "Safe start / first D log",
-                "Start P with I = 0, FF = 0, and the first D value.",
+                f"Start P with Roll I {plan.start_i['roll']}, Pitch I {plan.start_i['pitch']}, FF = 0, and the first D value.",
                 "d",
-                roll_pitch_target(plan.start_p["roll"], plan.start_p["pitch"], start_d, start_d, 0, 0, 0, 0),
+                roll_pitch_target(
+                    plan.start_p["roll"],
+                    plan.start_p["pitch"],
+                    start_d,
+                    start_d,
+                    plan.start_i["roll"],
+                    plan.start_i["pitch"],
+                    0,
+                    0,
+                ),
             )
             for index, d_value in enumerate(plan.d_sweep[1:], start=2):
                 add(
                     f"D sweep {index}/{len(plan.d_sweep)}",
                     f"Compare damping with Roll/Pitch D {d_value}.",
                     "d",
-                    roll_pitch_target(plan.start_p["roll"], plan.start_p["pitch"], int(d_value), int(d_value), 0, 0, 0, 0),
+                    roll_pitch_target(
+                        plan.start_p["roll"],
+                        plan.start_p["pitch"],
+                        int(d_value),
+                        int(d_value),
+                        plan.start_i["roll"],
+                        plan.start_i["pitch"],
+                        0,
+                        0,
+                    ),
                 )
             if plan.optional_d is not None and plan.optional_d not in plan.d_sweep:
                 add(
                     "Optional D sweep",
                     f"Optional comparison at Roll/Pitch D {plan.optional_d}.",
                     "d",
-                    roll_pitch_target(plan.start_p["roll"], plan.start_p["pitch"], int(plan.optional_d), int(plan.optional_d), 0, 0, 0, 0),
+                    roll_pitch_target(
+                        plan.start_p["roll"],
+                        plan.start_p["pitch"],
+                        int(plan.optional_d),
+                        int(plan.optional_d),
+                        plan.start_i["roll"],
+                        plan.start_i["pitch"],
+                        0,
+                        0,
+                    ),
                     "Real tuning should only run this if needed and motors stay cool.",
                 )
             for index, row in enumerate(pid_plan_p_candidates_for(plan), start=1):
@@ -2664,7 +2796,16 @@ class ModbusApp:
                     f"P sweep {index}/{len(pid_plan_p_candidates_for(plan))}",
                     f"Compare tracking with Roll P {row['roll']} and Pitch P {row['pitch']}.",
                     "p",
-                    roll_pitch_target(row["roll"], row["pitch"], preview_d, preview_d, 0, 0, 0, 0),
+                    roll_pitch_target(
+                        row["roll"],
+                        row["pitch"],
+                        preview_d,
+                        preview_d,
+                        plan.start_i["roll"],
+                        plan.start_i["pitch"],
+                        0,
+                        0,
+                    ),
                     f"Simulation uses preview D {preview_d}; real tuning uses the D you choose from logs.",
                 )
             for index, d_value in enumerate(simulated_d_recheck_values(preview_d), start=1):
@@ -2672,7 +2813,16 @@ class ModbusApp:
                     f"D re-check {index}/3",
                     f"Re-check damping with chosen P and Roll/Pitch D {d_value}.",
                     "d",
-                    roll_pitch_target(preview_p["roll"], preview_p["pitch"], d_value, d_value, 0, 0, 0, 0),
+                    roll_pitch_target(
+                        preview_p["roll"],
+                        preview_p["pitch"],
+                        d_value,
+                        d_value,
+                        plan.start_i["roll"],
+                        plan.start_i["pitch"],
+                        0,
+                        0,
+                    ),
                     f"Simulation uses preview P {preview_p['roll']}/{preview_p['pitch']}.",
                 )
             for index, row in enumerate(plan.i_sweep, start=1):
@@ -2805,11 +2955,11 @@ class ModbusApp:
                 "",
                 str(step["instruction"]),
                 "",
-                "Hardware is intentionally disconnected for simulation. These values are written only to the UI PID boxes.",
+                "Hardware is intentionally disconnected for simulation. These values are staged only in the UI PID boxes.",
                 "",
                 "Real-world sequence for this step:",
-                "1. Disarm before writing/checking these PID/FF values.",
-                "2. Write values only while disarmed.",
+                "1. Disarm before saving these PID/FF values.",
+                "2. Press Save in the FC / INAV section only while disarmed.",
                 "3. Arm, then press Fly/Log for the candidate.",
                 "4. Land and disarm before moving to the next plan step.",
                 "",
@@ -2945,8 +3095,8 @@ class ModbusApp:
 
         def do_simulated_auto_session_toggle() -> None:
             try:
-                if self.sim_active:
-                    stop_simulated_auto_session("Simulation stopped.")
+                if self.sim_active or self.sim_fly_log_active:
+                    self.status.set("Use Cancel Auto Session to stop the simulation.")
                     return
                 if self.sim_waiting_for_fly_log:
                     messagebox.showinfo(
@@ -2968,14 +3118,15 @@ class ModbusApp:
             try:
                 if simulation_mode_enabled():
                     if auto_is_running():
-                        auto_abort("Auto session aborted by user.", continue_pipeline=not self.pid_plan_fly_log_active)
+                        self.status.set("Use Cancel Auto Session to stop the active run.")
                         return
                     do_simulated_auto_session_toggle()
                     return
                 if self.sim_active:
-                    stop_simulated_auto_session("Simulation stopped.", clear_walkthrough=True)
+                    self.status.set("Use Cancel Auto Session to stop the simulation.")
+                    return
                 if auto_is_running():
-                    auto_abort("Auto session aborted by user.", continue_pipeline=not self.pid_plan_fly_log_active)
+                    self.status.set("Use Cancel Auto Session to stop the active run.")
                     return
                 if self.auto_state == AdaptiveSessionState.import_analyze:
                     self.status.set("Auto pipeline is running; wait for completion.")
@@ -2987,6 +3138,41 @@ class ModbusApp:
                 start_auto_session()
             except Exception as exc:
                 set_error("Auto session error", exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
+
+        def auto_session_cancel_available() -> bool:
+            runtime_cancelable = auto_is_running() and self.auto_state != AdaptiveSessionState.import_analyze
+            return (
+                runtime_cancelable
+                or self.pid_plan_active
+                or self.sim_active
+                or self.sim_fly_log_active
+                or self.sim_waiting_for_fly_log
+                or self.sim_plan is not None
+            )
+
+        def do_cancel_auto_session() -> None:
+            try:
+                canceled = False
+                if auto_is_running() and self.auto_state != AdaptiveSessionState.import_analyze:
+                    complete_auto_session(AdaptiveSessionState.aborted, "Canceled by user.")
+                    self.pid_plan_fly_log_active = False
+                    refresh_fly_log_button_state()
+                    set_auto_button_idle()
+                    self.status.set("Auto session canceled.")
+                    canceled = True
+                if self.pid_plan_active:
+                    self.pid_plan_fly_log_active = False
+                    complete_pid_tuning_plan("PID tuning plan canceled by user.")
+                    canceled = True
+                if self.sim_active or self.sim_fly_log_active or self.sim_waiting_for_fly_log or self.sim_plan is not None:
+                    stop_simulated_auto_session("Simulation canceled.", restore_display=True, clear_walkthrough=True)
+                    canceled = True
+                if not canceled:
+                    self.status.set("No auto session is active.")
+                update_link_indicators()
+                update_pid_progress_window()
+            except Exception as exc:
+                set_error("Cancel auto session error", exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
 
         def on_simulation_mode_changed() -> None:
             try:
@@ -3045,6 +3231,9 @@ class ModbusApp:
                 )
             if sim_mode:
                 self.connect_fc_button.config(state="disabled")
+            pid_save_state = "normal" if fc_connected and not sim_mode else "disabled"
+            self.load_pid_ff_button.config(state=pid_save_state)
+            self.save_pid_ff_button.config(state=pid_save_state)
             arduino_connected = self.controller.is_connected
             if self.start_pending:
                 self.arduino_button.config(
@@ -3087,10 +3276,13 @@ class ModbusApp:
             if self.auto_state == AdaptiveSessionState.import_analyze:
                 self.auto_session_button.config(text="Running Analysis...", state="disabled")
             elif auto_is_running():
-                self.auto_session_button.config(text="Abort Fly/Log" if self.pid_plan_fly_log_active else "Abort Auto Session", state="normal")
+                self.auto_session_button.config(
+                    text="Fly/Log Active" if self.pid_plan_fly_log_active else "Auto Session Active",
+                    state="disabled",
+                )
             elif sim_mode:
                 if self.sim_active or self.sim_fly_log_active:
-                    self.auto_session_button.config(text="Stop Simulation", state="normal")
+                    self.auto_session_button.config(text="Simulation Active", state="disabled")
                 elif self.sim_waiting_for_fly_log:
                     self.auto_session_button.config(text="Next Sim Step", state="disabled")
                 elif self.sim_plan is not None and self.sim_plan_step_index < len(self.sim_plan_steps):
@@ -3101,6 +3293,9 @@ class ModbusApp:
                 self.auto_session_button.config(text="Next PID Plan Step", state="normal")
             else:
                 self.auto_session_button.config(text="Start Auto Session", state="normal")
+            self.cancel_auto_session_button.config(
+                state="normal" if auto_session_cancel_available() else "disabled"
+            )
             refresh_fly_log_button_state()
 
         def cancel_level_timer() -> None:
@@ -3545,6 +3740,9 @@ class ModbusApp:
         self.fly_log_button.config(command=do_pid_plan_fly_log_toggle)
         self.simulation_mode_checkbutton.config(command=on_simulation_mode_changed)
         self.pid_progress_button.config(command=open_pid_progress_window)
+        self.cancel_auto_session_button.config(command=do_cancel_auto_session)
+        self.load_pid_ff_button.config(command=do_load_pid_ff_from_fc)
+        self.save_pid_ff_button.config(command=do_save_pid_ff_to_fc)
         self.step_response_button.config(command=do_step_response_report)
         self.pid_tuning_plan_button.config(command=do_pid_tuning_plan)
         self.arduino_button.config(command=do_arduino_toggle)

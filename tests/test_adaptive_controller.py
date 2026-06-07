@@ -68,7 +68,23 @@ class AdaptiveControllerTests(unittest.TestCase):
         self.assertTrue(abort)
         self.assertIn("Hard safety limit", reason)
 
+    def test_recovery_starts_before_hard_limit_and_completes_near_center(self) -> None:
+        self.assertTrue(self.controller.should_recover(0.0, -12.0))
+        self.assertFalse(self.controller.recovery_complete(0.0, -12.0))
+        self.assertTrue(self.controller.recovery_complete(2.0, -3.0))
+
+    def test_recovery_command_points_toward_center_on_largest_axis(self) -> None:
+        command = self.controller.next_command(roll_deg=6.0, pitch_deg=30.0, recovery_mode=True)
+
+        self.assertIsNotNone(command)
+        self.assertTrue(command.recovery)
+        self.assertEqual("pitch", command.axis)
+        self.assertEqual(-1, command.direction)
+        self.assertLessEqual(command.force_us, self.cfg.recovery_force_us)
+
     def test_initial_throttle_applies_floor_and_cap(self) -> None:
+        self.assertEqual(1260, self.cfg.throttle_start_us)
+
         target, reason = self.controller.initial_throttle(1200)
         self.assertEqual(self.cfg.throttle_start_us, target)
         self.assertIn("floor", reason)

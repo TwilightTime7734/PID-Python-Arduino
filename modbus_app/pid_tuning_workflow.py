@@ -12,6 +12,7 @@ from .constants import PID_PLAN_FLY_LOG_RUNTIME_S
 
 TUNED_AXES = ("roll", "pitch")
 START_P_DEFAULTS = {"roll": 45, "pitch": 47, "yaw": 45}
+START_I_DEFAULTS = {"roll": 30, "pitch": 35}
 D_SWEEP_VALUES = (17, 23, 30, 36, 42)
 OPTIONAL_D_VALUE = None
 I_SWEEP_VALUES = (
@@ -66,6 +67,7 @@ class PStartRecommendation:
     """Starting P values and the generated supervised tuning workflow."""
 
     start_p: dict[str, int]
+    start_i: dict[str, int]
     p_sweep: dict[str, tuple[int, ...]]
     yaw_final_pid_ff: dict[str, int]
     notes: tuple[str, ...]
@@ -85,6 +87,7 @@ class LoadedPIDTuningPlan:
     summary_json: str | None
     text: str
     start_p: dict[str, int]
+    start_i: dict[str, int]
     p_sweep: dict[str, tuple[int, ...]]
     yaw_final_pid_ff: dict[str, int]
     d_sweep: tuple[int, ...]
@@ -181,6 +184,7 @@ def suggest_starting_p(inputs: PStartInputs) -> PStartRecommendation:
 
     return PStartRecommendation(
         start_p=start_p,
+        start_i=dict(START_I_DEFAULTS),
         p_sweep=p_sweep,
         yaw_final_pid_ff=yaw_final,
         notes=tuple(dict.fromkeys(notes)),
@@ -192,6 +196,7 @@ def format_pid_tuning_plan(recommendation: PStartRecommendation) -> str:
     """Format the supervised D/P/D/I/FF plan as plain text."""
 
     start_p = recommendation.start_p
+    start_i = recommendation.start_i
     p_sweep = recommendation.p_sweep
     yaw = recommendation.yaw_final_pid_ff
     start_d = D_SWEEP_VALUES[0]
@@ -213,8 +218,8 @@ def format_pid_tuning_plan(recommendation: PStartRecommendation) -> str:
         "- Keep battery fresh.",
         "",
         "Safe starting point to set the PID/FF before starting auto run.",
-        f"- Roll:  P {start_p['roll']}, D {start_d}, I 0, FF 0",
-        f"- Pitch: P {start_p['pitch']}, D {start_d}, I 0, FF 0",
+        f"- Roll:  P {start_p['roll']}, D {start_d}, I {start_i['roll']}, FF 0",
+        f"- Pitch: P {start_p['pitch']}, D {start_d}, I {start_i['pitch']}, FF 0",
         f"- Yaw:   P {yaw['p']}, D {yaw['d']:2d}, I 0, FF 0",
         "",
         "D tuning, roll/pitch only",
@@ -342,6 +347,7 @@ def load_pid_tuning_plan(plan_text_path: str | Path) -> LoadedPIDTuningPlan:
             summary_json=str(summary_path),
             text=text,
             start_p=_int_dict(payload.get("start_p", {}), ("roll", "pitch")),
+            start_i=_int_dict(payload.get("start_i", START_I_DEFAULTS), ("roll", "pitch")),
             p_sweep=_tuple_map(payload.get("p_sweep", {}), ("roll", "pitch")),
             yaw_final_pid_ff=_int_dict(payload.get("yaw_final_pid_ff", {}), ("p", "i", "d", "ff")),
             d_sweep=tuple(int(value) for value in workflow.get("d_sweep", D_SWEEP_VALUES)),
@@ -409,6 +415,10 @@ def _load_pid_tuning_plan_from_text(text_path: Path, text: str) -> LoadedPIDTuni
         start_p={
             "roll": roll_start[0] if roll_start else START_P_DEFAULTS["roll"],
             "pitch": pitch_start[0] if pitch_start else START_P_DEFAULTS["pitch"],
+        },
+        start_i={
+            "roll": roll_start[2] if len(roll_start) >= 3 else START_I_DEFAULTS["roll"],
+            "pitch": pitch_start[2] if len(pitch_start) >= 3 else START_I_DEFAULTS["pitch"],
         },
         p_sweep={
             "roll": tuple(roll_p) if roll_p else _p_sweep(START_P_DEFAULTS["roll"]),

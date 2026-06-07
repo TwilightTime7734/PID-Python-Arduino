@@ -26,28 +26,31 @@ class AdaptiveSessionConfig:
     soft_limit_deg: float = 35.0
     hard_limit_deg: float = 45.0
     safety_margin_deg: float = 2.0
-    recovery_entry_deg: float = 43.0
-    recovery_exit_deg: float = 20.0
+    recovery_entry_deg: float = 10.0
+    recovery_exit_deg: float = 4.0
     telemetry_stale_s: float = 1.0
     control_interval_s: float = 0.070
     settle_deadband_deg: float = 2.5
     force_min_us: int = 100
-    force_max_us: int = 425
+    force_max_us: int = 220
+    recovery_force_us: int = 180
     hold_min_s: float = 0.25
-    hold_max_s: float = 0.65
-    roll_force_us: int = 425
-    pitch_force_us: int = 425
-    roll_hold_s: float = 0.45
-    pitch_hold_s: float = 0.35
-    roll_target_peak_deg: float = 25.0
-    pitch_target_peak_deg: float = 25.0
-    settle_max_s: float = 0.85
+    hold_max_s: float = 0.35
+    recovery_hold_s: float = 0.18
+    roll_force_us: int = 220
+    pitch_force_us: int = 220
+    roll_hold_s: float = 0.25
+    pitch_hold_s: float = 0.22
+    roll_target_peak_deg: float = 12.0
+    pitch_target_peak_deg: float = 12.0
+    settle_max_s: float = 0.45
+    recovery_settle_s: float = 0.05
     max_runtime_s: float = 60.0
-    target_peak_min_deg: float = 8.0
-    target_peak_max_deg: float = 25.0
+    target_peak_min_deg: float = 4.0
+    target_peak_max_deg: float = 12.0
     target_valid_events: int = 6
     target_settle_ratio: float = 0.80
-    throttle_start_us: int = 1350
+    throttle_start_us: int = 1260
     throttle_max_us: int = 1600
     throttle_step_us: int = 25
     throttle_boost_peak_deg: float = 4.0
@@ -221,13 +224,22 @@ class AdaptiveExcitationController:
             return True, f"Hard safety limit exceeded (roll={roll_deg:+.1f}, pitch={pitch_deg:+.1f})."
         return False, ""
 
-    def should_recover(self, _roll_deg: float, _pitch_deg: float) -> bool:
-        return False
+    def should_recover(self, roll_deg: float, pitch_deg: float) -> bool:
+        return (
+            abs(float(roll_deg)) >= self.config.recovery_entry_deg
+            or abs(float(pitch_deg)) >= self.config.recovery_entry_deg
+        )
 
-    def recovery_complete(self, _roll_deg: float, _pitch_deg: float) -> bool:
-        return True
+    def recovery_complete(self, roll_deg: float, pitch_deg: float) -> bool:
+        return (
+            abs(float(roll_deg)) <= self.config.recovery_exit_deg
+            and abs(float(pitch_deg)) <= self.config.recovery_exit_deg
+        )
 
     def next_command(self, roll_deg: float, pitch_deg: float, recovery_mode: bool = False) -> AdaptiveCommand | None:
+        if recovery_mode:
+            self._pending_commands.clear()
+            return self._recovery_command(float(roll_deg), float(pitch_deg))
         if not self._pending_commands:
             self._queue_random_cycle(float(roll_deg), float(pitch_deg))
         if not self._pending_commands:
@@ -328,6 +340,32 @@ class AdaptiveExcitationController:
         if current_angle < 0:
             return 1
         return self._rng.choice((-1, 1))
+
+    def _recovery_command(self, roll_deg: float, pitch_deg: float) -> AdaptiveCommand | None:
+        axis = "roll" if abs(roll_deg) >= abs(pitch_deg) else "pitch"
+        angle = roll_deg if axis == "roll" else pitch_deg
+        if abs(angle) <= self.config.recovery_exit_deg:
+            other_axis = "pitch" if axis == "roll" else "roll"
+            other_angle = pitch_deg if axis == "roll" else roll_deg
+            if abs(other_angle) <= self.config.recovery_exit_deg:
+                return None
+            axis = other_axis
+            angle = other_angle
+
+        direction = self._toward_center_direction(angle)
+        force_us = round(abs(angle) * 8.0)
+        force_us = max(self.config.force_min_us, min(int(self.config.recovery_force_us), force_us))
+        target_peak = max(0.0, abs(angle) - self.config.recovery_exit_deg)
+        return AdaptiveCommand(
+            axis=axis,
+            direction=direction,
+            force_us=force_us,
+            hold_s=max(0.05, self.config.recovery_hold_s),
+            settle_s=max(0.0, self.config.recovery_settle_s),
+            recovery=True,
+            reason="attitude recovery",
+            target_peak_deg=target_peak,
+        )
 
     def _predicted_peak_deg(self, axis: str, force_us: int, hold_s: float) -> float:
         base_hold = max(0.05, self.config.axis_hold_s(axis))

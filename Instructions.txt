@@ -1,6 +1,6 @@
 For the Betafpv Pavo Pico 2 start with
-Roll:  P 40, D 17, I 0, FF 0
-Pitch: P 42, D 17, I 0, FF 0
+Roll:  P 40, D 17, I 30, FF 0
+Pitch: P 42, D 17, I 35, FF 0
 Yaw:   leave low/not tested for now
 
 Now sweep upward:
@@ -8,13 +8,13 @@ Roll P: 40, 42, 45, 48
 Pitch P: 42, 44, 47, 50
 
 ```text
-Start with only P & D
-Set I = 0
+Start with P, D, and a conservative baseline I
+Set Roll I = 30 and Pitch I = 35
 Set FF = 0
 
 Start:
-Roll:  P 45, D 17
-Pitch: P 47, D 17
+Roll:  P 45, D 17, I 30
+Pitch: P 47, D 17, I 35
 Yaw:   P 45, D low/0
 
 Keep battery fresh.

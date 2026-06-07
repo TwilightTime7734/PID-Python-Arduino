@@ -114,6 +114,8 @@ class MainUi:
     roll_pidff_vars: list[tk.StringVar]
     pitch_pidff_vars: list[tk.StringVar]
     pid_ff_adjust_canvases: list[tk.Canvas]
+    load_pid_ff_button: tk.Button
+    save_pid_ff_button: tk.Button
     fc_port_entry: tk.Entry | ttk.Combobox
     fc_baud_entry: tk.Entry
     scan_fc_button: tk.Button
@@ -126,6 +128,7 @@ class MainUi:
     simulation_mode_var: tk.BooleanVar
     simulation_mode_checkbutton: tk.Checkbutton
     pid_progress_button: tk.Button
+    cancel_auto_session_button: tk.Button
     auto_report_text: tk.Text
     step_response_button: tk.Button
     pid_tuning_plan_button: tk.Button
@@ -234,8 +237,6 @@ def build_main_gui(root: tk.Tk) -> MainUi:
             width=8,
             textvariable=roll_var,
             justify="left",
-            state="readonly",
-            readonlybackground="#FFFFFF",
         ).grid(row=idx, column=0, padx=(0, 2), pady=1, sticky="w")
         roll_adjust = tk.Canvas(left_metrics_frame, width=32, height=16, bg="#F0F0F0", highlightthickness=0)
         roll_adjust.create_rectangle(1, 1, 16, 15, fill="#C94B4B", outline="")
@@ -249,8 +250,6 @@ def build_main_gui(root: tk.Tk) -> MainUi:
             width=8,
             textvariable=pitch_var,
             justify="left",
-            state="readonly",
-            readonlybackground="#FFFFFF",
         ).grid(row=idx, column=3, padx=(0, 2), pady=1, sticky="w")
         pitch_adjust = tk.Canvas(left_metrics_frame, width=32, height=16, bg="#F0F0F0", highlightthickness=0)
         pitch_adjust.create_rectangle(1, 1, 16, 15, fill="#C94B4B", outline="")
@@ -263,7 +262,14 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         pitch_pidff_vars.append(pitch_var)
         pid_ff_adjust_canvases.extend((roll_adjust, pitch_adjust))
 
-    horizon.grid(row=0, column=2, rowspan=2, columnspan=2, padx=(10, 0), pady=(0, 4), sticky="n")
+    pid_load_save_frame = tk.Frame(fc_frame)
+    pid_load_save_frame.grid(row=0, column=2, rowspan=2, padx=(8, 0), pady=(36, 0), sticky="n")
+    load_pid_ff_button = tk.Button(pid_load_save_frame, text="Load", width=8)
+    load_pid_ff_button.grid(row=0, column=0, pady=(0, 4), sticky="we")
+    save_pid_ff_button = tk.Button(pid_load_save_frame, text="Save", width=8)
+    save_pid_ff_button.grid(row=1, column=0, sticky="we")
+
+    horizon.grid(row=0, column=3, rowspan=2, columnspan=2, padx=(10, 0), pady=(0, 4), sticky="n")
 
     port_fields_frame = tk.Frame(fc_frame)
     port_fields_frame.grid(row=1, column=0, columnspan=2, sticky="nw")
@@ -301,6 +307,8 @@ def build_main_gui(root: tk.Tk) -> MainUi:
     fly_log_button.pack(side="left", padx=(0, 4))
     pid_progress_button = tk.Button(auto_action_frame, text="Progress", width=10)
     pid_progress_button.pack(side="left", padx=(0, 4))
+    cancel_auto_session_button = tk.Button(auto_action_frame, text="Cancel Auto Session", width=18)
+    cancel_auto_session_button.pack(side="left", padx=(0, 4))
     step_response_button = tk.Button(auto_action_frame, text="Chart Step Response", width=18)
     step_response_button.pack(side="left", padx=(0, 4))
     pid_tuning_plan_button = tk.Button(auto_action_frame, text="PID Tuning Plan", width=16)
@@ -336,6 +344,8 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         roll_pidff_vars=roll_pidff_vars,
         pitch_pidff_vars=pitch_pidff_vars,
         pid_ff_adjust_canvases=pid_ff_adjust_canvases,
+        load_pid_ff_button=load_pid_ff_button,
+        save_pid_ff_button=save_pid_ff_button,
         fc_port_entry=fc_port_entry,
         fc_baud_entry=fc_baud_entry,
         scan_fc_button=scan_fc_button,
@@ -348,6 +358,7 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         simulation_mode_var=simulation_mode_var,
         simulation_mode_checkbutton=simulation_mode_checkbutton,
         pid_progress_button=pid_progress_button,
+        cancel_auto_session_button=cancel_auto_session_button,
         auto_report_text=auto_report_text,
         step_response_button=step_response_button,
         pid_tuning_plan_button=pid_tuning_plan_button,

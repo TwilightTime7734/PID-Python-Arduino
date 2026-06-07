@@ -19,12 +19,15 @@ class PIDTuningWorkflowTests(unittest.TestCase):
         recommendation = suggest_starting_p(PStartInputs())
 
         self.assertEqual(recommendation.start_p, {"roll": 45, "pitch": 47})
+        self.assertEqual(recommendation.start_i, {"roll": 30, "pitch": 35})
         self.assertEqual(recommendation.p_sweep["roll"], (40, 45, 50, 55))
         self.assertEqual(recommendation.p_sweep["pitch"], (42, 47, 52, 57))
         self.assertEqual(recommendation.yaw_final_pid_ff, {"p": 45, "i": 60, "d": 0, "ff": 86})
 
         plan = format_pid_tuning_plan(recommendation)
         self.assertIn("D tuning, roll/pitch only", plan)
+        self.assertIn("- Roll:  P 45, D 17, I 30, FF 0", plan)
+        self.assertIn("- Pitch: P 47, D 17, I 35, FF 0", plan)
         self.assertIn("Yaw final recommendation, not tested", plan)
         self.assertNotIn("Yaw P candidates", plan)
         self.assertNotIn("Write values while disarmed", plan)
@@ -80,6 +83,7 @@ class PIDTuningWorkflowTests(unittest.TestCase):
             loaded = load_pid_tuning_plan(report.text_path)
 
             self.assertEqual(loaded.start_p, recommendation.start_p)
+            self.assertEqual(loaded.start_i, {"roll": 30, "pitch": 35})
             self.assertEqual(loaded.p_sweep, recommendation.p_sweep)
             self.assertEqual(loaded.d_sweep, (17, 23, 30, 36, 42))
             self.assertIsNone(loaded.optional_d)

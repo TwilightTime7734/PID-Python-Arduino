@@ -14,6 +14,7 @@ MSP_FC_VARIANT = 2
 MSP_FC_VERSION = 3
 MSP_STATUS = 101
 MSP_ATTITUDE = 108
+MSP_EEPROM_WRITE = 250
 MSP2_COMMON_SETTING = 0x1003
 MSP2_COMMON_SET_SETTING = 0x1004
 MSP2_COMMON_SETTING_INFO = 0x1007
@@ -435,6 +436,9 @@ class InavSerialService:
         info[name_end + 1 : name_end + 1 + value_size] = encoded
         self._request(MSP2_COMMON_SET_SETTING, bytes(info), timeout_s)
         return self.get_setting_int(setting, timeout_seconds=timeout_s)
+
+    def save_settings(self, timeout_seconds: float = 1.2) -> None:
+        self._request(MSP_EEPROM_WRITE, b"", timeout_seconds=max(0.1, timeout_seconds))
 
     def _setting_key_payload(self, index: int) -> bytes:
         # INAV settings API expects setting index in upper 24 bits.
