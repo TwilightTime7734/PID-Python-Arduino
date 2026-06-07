@@ -25,10 +25,6 @@ from serialUSB.inav_serial_service import (
 from .constants import (
     ADJUST_REPEAT_INITIAL_MS,
     ADJUST_REPEAT_INTERVAL_MS,
-    AUX_CHANNEL_OFF_US,
-    BEEPER_MARKER_CHANNEL_INDEX,
-    BEEPER_MARKER_OFF_US,
-    BEEPER_MARKER_ON_US,
     BEEPER_MARKER_SPINUP_DELAY_MS,
     CHANNEL_DEFAULTS,
     FC_DEVICE_ID,
@@ -46,7 +42,6 @@ from .constants import (
     OFFSET_DEFAULTS,
     PITCH_CHANNEL_INDEX,
     PID_PLAN_FLY_LOG_RUNTIME_S,
-    PPM_OUTPUT_CHANNEL_COUNT,
     PORT_DEFAULT,
     PULSE_STATUS_REJECTED,
     REG_QUANT,
@@ -555,20 +550,6 @@ class ModbusApp:
                 except ValueError:
                     values.append(OFFSET_DEFAULTS[i])
             return values
-
-        def ppm_channels_for_firmware(channels: list[int], marker_active: bool) -> list[int]:
-            count = max(PPM_OUTPUT_CHANNEL_COUNT, BEEPER_MARKER_CHANNEL_INDEX + 1, len(channels))
-            output = [AUX_CHANNEL_OFF_US] * count
-            for index, value in enumerate(channels):
-                output[index] = max(1000, min(2000, int(value)))
-            output[BEEPER_MARKER_CHANNEL_INDEX] = BEEPER_MARKER_ON_US if marker_active else BEEPER_MARKER_OFF_US
-            return output
-
-        def ppm_offsets_for_firmware(offsets: list[int], channel_count: int) -> list[int]:
-            output = [0] * channel_count
-            for index, value in enumerate(offsets[:channel_count]):
-                output[index] = int(value)
-            return output
 
         def adjust_channel_value(index: int, delta: int) -> None:
             try:

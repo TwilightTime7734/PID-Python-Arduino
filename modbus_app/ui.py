@@ -177,6 +177,35 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         channel_output_canvases.append(canvas)
         channel_output_fill_ids.append(fill_id)
 
+    main_button_grid = tk.Frame(main_frame)
+    main_button_grid.grid(row=6, column=0, columnspan=5, sticky="we", pady=(6, 0))
+    for col in range(4):
+        main_button_grid.grid_columnconfigure(col, weight=1, uniform="main_buttons")
+
+    main_button_width = 17
+    arduino_button = tk.Button(main_button_grid, text="Connect Arduino", width=main_button_width)
+    arduino_button.grid(row=0, column=0, padx=2, pady=2, sticky="we")
+    connect_fc_button = tk.Button(main_button_grid, text="Connect FC", width=main_button_width)
+    connect_fc_button.grid(row=0, column=1, padx=2, pady=2, sticky="we")
+    scan_fc_button = tk.Button(main_button_grid, text="Scan Ports", width=main_button_width)
+    scan_fc_button.grid(row=0, column=2, padx=2, pady=2, sticky="we")
+    simulation_mode_var = tk.BooleanVar(value=False)
+    simulation_mode_checkbutton = tk.Checkbutton(
+        main_button_grid,
+        text="Simulate",
+        variable=simulation_mode_var,
+        width=main_button_width,
+        anchor="w",
+    )
+    simulation_mode_checkbutton.grid(row=0, column=3, padx=2, pady=2, sticky="we")
+
+    import_blackbox_button = tk.Button(main_button_grid, text="Pull MSC Logs", width=main_button_width)
+    import_blackbox_button.grid(row=1, column=0, padx=2, pady=2, sticky="we")
+    analyze_blackbox_button = tk.Button(main_button_grid, text="Analyze Logs", width=main_button_width)
+    analyze_blackbox_button.grid(row=1, column=1, padx=2, pady=2, sticky="we")
+    level_button = tk.Button(main_button_grid, text="Level", width=main_button_width, state="disabled")
+    level_button.grid(row=1, column=2, padx=2, pady=2, sticky="we")
+
     status = tk.StringVar(value="Idle")
     pc_link_box = tk.Label(main_frame, width=18, relief="groove", bd=2)
 
@@ -258,30 +287,6 @@ def build_main_gui(root: tk.Tk) -> MainUi:
     fc_baud_entry = tk.Entry(port_fields_frame, width=10)
     fc_baud_entry.insert(0, str(FC_BAUD_DEFAULT))
     fc_baud_entry.grid(row=1, column=3, sticky="w", pady=(4, 0))
-
-    fc_button_width = 13
-    arduino_button_width = 18
-    button_row = tk.Frame(fc_frame)
-    button_row.grid(row=2, column=0, columnspan=4, sticky="w", pady=(2, 0))
-    arduino_button = tk.Button(button_row, text="Connect Arduino", width=arduino_button_width)
-    arduino_button.pack(side="left", padx=(0, 2))
-    connect_fc_button = tk.Button(button_row, text="Connect FC", width=fc_button_width)
-    connect_fc_button.pack(side="left", padx=(0, 2))
-    scan_fc_button = tk.Button(button_row, text="Scan Ports", width=10)
-    scan_fc_button.pack(side="left", padx=(0, 2))
-    import_blackbox_button = tk.Button(button_row, text="Pull MSC Logs", width=12)
-    import_blackbox_button.pack(side="left", padx=(0, 2))
-    analyze_blackbox_button = tk.Button(button_row, text="Analyze Logs", width=11)
-    analyze_blackbox_button.pack(side="left", padx=(0, 2))
-    level_button = tk.Button(button_row, text="Level", width=6, state="disabled")
-    level_button.pack(side="left", padx=(0, 6))
-    simulation_mode_var = tk.BooleanVar(value=False)
-    simulation_mode_checkbutton = tk.Checkbutton(
-        button_row,
-        text="Simulate",
-        variable=simulation_mode_var,
-    )
-    simulation_mode_checkbutton.pack(side="left")
 
     auto_frame = tk.LabelFrame(layout_grid, text="Auto Tune Session", padx=8, pady=8)
     auto_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(6, 0))
