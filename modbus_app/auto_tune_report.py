@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import html
 import json
 from dataclasses import dataclass
 from datetime import datetime
@@ -52,10 +53,12 @@ def generate_auto_tune_report(
         roll_trace_viewer_html = build_roll_trace_viewer(csv_path, trace_dir)
     except Exception as exc:
         roll_trace_viewer_warning = str(exc)
+        roll_trace_viewer_html = _write_trace_viewer_fallback(trace_dir, csv_path, "roll", roll_trace_viewer_warning)
     try:
         pitch_trace_viewer_html = build_pitch_trace_viewer(csv_path, trace_dir)
     except Exception as exc:
         pitch_trace_viewer_warning = str(exc)
+        pitch_trace_viewer_html = _write_trace_viewer_fallback(trace_dir, csv_path, "pitch", pitch_trace_viewer_warning)
 
     summary_txt = report_dir / "summary.txt"
     summary_json = report_dir / "summary.json"
@@ -86,6 +89,42 @@ def generate_auto_tune_report(
         combined_chart_sheet=combined_artifact,
         chart_paths=chart_paths,
     )
+
+
+def _write_trace_viewer_fallback(output_dir: Path, csv_path: Path, axis_name: str, warning: str) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    axis_title = axis_name.title()
+    html_path = output_dir / f"{axis_name}_trace_viewer.html"
+    html_path.write_text(
+        "\n".join(
+            [
+                "<!doctype html>",
+                "<html lang=\"en\">",
+                "<head>",
+                "  <meta charset=\"utf-8\">",
+                f"  <title>{html.escape(axis_title)} Trace Viewer Unavailable</title>",
+                "  <style>",
+                "    body { font-family: Segoe UI, Arial, sans-serif; margin: 32px; color: #111827; }",
+                "    .panel { max-width: 900px; border: 1px solid #d1d5db; padding: 18px; }",
+                "    h1 { font-size: 22px; margin: 0 0 12px; }",
+                "    p { line-height: 1.45; }",
+                "    code { background: #f3f4f6; padding: 2px 5px; }",
+                "  </style>",
+                "</head>",
+                "<body>",
+                "  <div class=\"panel\">",
+                f"    <h1>{html.escape(axis_title)} Trace Viewer Unavailable</h1>",
+                f"    <p>CSV: <code>{html.escape(str(csv_path))}</code></p>",
+                f"    <p>Reason: {html.escape(warning)}</p>",
+                "  </div>",
+                "</body>",
+                "</html>",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return html_path
 
 
 def _resolve_csv_path(source_hint: Path) -> Path | None:

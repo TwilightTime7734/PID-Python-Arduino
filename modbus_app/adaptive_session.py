@@ -42,7 +42,6 @@ class AdaptiveSessionConfig:
     roll_target_peak_deg: float = 25.0
     pitch_target_peak_deg: float = 25.0
     settle_max_s: float = 0.85
-    min_runtime_s: float = 60.0
     max_runtime_s: float = 60.0
     target_peak_min_deg: float = 8.0
     target_peak_max_deg: float = 25.0
@@ -146,7 +145,7 @@ class _DirectionCoverage:
 
 
 class AdaptiveExcitationController:
-    """Random roll/pitch excitation bounded by live attitude and a 60-second runtime."""
+    """Random roll/pitch excitation bounded by live attitude and configured runtime."""
 
     def __init__(self, config: AdaptiveSessionConfig | None = None, rng: random.Random | None = None) -> None:
         self.config = config or AdaptiveSessionConfig()
@@ -209,7 +208,12 @@ class AdaptiveExcitationController:
 
     def stop_ready(self, elapsed_s: float) -> tuple[bool, str, str]:
         if elapsed_s >= self.config.max_runtime_s:
-            return True, "Randomized 60-second auto tune complete.", ""
+            runtime_s = max(0.0, float(self.config.max_runtime_s))
+            if abs(runtime_s - round(runtime_s)) < 0.05:
+                duration_text = f"{runtime_s:.0f}-second"
+            else:
+                duration_text = f"{runtime_s:.1f}-second"
+            return True, f"Randomized {duration_text} auto tune complete.", ""
         return False, "", ""
 
     def should_abort(self, roll_deg: float, pitch_deg: float) -> tuple[bool, str]:

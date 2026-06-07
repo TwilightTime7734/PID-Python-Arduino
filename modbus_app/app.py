@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import os
 import math
+from dataclasses import replace
 from pathlib import Path
 import queue
-import shutil
 import time
 import tkinter as tk
 from collections.abc import Callable, Sequence
@@ -26,13 +25,16 @@ from serialUSB.inav_serial_service import (
 from .constants import (
     ADJUST_REPEAT_INITIAL_MS,
     ADJUST_REPEAT_INTERVAL_MS,
+    AUX_CHANNEL_OFF_US,
+    BEEPER_MARKER_CHANNEL_INDEX,
+    BEEPER_MARKER_OFF_US,
+    BEEPER_MARKER_ON_US,
+    BEEPER_MARKER_SPINUP_DELAY_MS,
     CHANNEL_DEFAULTS,
     FC_DEVICE_ID,
     FC_DEVICE_PID,
     FC_DEVICE_VID,
     FC_PORT_DEFAULT,
-    HOLD_ANGLE_CHECK_MS,
-    HOLD_TIMEOUT_POLL_MS,
     LEVEL_CENTER_US,
     LEVEL_DEADBAND_DEG,
     LEVEL_FULL_SCALE_DEG,
@@ -40,16 +42,13 @@ from .constants import (
     LEVEL_MAX_DELTA_US,
     LEVEL_MIN_DELTA_US,
     LEVEL_PULSE_TIMEOUT_S,
-    LEVEL_TIMEOUT_MAX_S,
-    LEVEL_TIMEOUT_MIN_S,
+    LEVEL_TIMEOUT_DEFAULT_S,
     OFFSET_DEFAULTS,
     PITCH_CHANNEL_INDEX,
+    PID_PLAN_FLY_LOG_RUNTIME_S,
+    PPM_OUTPUT_CHANNEL_COUNT,
     PORT_DEFAULT,
-    PULSE_DURATION_DEFAULTS,
-    PULSE_STATUS_HOLD_ENDED,
     PULSE_STATUS_REJECTED,
-    PULSE_STATUS_TIMEOUT_RESTORED,
-    PULSE_TARGET_DEFAULTS,
     REG_QUANT,
     ROLL_CHANNEL_INDEX,
     THROTTLE_CHANNEL_INDEX,
@@ -60,7 +59,6 @@ from .serial_protocol import (
     read_pulse_status_on_serial,
     read_regs,
     run_ppm_on_serial,
-    set_channel_with_human_profile_until_stop_on_serial,
     set_channel_until_stop_on_serial,
     stop_ppm_on_serial,
 )
@@ -98,7 +96,6 @@ from .step_response_report import (
 from .ui import (
     build_main_gui,
     parse_entries,
-    require_duration_range,
     require_range,
 )
 from .worker import SerialWorker
@@ -109,15 +106,10 @@ def main() -> None:
     ui = build_main_gui(root)
     port_entry = ui.port_entry
     channel_adjust_canvases = ui.channel_adjust_canvases
-    target_adjust_canvases = ui.target_adjust_canvases
     ch_entries = ui.ch_entries
     off_entries = ui.off_entries
-    target_entries = ui.target_entries
-    dur_entries = ui.dur_entries
-    angle_entries = ui.angle_entries
     channel_output_canvases = ui.channel_output_canvases
     channel_output_fill_ids = ui.channel_output_fill_ids
-    hold_send_canvases = ui.hold_send_canvases
     level_button = ui.level_button
     status = ui.status
     pc_link_box = ui.pc_link_box
@@ -136,12 +128,10 @@ def main() -> None:
     arduino_button = ui.arduino_button
     auto_session_button = ui.auto_session_button
     auto_report_text = ui.auto_report_text
-    auto_report_listbox = ui.auto_report_listbox
-    auto_open_selected_button = ui.auto_open_selected_button
-    auto_open_all_button = ui.auto_open_all_button
-    auto_clear_reports_button = ui.auto_clear_reports_button
     fly_log_button = ui.fly_log_button
-    simulate_auto_session_button = ui.simulate_auto_session_button
+    simulation_mode_var = ui.simulation_mode_var
+    simulation_mode_checkbutton = ui.simulation_mode_checkbutton
+    pid_progress_button = ui.pid_progress_button
     step_response_button = ui.step_response_button
     pid_tuning_plan_button = ui.pid_tuning_plan_button
 
@@ -152,17 +142,17 @@ def main() -> None:
     run_ser: serial.Serial | None = None
     run_quant: int | None = None
     run_max_count: int | None = None
-    hold_timeout_after_id: str | None = None
-    hold_command_inflight = False
     channel_update_inflight = False
     pending_channel_update_channels: list[int] | None = None
     pending_channel_update_offsets: list[int] | None = None
+    pending_channel_update_after: Callable[[bool, object], None] | None = None
     adjust_repeat_after_id: str | None = None
     adjust_repeat_handler: Callable[[int, int], None] | None = None
     adjust_repeat_index: int | None = None
     adjust_repeat_delta = 0
     base_channel_outputs = CHANNEL_DEFAULTS.copy()
     live_channel_outputs = base_channel_outputs.copy()
+    beeper_marker_active = False
     worker = SerialWorker()
     fc_service = InavSerialService()
     fc_poll_after_id: str | None = None
@@ -170,7 +160,6 @@ def main() -> None:
     level_after_id: str | None = None
     level_pulse_inflight = False
     level_timeout_deadline_s: float | None = None
-    level_timeout_s = max(PULSE_DURATION_DEFAULTS[ROLL_CHANNEL_INDEX], PULSE_DURATION_DEFAULTS[PITCH_CHANNEL_INDEX])
     auto_config = AdaptiveSessionConfig()
     auto_controller: AdaptiveExcitationController | None = None
     auto_state = AdaptiveSessionState.idle
@@ -181,6 +170,7 @@ def main() -> None:
     auto_last_sample_s: float | None = None
     auto_tick_after_id: str | None = None
     auto_hold_after_id: str | None = None
+    fly_log_marker_after_id: str | None = None
     auto_pulse_inflight = False
     auto_hold_end_requested = False
     auto_settle_until_s: float | None = None
@@ -195,7 +185,6 @@ def main() -> None:
     auto_current_throttle_us = base_channel_outputs[THROTTLE_CHANNEL_INDEX]
     auto_peak_throttle_us = base_channel_outputs[THROTTLE_CHANNEL_INDEX]
     auto_latest_report: AutoTuneReport | None = None
-    auto_report_files: list[str] = []
     auto_import_result: BlackboxImportResult | None = None
     auto_latest_imported_log: str = ""
     sim_active = False
@@ -206,7 +195,6 @@ def main() -> None:
     sim_waiting_for_fly_log = False
     sim_fly_log_active = False
     sim_step_started_s: float | None = None
-    sim_step_duration_s = 7.5
     sim_roll_deg = 0.0
     sim_pitch_deg = 0.0
     sim_last_report_second = -1
@@ -227,7 +215,16 @@ def main() -> None:
     pid_plan_selected_ff: dict[str, int] | None = None
     pid_plan_waiting_for_fly_log = False
     pid_plan_current_candidate_title = ""
+    pid_plan_current_candidate_phase = ""
+    pid_plan_current_candidate_target: dict[str, dict[str, int]] | None = None
     pid_plan_fly_log_active = False
+    pid_progress_window: tk.Toplevel | None = None
+    pid_progress_phase_labels: dict[str, tk.Label] = {}
+    pid_progress_current_var = tk.StringVar(value="No PID tuning plan is active.")
+    pid_progress_action_var = tk.StringVar(value="Generate or start a PID tuning plan.")
+    pid_progress_selection_var = tk.StringVar(value="")
+    pid_progress_plan_var = tk.StringVar(value="")
+    pid_progress_target_text: tk.Text | None = None
     pid_ff_labels = ("P", "I", "D", "FF")
     pid_ff_adjust_fields = [
         ("roll", "p"),
@@ -274,14 +271,17 @@ def main() -> None:
         for label, var in zip(pid_ff_labels, pitch_pidff_vars):
             var.set(f"{label}: --")
 
+    def simulation_mode_enabled() -> bool:
+        return bool(simulation_mode_var.get())
+
     def refresh_fly_log_button_state() -> None:
         if pid_plan_fly_log_active:
             fly_log_button.config(text="Abort Fly/Log", state="normal")
-        elif sim_fly_log_active:
+        elif simulation_mode_enabled() and sim_fly_log_active:
             fly_log_button.config(text="Stop Sim Fly/Log", state="normal")
         elif pid_plan_active and pid_plan_waiting_for_fly_log:
             fly_log_button.config(text="Fly/Log", state="normal")
-        elif sim_plan is not None and sim_waiting_for_fly_log:
+        elif simulation_mode_enabled() and sim_plan is not None and sim_waiting_for_fly_log:
             fly_log_button.config(text="Fly/Log", state="normal")
         else:
             fly_log_button.config(text="Fly/Log", state="disabled")
@@ -299,109 +299,6 @@ def main() -> None:
         auto_report_text.delete("1.0", tk.END)
         auto_report_text.insert("1.0", text.strip() + ("\n" if text and not text.endswith("\n") else ""))
         auto_report_text.config(state="disabled")
-
-    def refresh_auto_report_file_list() -> None:
-        auto_report_listbox.delete(0, tk.END)
-        for file_path in auto_report_files:
-            auto_report_listbox.insert(tk.END, file_path)
-
-    def open_local_path(path: str) -> None:
-        if not path:
-            return
-        target = Path(path)
-        if not target.exists():
-            raise RuntimeError(f"File not found: {target}")
-        if os.name == "nt":
-            os.startfile(str(target))  # type: ignore[attr-defined]
-            return
-        raise RuntimeError("Opening files is currently supported only on Windows in this app.")
-
-    def open_selected_report_file() -> None:
-        try:
-            selected = auto_report_listbox.curselection()
-            if not selected:
-                status.set("Select a report file first.")
-                return
-            file_path = auto_report_listbox.get(selected[0])
-            open_local_path(file_path)
-        except Exception as exc:
-            set_error("Open report file error", exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
-
-    def open_all_report_files() -> None:
-        try:
-            if not auto_report_files:
-                status.set("No report files available yet.")
-                return
-            for file_path in auto_report_files:
-                open_local_path(file_path)
-        except Exception as exc:
-            set_error("Open report files error", exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
-
-    def remove_blackbox_child_path(path: Path, root_dir: Path) -> int:
-        resolved_root = root_dir.resolve()
-        if path.is_symlink() or path.is_file():
-            path.unlink()
-            return 1
-        if path.is_dir():
-            resolved_path = path.resolve()
-            if resolved_root != resolved_path and resolved_root not in resolved_path.parents:
-                raise RuntimeError(f"Refusing to remove path outside blackbox_imports: {path}")
-            count = sum(1 for item in path.rglob("*") if item.is_file() or item.is_symlink())
-            shutil.rmtree(path)
-            return max(1, count)
-        return 0
-
-    def clear_blackbox_import_contents() -> int:
-        root_dir = blackbox_import_dir.resolve()
-        reports_dir = (root_dir / "reports").resolve()
-        if root_dir.name.lower() != "blackbox_imports":
-            raise RuntimeError(f"Unexpected blackbox import directory: {root_dir}")
-        if reports_dir.parent != root_dir:
-            raise RuntimeError(f"Unexpected reports directory: {reports_dir}")
-
-        root_dir.mkdir(parents=True, exist_ok=True)
-        reports_dir.mkdir(parents=True, exist_ok=True)
-
-        removed_count = 0
-        for child in list(root_dir.iterdir()):
-            if child.resolve() == reports_dir:
-                continue
-            removed_count += remove_blackbox_child_path(child, root_dir)
-
-        reports_dir.mkdir(parents=True, exist_ok=True)
-        for child in list(reports_dir.iterdir()):
-            removed_count += remove_blackbox_child_path(child, root_dir)
-        reports_dir.mkdir(parents=True, exist_ok=True)
-        return removed_count
-
-    def do_clear_report_files() -> None:
-        nonlocal auto_latest_report, auto_report_files, auto_import_result, auto_latest_imported_log
-        try:
-            if blackbox_import_inflight:
-                status.set("Blackbox import/analyze is in progress; wait before clearing files.")
-                return
-            if auto_is_running():
-                status.set("Auto session/pipeline is running; wait before clearing files.")
-                return
-            prompt = (
-                f"Delete all files under:\n{blackbox_import_dir}\n\n"
-                "This also clears generated reports. The folders themselves will be kept.\n"
-                "This cannot be undone."
-            )
-            if not messagebox.askyesno("Clear Blackbox Files", prompt, icon="warning", parent=root):
-                status.set("Clear canceled.")
-                return
-
-            removed_count = clear_blackbox_import_contents()
-            auto_latest_report = None
-            auto_report_files = []
-            auto_import_result = None
-            auto_latest_imported_log = ""
-            refresh_auto_report_file_list()
-            set_auto_report_text("Blackbox imports and generated reports cleared.")
-            status.set(f"Cleared {removed_count} item(s) from blackbox_imports and reports.")
-        except Exception as exc:
-            set_error("Clear report files error", exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
 
     def auto_elapsed_s(now_s: float | None = None) -> float:
         if auto_session_start_s is None:
@@ -529,6 +426,16 @@ def main() -> None:
             finally:
                 auto_hold_after_id = None
 
+    def cancel_fly_log_marker_timer() -> None:
+        nonlocal fly_log_marker_after_id
+        if fly_log_marker_after_id is not None:
+            try:
+                root.after_cancel(fly_log_marker_after_id)
+            except Exception:
+                pass
+            finally:
+                fly_log_marker_after_id = None
+
     def begin_auto_observe_window(command: AdaptiveCommand) -> None:
         nonlocal auto_pulse_inflight, auto_settle_until_s
         if not auto_is_running():
@@ -613,6 +520,20 @@ def main() -> None:
                 values.append(OFFSET_DEFAULTS[i])
         return values
 
+    def ppm_channels_for_firmware(channels: list[int], marker_active: bool) -> list[int]:
+        count = max(PPM_OUTPUT_CHANNEL_COUNT, BEEPER_MARKER_CHANNEL_INDEX + 1, len(channels))
+        output = [AUX_CHANNEL_OFF_US] * count
+        for index, value in enumerate(channels):
+            output[index] = max(1000, min(2000, int(value)))
+        output[BEEPER_MARKER_CHANNEL_INDEX] = BEEPER_MARKER_ON_US if marker_active else BEEPER_MARKER_OFF_US
+        return output
+
+    def ppm_offsets_for_firmware(offsets: list[int], channel_count: int) -> list[int]:
+        output = [0] * channel_count
+        for index, value in enumerate(offsets[:channel_count]):
+            output[index] = int(value)
+        return output
+
     def adjust_channel_value(index: int, delta: int) -> None:
         try:
             current = int(ch_entries[index].get().strip())
@@ -623,28 +544,10 @@ def main() -> None:
         ch_entries[index].insert(0, str(updated))
         on_output_inputs_changed()
 
-    def adjust_target_value(index: int, delta: int) -> None:
-        try:
-            current = int(target_entries[index].get().strip())
-        except ValueError:
-            current = PULSE_TARGET_DEFAULTS[index]
-        updated = max(0, min(500, current + delta))
-        target_entries[index].delete(0, tk.END)
-        target_entries[index].insert(0, str(updated))
-
     def get_adjust_delta(event: tk.Event, step: int = 5) -> int:
         width = int(event.widget.cget("width"))
         mid_x = width / 2
         return -step if event.x <= mid_x else step
-
-    def get_pulse_action(event: tk.Event) -> str:
-        width = int(event.widget.cget("width"))
-        third_x = width / 3
-        if event.x < third_x:
-            return "negative"
-        if event.x < (third_x * 2):
-            return "end"
-        return "positive"
 
     def cancel_adjust_repeat() -> None:
         nonlocal adjust_repeat_after_id, adjust_repeat_handler, adjust_repeat_index, adjust_repeat_delta
@@ -711,7 +614,7 @@ def main() -> None:
 
     def set_live_channel_outputs(values: list[int]) -> None:
         nonlocal live_channel_outputs
-        live_channel_outputs = values.copy()
+        live_channel_outputs = values[: len(channel_output_canvases)].copy()
         refresh_channel_outputs()
 
     def restore_base_outputs_after_hold(offsets: list[int] | None = None) -> None:
@@ -722,22 +625,32 @@ def main() -> None:
         queue_live_channel_update(base_channel_outputs.copy(), restore_offsets)
 
     def refresh_channel_outputs() -> None:
-        for i, value in enumerate(live_channel_outputs):
+        for i, value in enumerate(live_channel_outputs[: len(channel_output_canvases)]):
             draw_channel_output(i, value)
 
-    def queue_live_channel_update(channels: list[int], offsets: list[int]) -> None:
+    def queue_live_channel_update(
+        channels: list[int],
+        offsets: list[int],
+        after_update: Callable[[bool, object], None] | None = None,
+    ) -> None:
         nonlocal channel_update_inflight, pending_channel_update_channels, pending_channel_update_offsets
+        nonlocal pending_channel_update_after
         if not run_active or run_ser is None:
+            if after_update is not None:
+                after_update(False, RuntimeError("Arduino output is disconnected."))
             return
         if channel_update_inflight:
             pending_channel_update_channels = channels.copy()
             pending_channel_update_offsets = offsets.copy()
+            pending_channel_update_after = after_update
             return
 
         channel_update_inflight = True
+        marker_active = beeper_marker_active
 
         def on_live_update_done(ok: bool, res: object) -> None:
             nonlocal channel_update_inflight, pending_channel_update_channels, pending_channel_update_offsets
+            nonlocal pending_channel_update_after
             nonlocal run_quant, run_max_count, base_channel_outputs
             channel_update_inflight = False
             if not ok:
@@ -756,12 +669,18 @@ def main() -> None:
                     run_max_count = res[1]
                     sent_channels = [int(v) for v in res[2]]
                     base_channel_outputs = sent_channels
-                    if hold_timeout_after_id is None:
-                        set_live_channel_outputs(sent_channels)
+                    set_live_channel_outputs(sent_channels)
+
+            if after_update is not None:
+                try:
+                    after_update(ok, res)
+                except Exception as exc:
+                    set_error("Live update callback error", exc)
 
             if not run_active or run_ser is None:
                 pending_channel_update_channels = None
                 pending_channel_update_offsets = None
+                pending_channel_update_after = None
                 return
 
             if pending_channel_update_channels is None or pending_channel_update_offsets is None:
@@ -769,27 +688,29 @@ def main() -> None:
 
             next_channels = pending_channel_update_channels
             next_offsets = pending_channel_update_offsets
+            next_after = pending_channel_update_after
             pending_channel_update_channels = None
             pending_channel_update_offsets = None
-            queue_live_channel_update(next_channels, next_offsets)
+            pending_channel_update_after = None
+            queue_live_channel_update(next_channels, next_offsets, after_update=next_after)
 
-        worker.submit(_task_update_channels, channels.copy(), offsets.copy(), callback=on_live_update_done)
+        worker.submit(_task_update_channels, channels.copy(), offsets.copy(), marker_active, callback=on_live_update_done)
 
     def set_channel_entry_value(index: int, value: int) -> None:
         ch_entries[index].delete(0, tk.END)
         ch_entries[index].insert(0, str(value))
 
-    def apply_auto_base_outputs(channels: list[int], safety_text: str = "") -> None:
+    def apply_auto_base_outputs(channels: list[int], safety_text: str = "", send_update: bool = True) -> None:
         nonlocal base_channel_outputs, auto_current_throttle_us, auto_peak_throttle_us
-        clamped = [max(1000, min(2000, int(value))) for value in channels]
+        clamped = [max(1000, min(2000, int(value))) for value in channels[: len(ch_entries)]]
         base_channel_outputs = clamped.copy()
         if auto_original_base_outputs is not None:
             auto_current_throttle_us = clamped[THROTTLE_CHANNEL_INDEX]
             auto_peak_throttle_us = max(auto_peak_throttle_us, auto_current_throttle_us)
-        for index, value in enumerate(clamped):
+        for index, value in enumerate(clamped[: len(ch_entries)]):
             set_channel_entry_value(index, value)
         set_live_channel_outputs(clamped)
-        if run_active and run_ser is not None:
+        if send_update and run_active and run_ser is not None:
             queue_live_channel_update(clamped.copy(), parse_offset_values_with_defaults())
         if safety_text:
             status.set(safety_text)
@@ -802,7 +723,7 @@ def main() -> None:
         auto_original_base_outputs = None
         apply_auto_base_outputs(original, "restored pre-auto outputs")
 
-    def prepare_auto_throttle() -> bool:
+    def prepare_auto_throttle(send_update: bool = True) -> bool:
         if auto_controller is None:
             return False
         current = base_channel_outputs[THROTTLE_CHANNEL_INDEX]
@@ -811,7 +732,7 @@ def main() -> None:
             return False
         channels = base_channel_outputs.copy()
         channels[THROTTLE_CHANNEL_INDEX] = target
-        apply_auto_base_outputs(channels, reason)
+        apply_auto_base_outputs(channels, reason, send_update=send_update)
         return True
 
     def adjust_auto_throttle_after_event(event: ExcitationEvent, recovery_event: bool) -> None:
@@ -841,28 +762,6 @@ def main() -> None:
         set_live_channel_outputs(channels)
         base_channel_outputs = channels.copy()
         queue_live_channel_update(channels, offsets)
-
-    def channel_angle_value(channel_index: int) -> float | None:
-        sample = fc_service.latest_attitude()
-        if sample is None:
-            return None
-        if channel_index == 0:
-            return sample.roll_deg
-        if channel_index == 1:
-            return sample.pitch_deg
-        if channel_index == 3:
-            return sample.yaw_deg
-        return None
-
-    def is_angle_threshold_reached(channel_index: int, threshold_deg: float) -> bool:
-        if threshold_deg == 0:
-            return False
-        measured = channel_angle_value(channel_index)
-        if measured is None:
-            return False
-        if threshold_deg > 0:
-            return measured >= threshold_deg
-        return measured <= threshold_deg
 
     def select_fc_port(port_infos: Sequence[object]) -> str:
         target_id = FC_DEVICE_ID.upper()
@@ -1073,7 +972,6 @@ def main() -> None:
         return result["value"]
 
     def do_pid_tuning_plan() -> None:
-        nonlocal auto_report_files
         try:
             if blackbox_import_inflight:
                 status.set("Blackbox/report task already in progress.")
@@ -1089,8 +987,6 @@ def main() -> None:
 
             recommendation = suggest_starting_p(inputs)
             report = generate_pid_tuning_plan_report(blackbox_import_dir, recommendation)
-            auto_report_files = [report.text_path, report.summary_json]
-            refresh_auto_report_file_list()
             set_auto_report_text(Path(report.text_path).read_text(encoding="utf-8", errors="replace"))
             status.set(f"PID tuning plan generated: {report.report_dir}")
         except Exception as exc:
@@ -1164,6 +1060,260 @@ def main() -> None:
             lines.extend(["", "Target for this step", format_pid_values(target)])
         lines.extend(["", plan.text])
         set_auto_report_text("\n".join(lines))
+
+    PID_PROGRESS_PHASES = (
+        ("safe_start", "Safe Start"),
+        ("d_sweep", "D Sweep"),
+        ("p_sweep", "P Sweep"),
+        ("d_recheck", "D Re-check"),
+        ("i_sweep", "I Sweep"),
+        ("ff_sweep", "FF Sweep"),
+        ("final_write", "Final"),
+    )
+    PID_PROGRESS_PHASE_INDEX = {phase: index for index, (phase, _label) in enumerate(PID_PROGRESS_PHASES)}
+
+    def normalize_pid_progress_phase(phase: str) -> str:
+        if phase == "d_optional":
+            return "d_sweep"
+        return phase
+
+    def pid_progress_active_phase() -> str:
+        if pid_plan_phase == "complete":
+            return "complete"
+        if pid_plan_waiting_for_fly_log or pid_plan_fly_log_active:
+            return normalize_pid_progress_phase(pid_plan_current_candidate_phase or pid_plan_phase)
+        return normalize_pid_progress_phase(pid_plan_phase)
+
+    def pid_progress_target() -> dict[str, dict[str, int]] | None:
+        if pid_plan_waiting_for_fly_log or pid_plan_fly_log_active:
+            return pid_plan_current_candidate_target
+        if pid_plan is None or pid_plan_phase in ("idle", "complete"):
+            return None
+        try:
+            step = current_pid_plan_step()
+        except Exception:
+            return None
+        if step is None:
+            return None
+        return step[2]
+
+    def pid_progress_title() -> str:
+        if pid_plan is None:
+            return "No PID tuning plan is active."
+        if pid_plan_phase == "complete":
+            return "PID tuning plan complete."
+        if pid_plan_waiting_for_fly_log or pid_plan_fly_log_active:
+            return pid_plan_current_candidate_title or "Current candidate"
+        if pid_plan_phase == "final_write":
+            return "Final values"
+        try:
+            step = current_pid_plan_step()
+        except Exception:
+            return "PID tuning plan"
+        if step is None:
+            return "Choose the next winner or stage."
+        return step[0]
+
+    def pid_progress_action() -> str:
+        if pid_plan is None:
+            return "Start Auto Session to begin the guided PID plan."
+        if pid_plan_phase == "complete":
+            return "Review final values and save in INAV only when you are satisfied."
+        if pid_plan_fly_log_active:
+            return "Fly/Log movement is active. Keep the drone controlled, then land and disarm."
+        if pid_plan_waiting_for_fly_log:
+            return "Arm, press Fly/Log, land, disarm, review the log, then press Next PID Plan Step."
+        if pid_plan_phase == "final_write":
+            return "Choose final values. The app will verify disarmed state before writing."
+        return "Press Next PID Plan Step and follow the prompt. Write/check values only while disarmed."
+
+    def format_pid_progress_selection() -> str:
+        selected_p = (
+            "--"
+            if pid_plan_selected_p is None
+            else f"Roll {pid_plan_selected_p['roll']} / Pitch {pid_plan_selected_p['pitch']}"
+        )
+        selected_i = (
+            "--"
+            if pid_plan_selected_i is None
+            else f"Roll {pid_plan_selected_i['roll']} / Pitch {pid_plan_selected_i['pitch']}"
+        )
+        selected_ff = (
+            "--"
+            if pid_plan_selected_ff is None
+            else f"Roll {pid_plan_selected_ff['roll']} / Pitch {pid_plan_selected_ff['pitch']}"
+        )
+        return (
+            f"Chosen D: {'--' if pid_plan_selected_d is None else pid_plan_selected_d}\n"
+            f"Chosen P: {selected_p}\n"
+            f"Chosen I: {selected_i}\n"
+            f"Chosen FF: {selected_ff}"
+        )
+
+    def set_pid_progress_target_text(text: str) -> None:
+        if pid_progress_target_text is None:
+            return
+        pid_progress_target_text.config(state="normal")
+        pid_progress_target_text.delete("1.0", tk.END)
+        pid_progress_target_text.insert("1.0", text)
+        pid_progress_target_text.config(state="disabled")
+
+    def update_pid_progress_window() -> None:
+        if pid_progress_window is None or not pid_progress_window.winfo_exists():
+            return
+
+        active_phase = pid_progress_active_phase()
+        active_index = PID_PROGRESS_PHASE_INDEX.get(active_phase)
+        for phase, label_text in PID_PROGRESS_PHASES:
+            label = pid_progress_phase_labels.get(phase)
+            if label is None:
+                continue
+            phase_index = PID_PROGRESS_PHASE_INDEX[phase]
+            if pid_plan_phase == "complete":
+                state_text = "Done"
+                bg = "#DDEFE1"
+                fg = "#153B1A"
+            elif phase == active_phase:
+                state_text = "Active"
+                bg = "#CFE8FF"
+                fg = "#12385D"
+            elif active_index is not None and phase_index < active_index:
+                state_text = "Done"
+                bg = "#E3E8EF"
+                fg = "#26313D"
+            else:
+                state_text = "Pending"
+                bg = "#F3F4F6"
+                fg = "#374151"
+            label.config(text=f"{label_text}\n{state_text}", bg=bg, fg=fg)
+
+        pid_progress_current_var.set(pid_progress_title())
+        pid_progress_action_var.set(pid_progress_action())
+        pid_progress_selection_var.set(format_pid_progress_selection())
+        pid_progress_plan_var.set("" if pid_plan is None else f"Plan file: {pid_plan.text_path}")
+
+        target = pid_progress_target()
+        target_text = "No target values are staged yet."
+        if target:
+            target_text = format_pid_values(target)
+        set_pid_progress_target_text(target_text)
+
+    def close_pid_progress_window() -> None:
+        nonlocal pid_progress_window, pid_progress_target_text
+        if pid_progress_window is not None:
+            try:
+                pid_progress_window.destroy()
+            except Exception:
+                pass
+        pid_progress_window = None
+        pid_progress_target_text = None
+        pid_progress_phase_labels.clear()
+
+    def open_pid_progress_window() -> None:
+        nonlocal pid_progress_window, pid_progress_target_text
+        if pid_progress_window is not None and pid_progress_window.winfo_exists():
+            pid_progress_window.lift()
+            update_pid_progress_window()
+            return
+
+        window = tk.Toplevel(root)
+        window.withdraw()
+        try:
+            window.title("PID Tuning Progress")
+            window.resizable(False, False)
+            window.grid_rowconfigure(0, weight=1)
+            window.grid_columnconfigure(0, weight=1)
+            window.protocol("WM_DELETE_WINDOW", close_pid_progress_window)
+
+            outer = tk.Frame(window, padx=10, pady=10)
+            outer.grid(row=0, column=0, sticky="nsew")
+            outer.grid_columnconfigure(0, weight=1)
+
+            phase_frame = tk.LabelFrame(outer, text="Flow", padx=6, pady=6)
+            phase_frame.grid(row=0, column=0, sticky="we")
+            for column, (phase, label_text) in enumerate(PID_PROGRESS_PHASES):
+                phase_frame.grid_columnconfigure(column, weight=1)
+                label = tk.Label(
+                    phase_frame,
+                    text=f"{label_text}\nPending",
+                    width=12,
+                    height=2,
+                    relief="groove",
+                    bd=1,
+                    justify="center",
+                    bg="#F3F4F6",
+                )
+                label.grid(row=0, column=column, padx=2, sticky="we")
+                pid_progress_phase_labels[phase] = label
+
+            current_frame = tk.LabelFrame(outer, text="Current Step", padx=8, pady=8)
+            current_frame.grid(row=1, column=0, sticky="we", pady=(8, 0))
+            current_frame.grid_columnconfigure(0, weight=1)
+            tk.Label(
+                current_frame,
+                textvariable=pid_progress_current_var,
+                anchor="w",
+                justify="left",
+                font=("Segoe UI", 10, "bold"),
+                width=82,
+                wraplength=680,
+            ).grid(row=0, column=0, sticky="w")
+            tk.Label(
+                current_frame,
+                textvariable=pid_progress_action_var,
+                anchor="w",
+                justify="left",
+                width=82,
+                wraplength=680,
+            ).grid(row=1, column=0, sticky="w", pady=(6, 0))
+            tk.Label(
+                current_frame,
+                textvariable=pid_progress_plan_var,
+                anchor="w",
+                justify="left",
+                width=82,
+                wraplength=680,
+                fg="#374151",
+            ).grid(row=2, column=0, sticky="w", pady=(6, 0))
+
+            target_frame = tk.LabelFrame(outer, text="Target Values", padx=8, pady=8)
+            target_frame.grid(row=2, column=0, sticky="we", pady=(8, 0))
+            target_frame.grid_columnconfigure(0, weight=1)
+            pid_progress_target_text = tk.Text(target_frame, width=82, height=5, wrap="none")
+            pid_progress_target_text.grid(row=0, column=0, sticky="we")
+            pid_progress_target_text.config(state="disabled")
+
+            selection_frame = tk.LabelFrame(outer, text="Selected Winners", padx=8, pady=8)
+            selection_frame.grid(row=3, column=0, sticky="we", pady=(8, 0))
+            tk.Label(
+                selection_frame,
+                textvariable=pid_progress_selection_var,
+                anchor="w",
+                justify="left",
+                width=82,
+            ).grid(row=0, column=0, sticky="w")
+
+            buttons = tk.Frame(outer)
+            buttons.grid(row=4, column=0, sticky="e", pady=(8, 0))
+            tk.Button(buttons, text="Refresh", width=10, command=update_pid_progress_window).pack(side="right")
+            tk.Button(buttons, text="Close", width=10, command=close_pid_progress_window).pack(
+                side="right", padx=(0, 6)
+            )
+
+            pid_progress_window = window
+            update_pid_progress_window()
+            window.deiconify()
+            window.lift()
+            window.update_idletasks()
+        except Exception as exc:
+            pid_progress_window = None
+            pid_progress_target_text = None
+            pid_progress_phase_labels.clear()
+            try:
+                window.destroy()
+            except Exception:
+                pass
+            set_error("PID progress error", exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
 
     def ensure_disarmed_before_pid_write() -> bool:
         while True:
@@ -1258,21 +1408,24 @@ def main() -> None:
     def pid_plan_d_recheck_candidates() -> tuple[int, ...]:
         if pid_plan_selected_d is None:
             return ()
-        delta = 6
+        delta = 5
         values = (pid_plan_selected_d - delta, pid_plan_selected_d, pid_plan_selected_d + delta)
         return tuple(dict.fromkeys(max(0, min(255, int(value))) for value in values))
 
     def complete_pid_tuning_plan(message: str) -> None:
         nonlocal pid_plan_active, pid_plan_phase, pid_plan_index, pid_plan_waiting_for_fly_log
-        nonlocal pid_plan_current_candidate_title
+        nonlocal pid_plan_current_candidate_title, pid_plan_current_candidate_phase, pid_plan_current_candidate_target
         pid_plan_active = False
         pid_plan_phase = "complete"
         pid_plan_index = 0
         pid_plan_waiting_for_fly_log = False
         pid_plan_current_candidate_title = ""
+        pid_plan_current_candidate_phase = ""
+        pid_plan_current_candidate_target = None
         set_auto_button_idle()
         refresh_fly_log_button_state()
         status.set(message)
+        update_pid_progress_window()
 
     def prepare_pid_plan_next_step() -> bool:
         nonlocal pid_plan_phase, pid_plan_index, pid_plan_selected_d, pid_plan_selected_p
@@ -1302,6 +1455,7 @@ def main() -> None:
                 pid_plan_selected_d = int(chosen)
                 pid_plan_phase = "p_sweep"
                 pid_plan_index = 0
+                update_pid_progress_window()
                 continue
 
             if pid_plan_phase == "d_optional" and pid_plan_index >= 1:
@@ -1313,6 +1467,7 @@ def main() -> None:
                 pid_plan_selected_d = int(chosen)
                 pid_plan_phase = "p_sweep"
                 pid_plan_index = 0
+                update_pid_progress_window()
                 continue
 
             if pid_plan_phase == "p_sweep" and pid_plan_index >= len(pid_plan_p_candidates()):
@@ -1325,6 +1480,7 @@ def main() -> None:
                 pid_plan_selected_p = selected
                 pid_plan_phase = "d_recheck"
                 pid_plan_index = 0
+                update_pid_progress_window()
                 continue
 
             if pid_plan_phase == "d_recheck" and pid_plan_index >= len(pid_plan_d_recheck_candidates()):
@@ -1336,6 +1492,7 @@ def main() -> None:
                 pid_plan_selected_d = int(chosen)
                 pid_plan_phase = "i_sweep"
                 pid_plan_index = 0
+                update_pid_progress_window()
                 continue
 
             if pid_plan_phase == "i_sweep" and pid_plan_index >= len(pid_plan.i_sweep):
@@ -1347,6 +1504,7 @@ def main() -> None:
                 pid_plan_selected_i = selected
                 pid_plan_phase = "ff_sweep"
                 pid_plan_index = 0
+                update_pid_progress_window()
                 continue
 
             if pid_plan_phase == "ff_sweep" and pid_plan_index >= len(pid_plan.ff_sweep):
@@ -1358,6 +1516,7 @@ def main() -> None:
                 pid_plan_selected_ff = selected
                 pid_plan_phase = "final_write"
                 pid_plan_index = 0
+                update_pid_progress_window()
                 continue
 
             return True
@@ -1547,6 +1706,7 @@ def main() -> None:
             return
         if not ensure_disarmed_before_pid_write():
             status.set("PID final write canceled; disarm before writing values.")
+            update_pid_progress_window()
             return
         write_fc_pid_ff_values(with_yaw if choice else roll_pitch)
         refresh_pid_ff_from_fc(update_status=False)
@@ -1559,11 +1719,13 @@ def main() -> None:
 
     def continue_pid_tuning_plan() -> None:
         nonlocal pid_plan_waiting_for_fly_log, pid_plan_current_candidate_title
+        nonlocal pid_plan_current_candidate_phase, pid_plan_current_candidate_target
         if not pid_plan_active:
             return
         if pid_plan is None:
             raise RuntimeError("PID tuning plan is not loaded.")
         if pid_plan_waiting_for_fly_log:
+            open_pid_progress_window()
             messagebox.showinfo(
                 "Fly/Log Needed",
                 f"{pid_plan_current_candidate_title or 'The current candidate'} is ready.\n\n"
@@ -1571,22 +1733,29 @@ def main() -> None:
                 parent=root,
             )
             status.set("Press Fly/Log for the current candidate before moving to the next step.")
+            update_pid_progress_window()
             return
         if not prepare_pid_plan_next_step():
+            update_pid_progress_window()
             return
         if pid_plan_phase == "final_write":
+            update_pid_progress_window()
             run_pid_plan_final_write()
             return
 
         step = current_pid_plan_step()
         if step is None:
             status.set("PID plan is waiting for the next stage choice.")
+            update_pid_progress_window()
             return
         title, instruction, target = step
+        step_phase = pid_plan_phase
+        update_pid_progress_window()
         if pid_plan_phase == "safe_start":
             set_pid_plan_report_text(pid_plan, f"PID plan step: {title}", target)
             if not ensure_disarmed_before_pid_write():
                 status.set("Safe-start PID write waiting; disarm the drone before starting the plan.")
+                update_pid_progress_window()
                 return
             current = read_fc_pid_ff_values(tuple(target.keys()))
             set_pid_plan_report_text(pid_plan, f"PID plan step: {title}", target, current)
@@ -1595,9 +1764,12 @@ def main() -> None:
             advance_pid_plan_after_step()
             pid_plan_waiting_for_fly_log = True
             pid_plan_current_candidate_title = title
+            pid_plan_current_candidate_phase = step_phase
+            pid_plan_current_candidate_target = target
             auto_session_button.config(text="Next PID Plan Step", state="normal")
             refresh_fly_log_button_state()
             status.set("Safe-start PID/FF values written while disarmed.")
+            update_pid_progress_window()
             messagebox.showinfo(
                 "Safe Start Ready",
                 "Safe-start PID/FF values were written while the drone was disarmed.\n\n"
@@ -1608,6 +1780,7 @@ def main() -> None:
 
         if not ensure_disarmed_before_pid_write():
             status.set("PID plan paused; disarm the drone before moving to the next candidate.")
+            update_pid_progress_window()
             return
         current = read_fc_pid_ff_values(tuple(target.keys()))
         set_pid_plan_report_text(pid_plan, f"PID plan step: {title}", target, current)
@@ -1632,19 +1805,25 @@ def main() -> None:
         if choice:
             if not ensure_disarmed_before_pid_write():
                 status.set("PID write canceled; disarm before writing values.")
+                update_pid_progress_window()
                 return
             write_fc_pid_ff_values(target)
             refresh_pid_ff_from_fc(update_status=False)
             pid_plan_waiting_for_fly_log = True
             pid_plan_current_candidate_title = title
+            pid_plan_current_candidate_phase = step_phase
+            pid_plan_current_candidate_target = target
             status.set(f"PID plan step written: {title}")
         else:
             pid_plan_waiting_for_fly_log = False
             pid_plan_current_candidate_title = ""
+            pid_plan_current_candidate_phase = ""
+            pid_plan_current_candidate_target = None
             status.set(f"PID plan step skipped: {title}")
         advance_pid_plan_after_step()
         auto_session_button.config(text="Next PID Plan Step", state="normal")
         refresh_fly_log_button_state()
+        update_pid_progress_window()
         messagebox.showinfo(
             "PID Plan Step Ready",
             (
@@ -1660,7 +1839,7 @@ def main() -> None:
         nonlocal pid_plan_active, pid_plan, pid_plan_phase, pid_plan_index
         nonlocal pid_plan_selected_d, pid_plan_selected_p, pid_plan_selected_i, pid_plan_selected_ff
         nonlocal pid_plan_waiting_for_fly_log, pid_plan_current_candidate_title
-        nonlocal auto_report_files
+        nonlocal pid_plan_current_candidate_phase, pid_plan_current_candidate_target
         plan_path = locate_pid_tuning_plan_file()
         pid_plan = load_pid_tuning_plan(plan_path)
         pid_plan_active = True
@@ -1672,28 +1851,28 @@ def main() -> None:
         pid_plan_selected_ff = None
         pid_plan_waiting_for_fly_log = False
         pid_plan_current_candidate_title = ""
-        auto_report_files = [
-            path for path in (pid_plan.text_path, pid_plan.summary_json) if path
-        ]
-        refresh_auto_report_file_list()
+        pid_plan_current_candidate_phase = ""
+        pid_plan_current_candidate_target = None
         set_pid_plan_report_text(pid_plan, "PID tuning plan loaded")
         auto_session_button.config(text="Next PID Plan Step", state="normal")
         refresh_fly_log_button_state()
         status.set(f"PID tuning plan loaded: {pid_plan.text_path}")
+        open_pid_progress_window()
         continue_pid_tuning_plan()
 
     def read_fc_armed_state_for_blackbox_import(selected_port: str, selected_baud: int) -> bool:
-        if fc_service.is_connected:
-            return fc_service.is_armed(timeout_seconds=0.8)
-
-        checker = InavSerialService()
-        try:
-            checker.connect(selected_port, selected_baud)
-            return checker.is_armed(timeout_seconds=0.8)
-        finally:
-            checker.disconnect()
+        if not fc_service.is_connected:
+            raise RuntimeError("Connect FC manually before pulling Blackbox logs.")
+        return fc_service.is_armed(timeout_seconds=0.8)
 
     def ensure_disarmed_before_blackbox_import(selected_port: str, selected_baud: int) -> bool:
+        if not fc_service.is_connected:
+            messagebox.showwarning(
+                "FC Not Connected",
+                "Connect FC manually before pulling Blackbox logs. The app will not auto-connect to the FC.",
+                parent=root,
+            )
+            return False
         while True:
             try:
                 is_armed = read_fc_armed_state_for_blackbox_import(selected_port, selected_baud)
@@ -1721,6 +1900,9 @@ def main() -> None:
     def do_pull_blackbox_logs() -> None:
         nonlocal blackbox_import_inflight
         try:
+            if simulation_mode_enabled():
+                status.set("Turn off Simulate before pulling Blackbox logs.")
+                return
             if blackbox_import_inflight:
                 status.set("Blackbox import already in progress.")
                 return
@@ -1773,7 +1955,7 @@ def main() -> None:
             set_error("Blackbox import error", exc)
 
     def do_analyze_blackbox_logs() -> None:
-        nonlocal blackbox_import_inflight, auto_latest_report, auto_report_files
+        nonlocal blackbox_import_inflight, auto_latest_report
         try:
             if blackbox_import_inflight:
                 status.set("Blackbox import already in progress.")
@@ -1798,7 +1980,7 @@ def main() -> None:
             status.set(f"Analyzing Blackbox log: {selected_name}...")
 
             def on_analyze_done(ok: bool, res: object) -> None:
-                nonlocal blackbox_import_inflight, auto_latest_report, auto_report_files
+                nonlocal blackbox_import_inflight, auto_latest_report
                 if not ok:
                     blackbox_import_inflight = False
                     set_error("Blackbox analyze error", res if isinstance(res, Exception) else RuntimeError(res))
@@ -1815,8 +1997,6 @@ def main() -> None:
                 status.set(f"Blackbox analysis complete: {summary_head}. Generating report...")
                 set_auto_report_text(format_blackbox_report(res))
                 auto_latest_report = None
-                auto_report_files = []
-                refresh_auto_report_file_list()
 
                 session_payload = {
                     "state": "manual_analyze",
@@ -1827,7 +2007,7 @@ def main() -> None:
                 }
 
                 def on_report_done(ok2: bool, res2: object) -> None:
-                    nonlocal blackbox_import_inflight, auto_latest_report, auto_report_files
+                    nonlocal blackbox_import_inflight, auto_latest_report
                     blackbox_import_inflight = False
                     if not ok2:
                         error_text = str(res2) if not isinstance(res2, Exception) else str(res2)
@@ -1849,14 +2029,6 @@ def main() -> None:
                         return
 
                     auto_latest_report = res2
-                    report_files = [
-                        res2.summary_txt,
-                        res2.summary_json,
-                        res2.combined_chart_sheet,
-                        *list(res2.chart_paths),
-                    ]
-                    auto_report_files = [path for path in dict.fromkeys(item for item in report_files if item)]
-                    refresh_auto_report_file_list()
                     try:
                         report_text = Path(res2.summary_txt).read_text(encoding="utf-8", errors="replace")
                     except Exception:
@@ -1878,7 +2050,7 @@ def main() -> None:
             set_error("Blackbox analyze error", exc)
 
     def do_step_response_report() -> None:
-        nonlocal blackbox_import_inflight, auto_report_files
+        nonlocal blackbox_import_inflight
         try:
             if blackbox_import_inflight:
                 status.set("Blackbox import/analyze already in progress.")
@@ -1912,7 +2084,7 @@ def main() -> None:
             )
 
             def on_step_response_done(ok: bool, res: object) -> None:
-                nonlocal blackbox_import_inflight, auto_report_files
+                nonlocal blackbox_import_inflight
                 blackbox_import_inflight = False
                 step_response_button.config(state="normal")
                 if not ok:
@@ -1922,13 +2094,6 @@ def main() -> None:
                     set_error("Step response error", RuntimeError("Unexpected step-response task result."))
                     return
 
-                report_files = [
-                    res.html_path,
-                    res.summary_json,
-                    *list(res.decoded_csv_paths),
-                ]
-                auto_report_files = [path for path in dict.fromkeys(item for item in report_files if item)]
-                refresh_auto_report_file_list()
                 set_auto_report_text(format_step_response_report(res))
                 status.set(f"Step response report generated: {res.report_dir}")
 
@@ -1967,6 +2132,7 @@ def main() -> None:
                 pass
             auto_tick_after_id = None
         cancel_auto_hold_timer()
+        cancel_fly_log_marker_timer()
         restore_auto_original_base_outputs()
         auto_pulse_inflight = False
         auto_hold_end_requested = False
@@ -1977,11 +2143,12 @@ def main() -> None:
         auto_session_button.config(text="Start Auto Session", state="normal")
 
     def complete_auto_session(next_state: AdaptiveSessionState, reason: str, warning: str = "") -> None:
-        nonlocal auto_stop_reason, auto_warning
+        nonlocal auto_stop_reason, auto_warning, beeper_marker_active
         auto_stop_reason = reason
         auto_warning = warning
+        beeper_marker_active = False
         stop_auto_session_runtime()
-        if run_active and run_ser is not None and hold_timeout_after_id is None:
+        if run_active and run_ser is not None:
             try:
                 restore_base_outputs_after_hold()
             except Exception:
@@ -1997,13 +2164,14 @@ def main() -> None:
         set_auto_button_idle()
         if pid_plan_active:
             auto_session_button.config(text="Next PID Plan Step", state="normal")
+        update_pid_progress_window()
         if continue_pipeline:
             begin_auto_pipeline()
 
     def start_auto_session() -> None:
         nonlocal auto_config, auto_controller, auto_session_start_s, auto_last_tick_s
         nonlocal auto_last_sample_s, auto_stop_reason, auto_warning, auto_latest_report
-        nonlocal auto_report_files, auto_import_result, auto_latest_imported_log, auto_original_base_outputs
+        nonlocal auto_import_result, auto_latest_imported_log, auto_original_base_outputs
         nonlocal auto_start_throttle_us, auto_current_throttle_us, auto_peak_throttle_us
         if blackbox_import_inflight:
             raise RuntimeError("Blackbox import/analyze is in progress.")
@@ -2128,7 +2296,7 @@ def main() -> None:
 
     def run_auto_tick() -> None:
         nonlocal auto_tick_after_id, auto_recovery_mode, pid_plan_fly_log_active, pid_plan_waiting_for_fly_log
-        nonlocal pid_plan_current_candidate_title
+        nonlocal pid_plan_current_candidate_title, pid_plan_current_candidate_phase, pid_plan_current_candidate_target
         auto_tick_after_id = None
         if not auto_is_running():
             return
@@ -2184,9 +2352,12 @@ def main() -> None:
                 pid_plan_waiting_for_fly_log = False
                 completed_title = pid_plan_current_candidate_title
                 pid_plan_current_candidate_title = ""
+                pid_plan_current_candidate_phase = ""
+                pid_plan_current_candidate_target = None
                 auto_session_button.config(text="Next PID Plan Step", state="normal")
                 refresh_fly_log_button_state()
                 status.set(f"Fly/Log complete: {completed_title or stop_reason}")
+                update_pid_progress_window()
                 messagebox.showinfo(
                     "Fly/Log Complete",
                     "Fly/Log movement is complete.\n\n"
@@ -2213,6 +2384,9 @@ def main() -> None:
 
     def begin_auto_pipeline() -> None:
         nonlocal blackbox_import_inflight
+        if simulation_mode_enabled():
+            status.set("Auto blackbox pipeline skipped: simulation mode is enabled.")
+            return
         if blackbox_import_inflight:
             auto_warning_text = "Blackbox pipeline already in progress."
             status.set(auto_warning_text)
@@ -2279,7 +2453,7 @@ def main() -> None:
                 )
 
             def on_auto_report_done(ok: bool, res: object) -> None:
-                nonlocal blackbox_import_inflight, auto_latest_report, auto_report_files
+                nonlocal blackbox_import_inflight, auto_latest_report
                 blackbox_import_inflight = False
                 set_auto_button_idle()
                 if not ok:
@@ -2292,14 +2466,6 @@ def main() -> None:
                     auto_abort("Unexpected report generation result.")
                     return
                 auto_latest_report = res
-                report_files = [
-                    res.summary_txt,
-                    res.summary_json,
-                    res.combined_chart_sheet,
-                    *list(res.chart_paths),
-                ]
-                auto_report_files = [path for path in dict.fromkeys(item for item in report_files if item)]
-                refresh_auto_report_file_list()
                 try:
                     report_text = Path(res.summary_txt).read_text(encoding="utf-8", errors="replace")
                 except Exception:
@@ -2332,7 +2498,7 @@ def main() -> None:
         nonlocal auto_config, auto_controller, auto_session_start_s, auto_last_tick_s, auto_last_sample_s
         nonlocal auto_stop_reason, auto_warning, auto_original_base_outputs
         nonlocal auto_start_throttle_us, auto_current_throttle_us, auto_peak_throttle_us
-        nonlocal pid_plan_fly_log_active
+        nonlocal pid_plan_fly_log_active, beeper_marker_active
         if not pid_plan_active or not pid_plan_waiting_for_fly_log:
             status.set("No PID plan candidate is ready for Fly/Log.")
             return
@@ -2351,19 +2517,21 @@ def main() -> None:
             raise RuntimeError("Connect FC before Fly/Log.")
         if level_active:
             raise RuntimeError("Stop auto-level before Fly/Log.")
-        if hold_command_inflight or hold_timeout_after_id is not None:
-            raise RuntimeError("Wait for active pulse/hold command to complete first.")
         if fc_service.latest_attitude() is None:
             raise RuntimeError("No FC attitude sample yet. Wait for telemetry then retry.")
         if not fc_is_armed_for_fly_log():
             return
 
-        auto_config = read_auto_tune_config()
+        auto_config = replace(read_auto_tune_config(), max_runtime_s=PID_PLAN_FLY_LOG_RUNTIME_S)
         prompt = (
             f"Fly/Log candidate: {pid_plan_current_candidate_title or 'current PID plan step'}\n\n"
             "The FC reports ARMED.\n\n"
             "Pressing OK will send bounded roll/pitch stick movement through the Arduino output "
-            "for about 60 seconds so Blackbox has movement to log.\n\n"
+            f"for {PID_PLAN_FLY_LOG_RUNTIME_S:.0f} seconds after the CH8 marker turns on so Blackbox "
+            "has movement to log.\n\n"
+            "The app will first let the throttle settle briefly, then channel 8 will switch "
+            "high as the beeper log marker. Channel 8 switches low when Fly/Log completes "
+            "or aborts.\n\n"
             "No PID/FF values will be written while armed.\n\n"
             "Keep the drone secured, keep the area clear, and be ready to disarm."
         )
@@ -2383,18 +2551,75 @@ def main() -> None:
         auto_last_sample_s = auto_session_start_s
         pid_plan_fly_log_active = True
         set_auto_state(AdaptiveSessionState.adaptive_run, "Fly/Log active")
-        throttle_prepared = prepare_auto_throttle()
+        throttle_prepared = prepare_auto_throttle(send_update=False)
+        beeper_marker_active = False
         auto_session_button.config(text="Abort Fly/Log", state="normal")
         refresh_fly_log_button_state()
-        status.set("Fly/Log movement active. Disarm after it completes.")
+        spinup_delay_s = BEEPER_MARKER_SPINUP_DELAY_MS / 1000.0
+        status.set(f"Preparing Fly/Log outputs. CH8 marker starts after {spinup_delay_s:.1f}s spin-up.")
+        open_pid_progress_window()
+        update_pid_progress_window()
         set_auto_report_text(
             "Fly/Log active\n\n"
             f"Candidate: {pid_plan_current_candidate_title or 'current PID plan step'}\n"
-            "The app is sending bounded roll/pitch movement for Blackbox logging.\n"
+            f"The app is waiting {spinup_delay_s:.1f}s for spin-up before enabling the channel 8 marker.\n"
+            f"After the marker turns on, the app sends bounded roll/pitch movement for "
+            f"{PID_PLAN_FLY_LOG_RUNTIME_S:.0f}s of Blackbox data.\n"
             "No PID/FF values are being written while armed.\n\n"
             "When complete, disarm the drone before pressing Next PID Plan Step."
         )
-        schedule_auto_tick(delay_ms=250 if throttle_prepared else None)
+
+        def on_beeper_marker_enabled(ok: bool, res: object) -> None:
+            nonlocal auto_session_start_s, auto_last_tick_s, auto_last_sample_s
+            if not pid_plan_fly_log_active:
+                return
+            if not ok:
+                auto_abort(
+                    "Unable to enable channel 8 beeper log marker.",
+                    warning=str(res) if not isinstance(res, Exception) else str(res),
+                )
+                return
+            now_s = time.monotonic()
+            auto_session_start_s = now_s
+            auto_last_tick_s = now_s
+            auto_last_sample_s = now_s
+            status.set("Fly/Log movement active. Channel 8 beeper marker is ON.")
+            schedule_auto_tick(delay_ms=250 if throttle_prepared else None)
+
+        def enable_beeper_marker_after_spinup() -> None:
+            nonlocal fly_log_marker_after_id, beeper_marker_active
+            fly_log_marker_after_id = None
+            if not pid_plan_fly_log_active or not auto_is_running():
+                return
+            beeper_marker_active = True
+            status.set("Enabling channel 8 beeper log marker...")
+            queue_live_channel_update(
+                base_channel_outputs.copy(),
+                parse_offset_values_with_defaults(),
+                after_update=on_beeper_marker_enabled,
+            )
+
+        def on_spinup_outputs_prepared(ok: bool, res: object) -> None:
+            nonlocal fly_log_marker_after_id
+            if not pid_plan_fly_log_active:
+                return
+            if not ok:
+                auto_abort(
+                    "Unable to prepare Fly/Log outputs before marker.",
+                    warning=str(res) if not isinstance(res, Exception) else str(res),
+                )
+                return
+            status.set(f"Fly/Log spin-up wait: channel 8 marker starts in {spinup_delay_s:.1f}s.")
+            fly_log_marker_after_id = root.after(
+                max(1, BEEPER_MARKER_SPINUP_DELAY_MS),
+                enable_beeper_marker_after_spinup,
+            )
+
+        queue_live_channel_update(
+            base_channel_outputs.copy(),
+            parse_offset_values_with_defaults(),
+            after_update=on_spinup_outputs_prepared,
+        )
 
     def do_pid_plan_fly_log_toggle() -> None:
         nonlocal pid_plan_fly_log_active
@@ -2409,6 +2634,7 @@ def main() -> None:
                 auto_abort("Fly/Log aborted by user.", continue_pipeline=False)
                 pid_plan_fly_log_active = False
                 refresh_fly_log_button_state()
+                update_pid_progress_window()
                 return
             start_pid_plan_fly_log()
         except Exception as exc:
@@ -2434,7 +2660,7 @@ def main() -> None:
             var.set(f"{label}: --" if value is None else f"{label}: {value}")
 
     def simulation_hardware_is_disconnected() -> bool:
-        if run_active or run_ser is not None:
+        if start_pending or run_active or run_ser is not None:
             messagebox.showwarning(
                 "Simulation Requires No Hardware",
                 "Disconnect Arduino output before using the simulator.",
@@ -2561,7 +2787,7 @@ def main() -> None:
         )
 
     def simulated_d_recheck_values(selected_d: int) -> tuple[int, ...]:
-        return tuple(dict.fromkeys(max(0, min(255, int(value))) for value in (selected_d - 6, selected_d, selected_d + 6)))
+        return tuple(dict.fromkeys(max(0, min(255, int(value))) for value in (selected_d - 5, selected_d, selected_d + 5)))
 
     def current_sim_step() -> dict[str, object] | None:
         if sim_plan_step_index < 0 or sim_plan_step_index >= len(sim_plan_steps):
@@ -2597,6 +2823,15 @@ def main() -> None:
         bounce = target_deg * overshoot * 0.55 * math.exp(-(0.8 + damping * 2.0) * release_s) * math.sin(release_s * 8.5)
         return float(direction) * (residual + bounce)
 
+    def _sim_repeating_axis_wave(elapsed_s: float, start_s: float, direction: int, gains: dict[str, int], stage: str) -> float:
+        cycle_s = max(1.0, PID_PLAN_FLY_LOG_RUNTIME_S / 4.0)
+        if elapsed_s < start_s:
+            return 0.0
+        cycle_index = int((elapsed_s - start_s) // cycle_s)
+        cycle_start_s = start_s + (cycle_index * cycle_s)
+        cycle_direction = direction if cycle_index % 2 == 0 else -direction
+        return _sim_axis_wave(elapsed_s, cycle_start_s, cycle_direction, gains, stage)
+
     def update_simulated_plan_attitude(elapsed_s: float, step: dict[str, object]) -> None:
         nonlocal sim_roll_deg, sim_pitch_deg
         target = step["target"]
@@ -2607,8 +2842,8 @@ def main() -> None:
         stage = str(step.get("stage", ""))
         roll_gains = target.get("roll", {}) if isinstance(target.get("roll", {}), dict) else {}
         pitch_gains = target.get("pitch", {}) if isinstance(target.get("pitch", {}), dict) else {}
-        sim_roll_deg = _sim_axis_wave(elapsed_s, 0.25, 1, roll_gains, stage)
-        sim_pitch_deg = _sim_axis_wave(elapsed_s, 3.85, -1, pitch_gains, stage)
+        sim_roll_deg = _sim_repeating_axis_wave(elapsed_s, 0.25, 1, roll_gains, stage)
+        sim_pitch_deg = _sim_repeating_axis_wave(elapsed_s, 3.85, -1, pitch_gains, stage)
         limit = 35.0
         sim_roll_deg = max(-limit, min(limit, sim_roll_deg))
         sim_pitch_deg = max(-limit, min(limit, sim_pitch_deg))
@@ -2643,7 +2878,7 @@ def main() -> None:
             "Simulated PID/FF boxes",
             target_text,
             "",
-            f"Elapsed: {elapsed_s:4.1f}s / {sim_step_duration_s:.1f}s",
+            f"Elapsed: {elapsed_s:4.1f}s / {PID_PLAN_FLY_LOG_RUNTIME_S:.1f}s",
             f"Roll:  {sim_roll_deg:+5.1f} deg",
             f"Pitch: {sim_pitch_deg:+5.1f} deg",
         ]
@@ -2673,13 +2908,7 @@ def main() -> None:
             sim_plan_steps = []
             sim_plan_step_index = 0
             sim_waiting_for_fly_log = False
-        if sim_waiting_for_fly_log:
-            simulate_auto_session_button.config(text="Next Sim Step", state="disabled")
-        elif sim_plan is not None and sim_plan_step_index < len(sim_plan_steps):
-            simulate_auto_session_button.config(text="Next Sim Step", state="normal")
-        else:
-            simulate_auto_session_button.config(text="Simulate", state="normal")
-        refresh_fly_log_button_state()
+        update_link_indicators()
         if restore_display:
             restore_neutral_sim_display()
         if message and not is_closing:
@@ -2696,15 +2925,13 @@ def main() -> None:
         sim_step_started_s = None
         sim_plan_step_index += 1
         if sim_plan_step_index >= len(sim_plan_steps):
-            simulate_auto_session_button.config(text="Simulate", state="normal")
-            refresh_fly_log_button_state()
+            update_link_indicators()
             status.set("PID plan simulation complete.")
-            refresh_sim_report(sim_step_duration_s, step, fly_log_running=False, step_number=completed_step_number)
+            refresh_sim_report(PID_PLAN_FLY_LOG_RUNTIME_S, step, fly_log_running=False, step_number=completed_step_number)
             return
-        simulate_auto_session_button.config(text="Next Sim Step", state="normal")
-        refresh_fly_log_button_state()
+        update_link_indicators()
         status.set(f"Simulation step complete. Next: {sim_plan_steps[sim_plan_step_index]['title']}")
-        refresh_sim_report(sim_step_duration_s, step, fly_log_running=False, step_number=completed_step_number)
+        refresh_sim_report(PID_PLAN_FLY_LOG_RUNTIME_S, step, fly_log_running=False, step_number=completed_step_number)
 
     def run_simulated_auto_tick() -> None:
         nonlocal sim_after_id, sim_last_report_second
@@ -2723,7 +2950,7 @@ def main() -> None:
         if report_second != sim_last_report_second:
             sim_last_report_second = report_second
             refresh_sim_report(elapsed_s, step, fly_log_running=True)
-        if elapsed_s >= sim_step_duration_s:
+        if elapsed_s >= PID_PLAN_FLY_LOG_RUNTIME_S:
             finish_simulated_plan_step(step)
             return
         sim_after_id = root.after(40, run_simulated_auto_tick)
@@ -2750,8 +2977,7 @@ def main() -> None:
         sim_roll_deg = 0.0
         sim_pitch_deg = 0.0
         sim_last_report_second = -1
-        simulate_auto_session_button.config(text="Next Sim Step", state="disabled")
-        refresh_fly_log_button_state()
+        update_link_indicators()
         status.set(f"Simulated values staged: {step['title']}. Press Fly/Log.")
         refresh_sim_report(0.0, step, fly_log_running=False)
         set_sim_attitude_display()
@@ -2771,8 +2997,7 @@ def main() -> None:
         sim_roll_deg = 0.0
         sim_pitch_deg = 0.0
         sim_last_report_second = -1
-        simulate_auto_session_button.config(text="Next Sim Step", state="disabled")
-        refresh_fly_log_button_state()
+        update_link_indicators()
         status.set(f"Simulated Fly/Log running: {step['title']}")
         refresh_sim_report(0.0, step, fly_log_running=True)
         set_sim_attitude_display()
@@ -2788,8 +3013,6 @@ def main() -> None:
         sim_plan_step_index = 0
         if not sim_plan_steps:
             raise RuntimeError("PID tuning plan has no steps to simulate.")
-        auto_report_files[:] = [path for path in (sim_plan.text_path, sim_plan.summary_json) if path]
-        refresh_auto_report_file_list()
         start_simulated_plan_step()
 
     def do_simulated_auto_session_toggle() -> None:
@@ -2815,6 +3038,12 @@ def main() -> None:
 
     def do_auto_session_toggle() -> None:
         try:
+            if simulation_mode_enabled():
+                if auto_is_running():
+                    auto_abort("Auto session aborted by user.", continue_pipeline=not pid_plan_fly_log_active)
+                    return
+                do_simulated_auto_session_toggle()
+                return
             if sim_active:
                 stop_simulated_auto_session("Simulation stopped.", clear_walkthrough=True)
             if auto_is_running():
@@ -2824,11 +3053,36 @@ def main() -> None:
                 status.set("Auto pipeline is running; wait for completion.")
                 return
             if pid_plan_active:
+                open_pid_progress_window()
                 continue_pid_tuning_plan()
                 return
             start_auto_session()
         except Exception as exc:
             set_error("Auto session error", exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
+
+    def on_simulation_mode_changed() -> None:
+        try:
+            if simulation_mode_enabled():
+                if start_pending or run_active or run_ser is not None or fc_service.is_connected:
+                    simulation_mode_var.set(False)
+                    messagebox.showwarning(
+                        "Simulation Requires No Hardware",
+                        "Disconnect Arduino output and FC before enabling simulation mode.",
+                        parent=root,
+                    )
+                    status.set("Simulation mode requires Arduino and FC disconnected.")
+                    update_link_indicators()
+                    return
+                status.set("Simulation mode enabled. Press Start Auto Session to run the simulator.")
+            else:
+                if sim_active or sim_fly_log_active or sim_waiting_for_fly_log or sim_plan is not None:
+                    stop_simulated_auto_session("Simulation mode disabled.", restore_display=True, clear_walkthrough=True)
+                    return
+                status.set("Simulation mode disabled.")
+            update_link_indicators()
+        except Exception as exc:
+            simulation_mode_var.set(False)
+            set_error("Simulation mode error", exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
 
     def set_error(title: str, exc: Exception) -> None:
         if is_closing:
@@ -2837,6 +3091,7 @@ def main() -> None:
         messagebox.showerror(title, str(exc))
 
     def update_link_indicators() -> None:
+        sim_mode = simulation_mode_enabled()
         if run_ser is not None:
             pc_link_box.config(text="PC-ARD OPEN", bg="#2E7D32", fg="white")
         else:
@@ -2860,6 +3115,8 @@ def main() -> None:
                 fg="#3A1111",
                 activeforeground="#3A1111",
             )
+        if sim_mode:
+            connect_fc_button.config(state="disabled")
         arduino_connected = run_active and run_ser is not None
         if start_pending:
             arduino_button.config(
@@ -2888,9 +3145,10 @@ def main() -> None:
                 fg="#3A1111",
                 activeforeground="#3A1111",
             )
-        angle_state = "normal" if fc_connected else "disabled"
-        for entry in angle_entries:
-            entry.config(state=angle_state)
+        if sim_mode:
+            arduino_button.config(state="disabled")
+        simulation_blocked = start_pending or arduino_connected or run_ser is not None or fc_connected
+        simulation_mode_checkbutton.config(state="normal" if sim_mode or not simulation_blocked else "disabled")
         level_ready = run_ser is not None and fc_connected
         if level_active and not level_ready:
             stop_level_loop(update_status=False)
@@ -2902,21 +3160,20 @@ def main() -> None:
             auto_session_button.config(text="Running Analysis...", state="disabled")
         elif auto_is_running():
             auto_session_button.config(text="Abort Fly/Log" if pid_plan_fly_log_active else "Abort Auto Session", state="normal")
+        elif sim_mode:
+            if sim_active or sim_fly_log_active:
+                auto_session_button.config(text="Stop Simulation", state="normal")
+            elif sim_waiting_for_fly_log:
+                auto_session_button.config(text="Next Sim Step", state="disabled")
+            elif sim_plan is not None and sim_plan_step_index < len(sim_plan_steps):
+                auto_session_button.config(text="Next Sim Step", state="normal")
+            else:
+                auto_session_button.config(text="Start Auto Session", state="normal")
         elif pid_plan_active:
             auto_session_button.config(text="Next PID Plan Step", state="normal")
         else:
             auto_session_button.config(text="Start Auto Session", state="normal")
         refresh_fly_log_button_state()
-
-    def cancel_hold_timeout() -> None:
-        nonlocal hold_timeout_after_id
-        if hold_timeout_after_id is not None:
-            try:
-                root.after_cancel(hold_timeout_after_id)
-            except Exception:
-                pass
-            finally:
-                hold_timeout_after_id = None
 
     def cancel_level_timer() -> None:
         nonlocal level_after_id
@@ -2935,8 +3192,7 @@ def main() -> None:
         level_active = False
         level_pulse_inflight = False
         level_timeout_deadline_s = None
-        if hold_timeout_after_id is None:
-            set_live_channel_outputs(base_channel_outputs)
+        set_live_channel_outputs(base_channel_outputs)
         update_link_indicators()
         if update_status and was_active and not is_closing:
             status.set(reason)
@@ -2971,9 +3227,9 @@ def main() -> None:
             stop_level_loop(update_status=True, reason="Auto-level stopped: FC is disconnected.")
             return
         if level_timeout_deadline_s is not None and time.monotonic() >= level_timeout_deadline_s:
-            stop_level_loop(update_status=True, reason=f"Auto-level timed out after {level_timeout_s:.3g}s.")
+            stop_level_loop(update_status=True, reason=f"Auto-level timed out after {LEVEL_TIMEOUT_DEFAULT_S:.3g}s.")
             return
-        if hold_timeout_after_id is not None or level_pulse_inflight:
+        if level_pulse_inflight:
             schedule_level_step()
             return
 
@@ -3038,7 +3294,7 @@ def main() -> None:
         )
 
     def do_level() -> None:
-        nonlocal level_active, level_timeout_deadline_s, level_timeout_s
+        nonlocal level_active, level_timeout_deadline_s
         try:
             if level_active:
                 stop_level_loop(update_status=True)
@@ -3047,30 +3303,22 @@ def main() -> None:
                 raise RuntimeError("Press Connect Arduino before using Level.")
             if not fc_service.is_connected:
                 raise RuntimeError("Connect FC before using Level.")
-            if hold_command_inflight:
-                raise RuntimeError("Wait for active Pulse command to finish.")
-            if hold_timeout_after_id is not None:
-                raise RuntimeError("Wait for active Hold to finish or press ∅/Stop.")
             if fc_service.latest_attitude() is None:
                 raise RuntimeError("No FC attitude sample yet. Wait a moment, then press Level again.")
-            durations = parse_entries(dur_entries, float, "Duration")
-            level_timeout_s = max(durations[ROLL_CHANNEL_INDEX], durations[PITCH_CHANNEL_INDEX])
-            if level_timeout_s < LEVEL_TIMEOUT_MIN_S or level_timeout_s > LEVEL_TIMEOUT_MAX_S:
-                raise RuntimeError(
-                    f"Duration CH1/CH2 must be between {LEVEL_TIMEOUT_MIN_S:.3g}s and {LEVEL_TIMEOUT_MAX_S:.3g}s."
-                )
             level_active = True
-            level_timeout_deadline_s = time.monotonic() + level_timeout_s
+            level_timeout_deadline_s = time.monotonic() + LEVEL_TIMEOUT_DEFAULT_S
             update_link_indicators()
-            status.set(f"Auto-level active ({level_timeout_s:.3g}s timeout). Press Level again to stop.")
+            status.set(f"Auto-level active ({LEVEL_TIMEOUT_DEFAULT_S:.3g}s timeout). Press Level again to stop.")
             run_level_step()
         except Exception as exc:
             stop_level_loop(update_status=False)
             set_error("Level error", exc)
 
     def close_run_connection() -> None:
-        nonlocal run_ser, run_quant, run_max_count, run_active, hold_command_inflight
+        nonlocal run_ser, run_quant, run_max_count, run_active, beeper_marker_active
         nonlocal channel_update_inflight, pending_channel_update_channels, pending_channel_update_offsets
+        nonlocal pending_channel_update_after
+        beeper_marker_active = False
         if run_ser is not None:
             try:
                 run_ser.close()
@@ -3081,14 +3329,16 @@ def main() -> None:
                 run_quant = None
                 run_max_count = None
                 run_active = False
-                hold_command_inflight = False
                 channel_update_inflight = False
                 pending_channel_update_channels = None
                 pending_channel_update_offsets = None
+                pending_channel_update_after = None
                 update_link_indicators()
 
     def do_fc_connect() -> None:
         try:
+            if simulation_mode_enabled():
+                raise RuntimeError("Turn off Simulate before connecting FC.")
             if fc_service.is_connected:
                 return
             selected_port = fc_port()
@@ -3120,12 +3370,18 @@ def main() -> None:
                 status.set("FC disconnected.")
 
     def do_fc_toggle() -> None:
+        if simulation_mode_enabled():
+            status.set("Turn off Simulate before connecting FC.")
+            return
         if fc_service.is_connected:
             do_fc_disconnect()
         else:
             do_fc_connect()
 
     def do_arduino_toggle() -> None:
+        if simulation_mode_enabled():
+            status.set("Turn off Simulate before connecting Arduino.")
+            return
         if start_pending:
             return
         if run_active and run_ser is not None:
@@ -3147,11 +3403,19 @@ def main() -> None:
             pass
         fc_poll_after_id = root.after(60, poll_fc_attitude)
 
-    def _task_open_and_start(worker_self: SerialWorker, port: str, channels: list[int], offsets: list[int]):
+    def _task_open_and_start(
+        worker_self: SerialWorker,
+        port: str,
+        channels: list[int],
+        offsets: list[int],
+        marker_active: bool,
+    ):
         ser = open_serial(port)
         worker_self.ser = ser
         try:
-            quant, max_count, version_warning = run_ppm_on_serial(ser, channels, offsets)
+            ppm_channels = ppm_channels_for_firmware(channels, marker_active)
+            ppm_offsets = ppm_offsets_for_firmware(offsets, len(ppm_channels))
+            quant, max_count, version_warning = run_ppm_on_serial(ser, ppm_channels, ppm_offsets)
         except Exception:
             ser.close()
             worker_self.ser = None
@@ -3168,10 +3432,7 @@ def main() -> None:
                 finally:
                     worker_self.ser = None
             return None
-        else:
-            with open_serial(port) as ser:
-                stop_ppm_on_serial(ser)
-            return None
+        return None
 
     def _task_hold(worker_self: SerialWorker, i: int, target: int, offset: int, timeout_s: float):
         if worker_self.ser is None:
@@ -3286,31 +3547,6 @@ def main() -> None:
     def _task_generate_step_response_report(_worker_self: SerialWorker, log_paths: list[str]):
         return generate_step_response_report(log_paths, blackbox_import_dir)
 
-    def _task_hold_humanized(
-        worker_self: SerialWorker,
-        i: int,
-        target: int,
-        offset: int,
-        timeout_s: float,
-        channels: list[int],
-        offsets: list[int],
-    ):
-        if worker_self.ser is None:
-            raise RuntimeError("Serial not open")
-        quant, max_count = read_regs(worker_self.ser, REG_QUANT, 2)
-        set_channel_with_human_profile_until_stop_on_serial(
-            worker_self.ser,
-            quant,
-            max_count,
-            channels,
-            offsets,
-            i,
-            target,
-            offset,
-            timeout_s,
-        )
-        return read_pulse_status_on_serial(worker_self.ser, max_count)
-
     def _task_hold_end(worker_self: SerialWorker, i: int):
         if worker_self.ser is None:
             raise RuntimeError("Serial not open")
@@ -3318,21 +3554,30 @@ def main() -> None:
         end_hold_on_serial(worker_self.ser, max_count, i)
         return read_pulse_status_on_serial(worker_self.ser, max_count)
 
-    def _task_run_ppm_on_existing(worker_self: SerialWorker, channels: list[int], offsets: list[int]):
+    def _task_run_ppm_on_existing(
+        worker_self: SerialWorker,
+        channels: list[int],
+        offsets: list[int],
+        marker_active: bool,
+    ):
         if worker_self.ser is None:
             raise RuntimeError("Serial not open")
-        return run_ppm_on_serial(worker_self.ser, channels, offsets)
+        ppm_channels = ppm_channels_for_firmware(channels, marker_active)
+        ppm_offsets = ppm_offsets_for_firmware(offsets, len(ppm_channels))
+        return run_ppm_on_serial(worker_self.ser, ppm_channels, ppm_offsets)
 
-    def _task_update_channels(worker_self: SerialWorker, channels: list[int], offsets: list[int]):
+    def _task_update_channels(
+        worker_self: SerialWorker,
+        channels: list[int],
+        offsets: list[int],
+        marker_active: bool,
+    ):
         if worker_self.ser is None:
             raise RuntimeError("Serial not open")
-        quant, max_count, _ = run_ppm_on_serial(worker_self.ser, channels, offsets)
+        ppm_channels = ppm_channels_for_firmware(channels, marker_active)
+        ppm_offsets = ppm_offsets_for_firmware(offsets, len(ppm_channels))
+        quant, max_count, _ = run_ppm_on_serial(worker_self.ser, ppm_channels, ppm_offsets)
         return (quant, max_count, channels)
-
-    def _task_read_pulse_status(worker_self: SerialWorker, max_count: int):
-        if worker_self.ser is None:
-            raise RuntimeError("Serial not open")
-        return read_pulse_status_on_serial(worker_self.ser, max_count)
 
     def _task_shutdown(worker_self: SerialWorker):
         if worker_self.ser is None:
@@ -3363,22 +3608,24 @@ def main() -> None:
 
     def do_start() -> None:
         nonlocal run_active, run_port, run_ser, run_quant, run_max_count, start_pending, base_channel_outputs
+        nonlocal beeper_marker_active
         nonlocal channel_update_inflight, pending_channel_update_channels, pending_channel_update_offsets
+        nonlocal pending_channel_update_after
         try:
+            if simulation_mode_enabled():
+                raise RuntimeError("Turn off Simulate before connecting Arduino.")
             if start_pending:
                 raise RuntimeError("Start is already in progress.")
-            if hold_command_inflight:
-                raise RuntimeError("Wait for active Pulse command to finish.")
-            if hold_timeout_after_id is not None:
-                raise RuntimeError("Wait for active Hold to finish or press ∅/Stop.")
             channels = parse_entries(ch_entries, int, "Channel")
             require_range(channels, "Channel", 1000, 2000)
             offsets = parse_entries(off_entries, int, "Offset")
             selected_port = port()
+            beeper_marker_active = False
 
             def on_start_done(ok: bool, res: object) -> None:
                 nonlocal run_active, run_port, run_ser, run_quant, run_max_count, start_pending, base_channel_outputs
                 nonlocal channel_update_inflight, pending_channel_update_channels, pending_channel_update_offsets
+                nonlocal pending_channel_update_after
                 start_pending = False
                 if not ok:
                     update_link_indicators()
@@ -3403,6 +3650,7 @@ def main() -> None:
                 channel_update_inflight = False
                 pending_channel_update_channels = None
                 pending_channel_update_offsets = None
+                pending_channel_update_after = None
                 base_channel_outputs = channels.copy()
                 set_live_channel_outputs(base_channel_outputs)
                 update_link_indicators()
@@ -3416,13 +3664,26 @@ def main() -> None:
             if run_ser is None:
                 start_pending = True
                 update_link_indicators()
-                worker.submit(_task_open_and_start, selected_port, channels, offsets, callback=on_start_done)
+                worker.submit(
+                    _task_open_and_start,
+                    selected_port,
+                    channels,
+                    offsets,
+                    beeper_marker_active,
+                    callback=on_start_done,
+                )
             else:
                 if selected_port != run_port:
                     raise RuntimeError(f"Output is active on {run_port}. Press Disconnect Arduino before switching ports.")
                 start_pending = True
                 update_link_indicators()
-                worker.submit(_task_run_ppm_on_existing, channels, offsets, callback=on_start_done)
+                worker.submit(
+                    _task_run_ppm_on_existing,
+                    channels,
+                    offsets,
+                    beeper_marker_active,
+                    callback=on_start_done,
+                )
 
         except Exception as exc:
             start_pending = False
@@ -3431,12 +3692,10 @@ def main() -> None:
 
     def do_stop() -> None:
         try:
-            if hold_command_inflight:
-                raise RuntimeError("Pulse command is in progress. Wait a moment, then try again.")
-            cancel_hold_timeout()
             def on_stop_done(ok: bool, res: object) -> None:
-                nonlocal run_ser, run_quant, run_max_count, run_active, hold_command_inflight
+                nonlocal run_ser, run_quant, run_max_count, run_active, beeper_marker_active
                 nonlocal channel_update_inflight, pending_channel_update_channels, pending_channel_update_offsets
+                nonlocal pending_channel_update_after
                 if not ok:
                     set_error("Stop error", res if isinstance(res, Exception) else RuntimeError(res))
                     return
@@ -3447,10 +3706,11 @@ def main() -> None:
                 run_quant = None
                 run_max_count = None
                 run_active = False
-                hold_command_inflight = False
+                beeper_marker_active = False
                 channel_update_inflight = False
                 pending_channel_update_channels = None
                 pending_channel_update_offsets = None
+                pending_channel_update_after = None
                 set_live_channel_outputs(parse_channel_values_with_defaults())
                 update_link_indicators()
                 status.set("PPM output stopped.")
@@ -3459,193 +3719,10 @@ def main() -> None:
         except Exception as exc:
             set_error("Stop error", exc)
 
-    def do_hold_send(i: int, direction: int) -> None:
-        nonlocal run_max_count, hold_timeout_after_id, hold_command_inflight
-        try:
-            if not run_active or run_ser is None:
-                raise RuntimeError("Press Connect Arduino before using Hold.")
-            if level_active:
-                stop_level_loop(update_status=False)
-            if hold_command_inflight:
-                raise RuntimeError("A pulse command is already in progress.")
-            if hold_timeout_after_id is not None:
-                raise RuntimeError("A hold command is already active. Wait for timeout or press ∅.")
-
-            channels = parse_entries(ch_entries, int, "Channel")
-            require_range(channels, "Channel", 1000, 2000)
-            offsets = parse_entries(off_entries, int, "Offset")
-            targets = parse_entries(target_entries, int, "Target")
-            require_range(targets, "Target", 0, 500)
-            durations = parse_entries(dur_entries, float, "Duration")
-            require_duration_range(durations, 0.05, 60.0)
-            timeout_s = durations[i]
-            signed_direction = 1 if direction >= 0 else -1
-            target_delta_us = signed_direction * targets[i]
-            pulse_target_us = channels[i] + target_delta_us
-            if pulse_target_us < 1000 or pulse_target_us > 2000:
-                raise RuntimeError(
-                    f"Computed pulse value CH{i + 1} is {pulse_target_us}. "
-                    "Adjust Channel/Target so output stays between 1000 and 2000."
-                )
-            angle_threshold = 0.0
-            angle_state = str(angle_entries[i].cget("state"))
-            if angle_state == "normal":
-                raw_threshold = angle_entries[i].get().strip()
-                if raw_threshold:
-                    try:
-                        angle_magnitude = float(raw_threshold)
-                    except ValueError as exc:
-                        raise RuntimeError(f"Angle CH{i + 1} must be a number.") from exc
-                    if angle_magnitude < 0 or angle_magnitude > 45:
-                        raise RuntimeError(f"Angle CH{i + 1} must be between 0 and 45.")
-                    if angle_magnitude > 0:
-                        angle_threshold = float(signed_direction) * angle_magnitude
-
-            def restore_after_hold_failure() -> None:
-                if not run_active or run_ser is None:
-                    return
-                restore_base_outputs_after_hold(offsets)
-
-            def on_hold_done(ok: bool, res: object) -> None:
-                nonlocal hold_timeout_after_id, run_max_count, hold_command_inflight
-                hold_command_inflight = False
-                if not ok:
-                    restore_after_hold_failure()
-                    set_error("Hold error", res if isinstance(res, Exception) else RuntimeError(res))
-                    return
-                if not isinstance(res, int):
-                    restore_after_hold_failure()
-                    set_error("Hold error", RuntimeError("Unexpected worker result from hold task"))
-                    return
-                pulse_status = res
-                if pulse_status == PULSE_STATUS_REJECTED:
-                    restore_after_hold_failure()
-                    set_error("Hold error", RuntimeError("Firmware rejected hold command"))
-                    return
-                active_outputs = base_channel_outputs.copy()
-                active_outputs[i] = pulse_target_us
-                set_live_channel_outputs(active_outputs)
-
-                timeout_ms = max(1, round(timeout_s * 1000))
-                chan_label = i + 1
-                deadline_s = time.monotonic() + timeout_s
-                direction_label = "positive" if signed_direction > 0 else "negative"
-
-                def schedule_timeout_status_check() -> None:
-                    def cb(ok2: bool, res2: object) -> None:
-                        nonlocal hold_timeout_after_id
-                        if not ok2:
-                            set_error("Hold timeout error", res2 if isinstance(res2, Exception) else RuntimeError(res2))
-                            hold_timeout_after_id = None
-                            return
-                        if not isinstance(res2, int):
-                            set_error("Hold timeout error", RuntimeError("Unexpected worker result from pulse-status task"))
-                            hold_timeout_after_id = None
-                            return
-                        pulse_status_now = res2
-                        if pulse_status_now not in (PULSE_STATUS_TIMEOUT_RESTORED, PULSE_STATUS_HOLD_ENDED):
-                            hold_timeout_after_id = root.after(HOLD_TIMEOUT_POLL_MS, schedule_timeout_status_check)
-                            return
-                        hold_timeout_after_id = None
-                        restore_base_outputs_after_hold(offsets)
-                        if pulse_status_now == PULSE_STATUS_TIMEOUT_RESTORED:
-                            status.set(f"CH{chan_label} hold timed out; channel restored.")
-                        else:
-                            status.set(f"CH{chan_label} hold ended; channel restored.")
-
-                    worker.submit(_task_read_pulse_status, run_max_count or 0, callback=cb)
-
-                def on_angle_hold_end_done(ok3: bool, res3: object) -> None:
-                    nonlocal hold_timeout_after_id
-                    if not ok3:
-                        set_error("Hold end error", res3 if isinstance(res3, Exception) else RuntimeError(res3))
-                        hold_timeout_after_id = root.after(HOLD_ANGLE_CHECK_MS, schedule_angle_or_timeout_check)
-                        return
-                    if not isinstance(res3, int):
-                        set_error("Hold end error", RuntimeError("Unexpected worker result from hold-end task"))
-                        hold_timeout_after_id = root.after(HOLD_ANGLE_CHECK_MS, schedule_angle_or_timeout_check)
-                        return
-                    if res3 == PULSE_STATUS_REJECTED:
-                        set_error("Hold end error", RuntimeError("Firmware rejected hold-end command"))
-                        hold_timeout_after_id = root.after(HOLD_ANGLE_CHECK_MS, schedule_angle_or_timeout_check)
-                        return
-                    cancel_hold_timeout()
-                    restore_base_outputs_after_hold(offsets)
-                    status.set(f"CH{chan_label} hold ended on angle threshold; channel restored.")
-
-                def schedule_angle_or_timeout_check() -> None:
-                    nonlocal hold_timeout_after_id
-                    if hold_timeout_after_id is None:
-                        return
-
-                    angle_entry_enabled = str(angle_entries[i].cget("state")) == "normal"
-                    if angle_entry_enabled and angle_threshold != 0 and is_angle_threshold_reached(i, angle_threshold):
-                        worker.submit(_task_hold_end, i, callback=on_angle_hold_end_done)
-                        return
-
-                    if time.monotonic() >= deadline_s:
-                        schedule_timeout_status_check()
-                        return
-
-                    remaining_ms = max(1, round((deadline_s - time.monotonic()) * 1000))
-                    hold_timeout_after_id = root.after(min(HOLD_ANGLE_CHECK_MS, remaining_ms), schedule_angle_or_timeout_check)
-
-                hold_timeout_after_id = root.after(min(HOLD_ANGLE_CHECK_MS, timeout_ms), schedule_angle_or_timeout_check)
-                status.set(
-                    f"CH{chan_label} hold active ({direction_label}, {target_delta_us:+d}us). "
-                    f"Press ∅ for early restore (auto in {timeout_s:.3g}s)."
-                )
-
-            hold_command_inflight = True
-            try:
-                worker.submit(
-                    _task_hold_humanized,
-                    i,
-                    pulse_target_us,
-                    offsets[i],
-                    timeout_s,
-                    channels.copy(),
-                    offsets.copy(),
-                    callback=on_hold_done,
-                )
-            except Exception:
-                hold_command_inflight = False
-                raise
-        except Exception as exc:
-            set_error("Hold error", exc)
-
-    def do_hold_end(i: int) -> None:
-        try:
-            if not run_active or run_ser is None:
-                raise RuntimeError("Press Connect Arduino before ending Hold.")
-            if hold_command_inflight:
-                raise RuntimeError("Pulse command is still ramping in. Wait a moment, then try ∅.")
-            if hold_timeout_after_id is None:
-                raise RuntimeError("No active Hold to end.")
-
-            def on_hold_end_done(ok: bool, res: object) -> None:
-                if not ok:
-                    set_error("Hold end error", res if isinstance(res, Exception) else RuntimeError(res))
-                    return
-                if not isinstance(res, int):
-                    set_error("Hold end error", RuntimeError("Unexpected worker result from hold-end task"))
-                    return
-                if res == PULSE_STATUS_REJECTED:
-                    set_error("Hold end error", RuntimeError("Firmware rejected hold-end command"))
-                    return
-                cancel_hold_timeout()
-                restore_base_outputs_after_hold()
-                status.set(f"CH{i + 1} hold ended; channel restored.")
-
-            worker.submit(_task_hold_end, i, callback=on_hold_end_done)
-        except Exception as exc:
-            set_error("Hold end error", exc)
-
     def on_close() -> None:
         nonlocal is_closing, fc_poll_after_id
         is_closing = True
         cancel_adjust_repeat()
-        cancel_hold_timeout()
         stop_auto_session_runtime()
         stop_simulated_auto_session("", restore_display=False)
         if fc_poll_after_id is not None:
@@ -3678,30 +3755,14 @@ def main() -> None:
     analyze_blackbox_button.config(command=do_analyze_blackbox_logs)
     auto_session_button.config(command=do_auto_session_toggle)
     fly_log_button.config(command=do_pid_plan_fly_log_toggle)
-    simulate_auto_session_button.config(command=do_simulated_auto_session_toggle)
+    simulation_mode_checkbutton.config(command=on_simulation_mode_changed)
+    pid_progress_button.config(command=open_pid_progress_window)
     step_response_button.config(command=do_step_response_report)
     pid_tuning_plan_button.config(command=do_pid_tuning_plan)
-    auto_open_selected_button.config(command=open_selected_report_file)
-    auto_open_all_button.config(command=open_all_report_files)
-    auto_clear_reports_button.config(command=do_clear_report_files)
     arduino_button.config(command=do_arduino_toggle)
-    for i, canvas in enumerate(hold_send_canvases):
-        def on_hold_press(event: tk.Event, i: int = i) -> None:
-            action = get_pulse_action(event)
-            if action == "end":
-                do_hold_end(i)
-                return
-            direction = 1 if action == "positive" else -1
-            do_hold_send(i, direction)
-
-        canvas.bind("<ButtonPress-1>", on_hold_press)
     level_button.config(command=do_level)
     for i, canvas in enumerate(channel_adjust_canvases):
         canvas.bind("<ButtonPress-1>", lambda event, i=i: on_adjust_press(adjust_channel_value, i, event))
-        canvas.bind("<ButtonRelease-1>", on_adjust_release)
-        canvas.bind("<Leave>", on_adjust_release)
-    for i, canvas in enumerate(target_adjust_canvases):
-        canvas.bind("<ButtonPress-1>", lambda event, i=i: on_adjust_press(adjust_target_value, i, event))
         canvas.bind("<ButtonRelease-1>", on_adjust_release)
         canvas.bind("<Leave>", on_adjust_release)
     for i, canvas in enumerate(pid_ff_adjust_canvases):

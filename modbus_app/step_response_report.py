@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import math
 import shutil
@@ -58,6 +59,13 @@ class StepResponseLogMetrics:
     color: str
     source_log: str
     decoded_csv: str
+    marker_column: str
+    marker_start_index: int | None
+    marker_end_index: int | None
+    marker_start_s: float | None
+    marker_end_s: float | None
+    marker_samples: int
+    marker_warning: str
     axes: dict[str, StepResponseAxisMetrics]
 
 
@@ -113,6 +121,16 @@ def format_step_response_report(report: StepResponseReport) -> str:
     lines = ["PIDtoolbox Step Response", f"Report: {report.html_path}", ""]
     for log in report.logs:
         lines.append(log.label)
+        if log.marker_column and log.marker_start_s is not None and log.marker_end_s is not None:
+            marker_line = (
+                f"- beeper marker: {log.marker_column}, "
+                f"{log.marker_start_s:.2f}s to {log.marker_end_s:.2f}s"
+            )
+            if log.marker_warning:
+                marker_line = f"{marker_line} ({log.marker_warning})"
+            lines.append(marker_line)
+        elif log.marker_warning:
+            lines.append(f"- beeper marker: {log.marker_warning}")
         for axis in ("roll", "pitch", "yaw"):
             metrics = log.axes.get(axis)
             if metrics is None:
@@ -193,17 +211,30 @@ def _find_tools_decoder() -> Path:
     raise RuntimeError("No Blackbox decoder was found in the tools folder.")
 
 
+@dataclass(frozen=True)
+class _MarkerWindow:
+    column: str
+    start_index: int | None
+    end_index: int | None
+    start_s: float | None
+    end_s: float | None
+    samples: int
+    warning: str
+
+
 def _analyze_log(source: Path, csv_path: Path, label: str, color: str) -> StepResponseLogMetrics:
     columns = load_blackbox_csv(csv_path)
     time_col = detect_time_column(columns)
     if time_col is None:
         raise RuntimeError(f"Decoded CSV has no time column: {csv_path}")
-    time_us = columns[time_col]
+    marker = _detect_beeper_marker_window(columns, time_col, csv_path)
+    analysis_columns = _slice_columns_for_marker(columns, marker)
+    time_us = analysis_columns[time_col]
 
     axes: dict[str, StepResponseAxisMetrics] = {}
     for axis, axis_index in (("roll", 0), ("pitch", 1), ("yaw", 2)):
-        setpoint_col = _pick_column(columns, [f"axisRate[{axis_index}]", f"setpoint[{axis_index}]"])
-        gyro_col = _pick_column(columns, [f"gyroADC[{axis_index}] (deg/s)", f"gyroADC[{axis_index}]"])
+        setpoint_col = _pick_column(analysis_columns, [f"axisRate[{axis_index}]", f"setpoint[{axis_index}]"])
+        gyro_col = _pick_column(analysis_columns, [f"gyroADC[{axis_index}] (deg/s)", f"gyroADC[{axis_index}]"])
         if setpoint_col is None or gyro_col is None:
             axes[axis] = StepResponseAxisMetrics(
                 axis=axis,
@@ -219,8 +250,8 @@ def _analyze_log(source: Path, csv_path: Path, label: str, color: str) -> StepRe
             continue
         try:
             result = compute_pidtoolbox_step_response(
-                columns[setpoint_col],
-                columns[gyro_col],
+                analysis_columns[setpoint_col],
+                analysis_columns[gyro_col],
                 time_us=time_us,
                 smooth_level=int(STEP_RESPONSE_SETTINGS["smooth_level"]),
                 y_correction=bool(STEP_RESPONSE_SETTINGS["y_correction"]),
@@ -250,8 +281,107 @@ def _analyze_log(source: Path, csv_path: Path, label: str, color: str) -> StepRe
         color=color,
         source_log=str(source),
         decoded_csv=str(csv_path),
+        marker_column=marker.column,
+        marker_start_index=marker.start_index,
+        marker_end_index=marker.end_index,
+        marker_start_s=marker.start_s,
+        marker_end_s=marker.end_s,
+        marker_samples=marker.samples,
+        marker_warning=marker.warning,
         axes=axes,
     )
+
+
+def _detect_beeper_marker_window(columns: dict[str, np.ndarray], time_col: str, csv_path: Path) -> _MarkerWindow:
+    flag_marker = _detect_beeper_mode_flag_window(csv_path, columns, time_col)
+    if flag_marker is not None:
+        return flag_marker
+
+    return _MarkerWindow("", None, None, None, None, 0, "BEEPERON flight mode flag not found; full log used")
+
+
+def _detect_beeper_mode_flag_window(
+    csv_path: Path,
+    columns: dict[str, np.ndarray],
+    time_col: str,
+) -> _MarkerWindow | None:
+    text_column = _load_csv_text_column(csv_path, ["flightModeFlags (flags)", "flightModeFlags"])
+    if text_column is None:
+        return None
+    marker_col, values = text_column
+    high = np.asarray([_flight_mode_has_beeper_on(value) for value in values], dtype=bool)
+    if not np.any(high):
+        return None
+
+    max_samples = len(columns[time_col])
+    high_indices = np.flatnonzero(high)
+    start = int(high_indices[0])
+    if start >= max_samples:
+        return None
+
+    after_start = high[start + 1 :]
+    off_after_start = np.flatnonzero(~after_start)
+    end = start + 1 + int(off_after_start[0]) if off_after_start.size else len(high)
+    end = min(end, max_samples)
+
+    times = np.asarray(columns[time_col], dtype=float)
+    start_s = _time_value_s(times, start)
+    end_s = _time_value_s(times, max(start, end - 1))
+    return _MarkerWindow(marker_col, start, end, start_s, end_s, int(end - start), "using BEEPERON flight mode flag")
+
+
+def _flight_mode_has_beeper_on(value: str) -> bool:
+    tokens = [token.strip().upper() for token in str(value or "").split("|")]
+    return "BEEPERON" in tokens or "BEEPER" in tokens
+
+
+def _load_csv_text_column(csv_path: Path, candidates: list[str]) -> tuple[str, list[str]] | None:
+    with csv_path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
+        reader = csv.reader(handle, skipinitialspace=True)
+        header: list[str] | None = None
+        column_name = ""
+        column_index = -1
+        for row in reader:
+            if not row:
+                continue
+            normalized = {_normalize_text_header(name): index for index, name in enumerate(row)}
+            for candidate in candidates:
+                index = normalized.get(_normalize_text_header(candidate))
+                if index is not None:
+                    header = row
+                    column_name = row[index]
+                    column_index = index
+                    break
+            if header is not None:
+                break
+
+        if header is None or column_index < 0:
+            return None
+
+        values: list[str] = []
+        for row in reader:
+            values.append(row[column_index].strip() if column_index < len(row) else "")
+        return column_name, values
+
+
+def _normalize_text_header(header: str) -> str:
+    return "".join(ch for ch in header.strip().lower() if ch not in " \t\r\n_()-")
+
+
+def _time_value_s(times: np.ndarray, index: int) -> float | None:
+    if times.size == 0:
+        return None
+    index = max(0, min(int(index), times.size - 1))
+    value = float(times[index])
+    if not math.isfinite(value):
+        return None
+    return value / 1_000_000.0
+
+
+def _slice_columns_for_marker(columns: dict[str, np.ndarray], marker: _MarkerWindow) -> dict[str, np.ndarray]:
+    if marker.start_index is None or marker.end_index is None or marker.end_index <= marker.start_index:
+        return columns
+    return {name: values[marker.start_index : marker.end_index] for name, values in columns.items()}
 
 
 def _axis_metrics_from_result(
@@ -275,6 +405,11 @@ def _result_for_plot(log: StepResponseLogMetrics, axis: str) -> StepResponseResu
     metrics = log.axes.get(axis)
     if time_col is None or metrics is None or metrics.error or not metrics.setpoint_column or not metrics.gyro_column:
         return None
+    if log.marker_start_index is not None and log.marker_end_index is not None:
+        columns = {
+            name: values[log.marker_start_index : log.marker_end_index]
+            for name, values in columns.items()
+        }
     return compute_pidtoolbox_step_response(
         columns[metrics.setpoint_column],
         columns[metrics.gyro_column],
@@ -408,6 +543,15 @@ def _summary_json_payload(report_dir: Path, html_path: Path, summary_json: Path,
                 "color": log.color,
                 "source_log": log.source_log,
                 "decoded_csv": log.decoded_csv,
+                "beeper_marker": {
+                    "column": log.marker_column,
+                    "start_index": log.marker_start_index,
+                    "end_index": log.marker_end_index,
+                    "start_s": log.marker_start_s,
+                    "end_s": log.marker_end_s,
+                    "samples": log.marker_samples,
+                    "warning": log.marker_warning,
+                },
                 "axes": {
                     axis: {
                         "setpoint_column": metrics.setpoint_column,

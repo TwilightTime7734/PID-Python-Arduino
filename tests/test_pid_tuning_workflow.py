@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -26,6 +27,9 @@ class PIDTuningWorkflowTests(unittest.TestCase):
         self.assertIn("D tuning, roll/pitch only", plan)
         self.assertIn("Yaw final recommendation, not tested", plan)
         self.assertNotIn("Yaw P candidates", plan)
+        self.assertNotIn("Write values while disarmed", plan)
+        self.assertNotIn("Use Y Correction", plan)
+        self.assertNotIn("Keep final picks supervised", plan)
 
     def test_high_risk_inputs_reduce_starting_p(self) -> None:
         recommendation = suggest_starting_p(
@@ -62,6 +66,11 @@ class PIDTuningWorkflowTests(unittest.TestCase):
             self.assertTrue(Path(report.text_path).exists())
             self.assertTrue(Path(report.summary_json).exists())
             self.assertIn("pid_tuning_plan", report.report_dir)
+            plan_text = Path(report.text_path).read_text(encoding="utf-8").strip()
+            summary = json.loads(Path(report.summary_json).read_text(encoding="utf-8"))
+            self.assertEqual(summary["plan"]["format"], "sample")
+            self.assertEqual(summary["plan"]["text"], plan_text)
+            self.assertIn("Once the 'Fly/Log' button is pressed", summary["plan"]["text"])
 
     def test_load_generated_pid_tuning_plan_uses_summary_values(self) -> None:
         recommendation = suggest_starting_p(PAVO_PICO_II_PRESET_INPUTS)
@@ -72,8 +81,8 @@ class PIDTuningWorkflowTests(unittest.TestCase):
 
             self.assertEqual(loaded.start_p, recommendation.start_p)
             self.assertEqual(loaded.p_sweep, recommendation.p_sweep)
-            self.assertEqual(loaded.d_sweep, (17, 23, 30, 36))
-            self.assertEqual(loaded.optional_d, 42)
+            self.assertEqual(loaded.d_sweep, (17, 23, 30, 36, 42))
+            self.assertIsNone(loaded.optional_d)
             self.assertEqual(loaded.yaw_final_pid_ff, recommendation.yaw_final_pid_ff)
 
     def test_find_latest_pid_tuning_plan_returns_newest_text_file(self) -> None:

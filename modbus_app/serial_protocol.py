@@ -24,14 +24,6 @@ from .constants import (
 )
 
 
-HUMAN_STICK_TOTAL_S = 0.200
-HUMAN_STICK_DEADBAND_S = 0.030
-HUMAN_STICK_ACCEL_END_S = 0.150
-HUMAN_STICK_STEP_S = 0.010
-HUMAN_STICK_DEADBAND_PROGRESS = 0.03
-HUMAN_STICK_ACCEL_END_PROGRESS = 0.72
-
-
 def crc16(data: bytes) -> int:
     crc = 0xFFFF
     for b in data:
@@ -249,99 +241,6 @@ def set_channel_until_stop_on_serial(
 
     # Hold mode uses duration as a default timeout safety for automatic restore.
     send_pulse_command_on_serial(ser, max_count, chl, value_ticks, timeout_us)
-
-
-def _smoothstep(u: float) -> float:
-    return u * u * (3.0 - (2.0 * u))
-
-
-def _ease_out_cubic(u: float) -> float:
-    inv = 1.0 - u
-    return 1.0 - (inv * inv * inv)
-
-
-def _human_stick_progress(elapsed_s: float, total_s: float, deadband_s: float, accel_end_s: float) -> float:
-    if elapsed_s <= 0:
-        return 0.0
-    if elapsed_s >= total_s:
-        return 1.0
-    deadband = max(0.0, min(deadband_s, total_s))
-    accel_end = max(deadband, min(accel_end_s, total_s))
-    p_dead = HUMAN_STICK_DEADBAND_PROGRESS
-    p_accel = HUMAN_STICK_ACCEL_END_PROGRESS
-
-    if deadband > 0 and elapsed_s <= deadband:
-        u = elapsed_s / deadband
-        return p_dead * _smoothstep(u)
-
-    if accel_end > deadband and elapsed_s <= accel_end:
-        u = (elapsed_s - deadband) / (accel_end - deadband)
-        return p_dead + ((p_accel - p_dead) * (u * u * u))
-
-    if total_s > accel_end:
-        u = (elapsed_s - accel_end) / (total_s - accel_end)
-        return p_accel + ((1.0 - p_accel) * _ease_out_cubic(u))
-
-    return 1.0
-
-
-def _human_stick_targets(start_us: int, target_us: int, total_s: float) -> list[tuple[float, int]]:
-    if start_us == target_us or total_s <= 0:
-        return []
-    times: list[float] = [0.0]
-    step = max(0.002, HUMAN_STICK_STEP_S)
-    t = step
-    while t < total_s:
-        times.append(t)
-        t += step
-    times.extend((HUMAN_STICK_DEADBAND_S, HUMAN_STICK_ACCEL_END_S, total_s))
-    clamped_sorted = sorted({max(0.0, min(total_s, s)) for s in times})
-
-    span = target_us - start_us
-    last_value = start_us
-    targets: list[tuple[float, int]] = []
-    for elapsed_s in clamped_sorted[1:]:
-        progress = _human_stick_progress(elapsed_s, total_s, HUMAN_STICK_DEADBAND_S, HUMAN_STICK_ACCEL_END_S)
-        value = int(round(start_us + (span * progress)))
-        if value == last_value:
-            continue
-        targets.append((elapsed_s, value))
-        last_value = value
-    if not targets or targets[-1][1] != target_us:
-        targets.append((total_s, target_us))
-    return targets
-
-
-def set_channel_with_human_profile_until_stop_on_serial(
-    ser: serial.Serial,
-    quant: int,
-    max_count: int,
-    channels: list[int],
-    offsets: list[int],
-    chl: int,
-    val_us: int,
-    offset_us: int,
-    timeout_s: float,
-) -> None:
-    if chl < 0:
-        raise RuntimeError("Channel index must be >= 0")
-    if chl >= len(channels):
-        raise RuntimeError(f"Channel index {chl} out of range for configured channels ({len(channels)})")
-
-    profile_total_s = min(HUMAN_STICK_TOTAL_S, timeout_s)
-    start_us = int(channels[chl])
-    targets = _human_stick_targets(start_us, int(val_us), profile_total_s)
-    started_at = time.monotonic()
-    for elapsed_s, step_us in targets:
-        now = time.monotonic()
-        sleep_s = (started_at + elapsed_s) - now
-        if sleep_s > 0:
-            time.sleep(sleep_s)
-        stepped_channels = channels.copy()
-        stepped_channels[chl] = step_us
-        write_ppm_channels_on_serial(ser, quant, max_count, stepped_channels, offsets)
-
-    set_channel_until_stop_on_serial(ser, quant, max_count, chl, val_us, offset_us, timeout_s)
 
 
 def end_hold_on_serial(ser: serial.Serial, max_count: int, chl: int) -> None:

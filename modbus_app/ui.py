@@ -15,8 +15,6 @@ from .constants import (
     FC_PORT_DEFAULT,
     OFFSET_DEFAULTS,
     PORT_DEFAULT,
-    PULSE_DURATION_DEFAULTS,
-    PULSE_TARGET_DEFAULTS,
 )
 
 
@@ -32,12 +30,6 @@ def require_range(values: Sequence[int], label: str, min_value: int, max_value: 
     for idx, value in enumerate(values, 1):
         if value < min_value or value > max_value:
             raise RuntimeError(f"{label} CH{idx} must be between {min_value} and {max_value}")
-
-
-def require_duration_range(values: Sequence[float], min_s: float, max_s: float) -> None:
-    for idx, value in enumerate(values, 1):
-        if value < min_s or value > max_s:
-            raise RuntimeError(f"Duration CH{idx} must be between {min_s:.3g}s and {max_s:.3g}s")
 
 
 def make_row(root: tk.Misc, row: int, label: str, defaults: Sequence[int | float]) -> list[tk.Entry]:
@@ -109,15 +101,10 @@ class ArtificialHorizon(tk.Canvas):
 class MainUi:
     port_entry: tk.Entry | ttk.Combobox
     channel_adjust_canvases: list[tk.Canvas]
-    target_adjust_canvases: list[tk.Canvas]
     ch_entries: list[tk.Entry]
     off_entries: list[tk.Entry]
-    target_entries: list[tk.Entry]
-    dur_entries: list[tk.Entry]
-    angle_entries: list[tk.Entry]
     channel_output_canvases: list[tk.Canvas]
     channel_output_fill_ids: list[int]
-    hold_send_canvases: list[tk.Canvas]
     level_button: tk.Button
     status: tk.StringVar
     pc_link_box: tk.Label
@@ -136,12 +123,10 @@ class MainUi:
     arduino_button: tk.Button
     auto_session_button: tk.Button
     fly_log_button: tk.Button
-    simulate_auto_session_button: tk.Button
+    simulation_mode_var: tk.BooleanVar
+    simulation_mode_checkbutton: tk.Checkbutton
+    pid_progress_button: tk.Button
     auto_report_text: tk.Text
-    auto_report_listbox: tk.Listbox
-    auto_open_selected_button: tk.Button
-    auto_open_all_button: tk.Button
-    auto_clear_reports_button: tk.Button
     step_response_button: tk.Button
     pid_tuning_plan_button: tk.Button
 
@@ -179,33 +164,8 @@ def build_main_gui(root: tk.Tk) -> MainUi:
 
     ch_entries = make_row(main_frame, 3, "Default", CHANNEL_DEFAULTS)
     off_entries = make_row(main_frame, 4, "Offsets", OFFSET_DEFAULTS)
-    tk.Label(main_frame, text="Adjust Tgt").grid(row=5, column=0, padx=6, pady=(0, 2), sticky="e")
-    target_adjust_canvases: list[tk.Canvas] = []
-    for i in range(1, 5):
-        width = 52
-        height = 18
-        canvas = tk.Canvas(main_frame, width=width, height=height, bg="#F0F0F0", highlightthickness=0)
-        mid_x = width // 2
-        canvas.create_rectangle(1, 1, mid_x, height - 1, fill="#C94B4B", outline="")
-        canvas.create_rectangle(mid_x, 1, width - 1, height - 1, fill="#4CAF50", outline="")
-        canvas.create_line(mid_x, 1, mid_x, height - 1, fill="white", width=2)
-        canvas.create_text(13, height // 2, text="-", fill="white", font=("Segoe UI", 11, "bold"))
-        canvas.create_text(width - 13, height // 2, text="+", fill="white", font=("Segoe UI", 11, "bold"))
-        canvas.grid(row=5, column=i, padx=4, pady=(0, 2))
-        target_adjust_canvases.append(canvas)
 
-    target_entries = make_row(main_frame, 6, "Pulse Str", PULSE_TARGET_DEFAULTS)
-    dur_entries = make_row(main_frame, 7, "Duration", PULSE_DURATION_DEFAULTS)
-
-    tk.Label(main_frame, text="Angle").grid(row=8, column=0, padx=6, pady=(0, 2), sticky="e")
-    angle_entries: list[tk.Entry] = []
-    for i in range(1, 5):
-        entry = tk.Entry(main_frame, width=8)
-        entry.insert(0, "0")
-        entry.grid(row=8, column=i, padx=4, pady=(0, 2))
-        angle_entries.append(entry)
-
-    tk.Label(main_frame, text="Idle").grid(row=9, column=0, padx=6, pady=(0, 2), sticky="e")
+    tk.Label(main_frame, text="Idle").grid(row=5, column=0, padx=6, pady=(0, 2), sticky="e")
     channel_output_canvases: list[tk.Canvas] = []
     channel_output_fill_ids: list[int] = []
     for i in range(1, 5):
@@ -213,29 +173,9 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         canvas.create_rectangle(1, 2, 95, 12, fill="#E6EBF0", outline="#B4BEC8")
         canvas.create_line(48, 2, 48, 12, fill="#8F98A3")
         fill_id = canvas.create_rectangle(48, 3, 48, 11, fill="#94D98F", outline="")
-        canvas.grid(row=9, column=i, padx=4, pady=(0, 2))
+        canvas.grid(row=5, column=i, padx=4, pady=(0, 2))
         channel_output_canvases.append(canvas)
         channel_output_fill_ids.append(fill_id)
-
-    tk.Label(main_frame, text="Pulse").grid(row=10, column=0, padx=6, pady=1, sticky="e")
-    hold_send_canvases: list[tk.Canvas] = []
-    neutral_control_color = main_frame.cget("bg")
-    for i in range(4):
-        width = 78
-        height = 18
-        canvas = tk.Canvas(main_frame, width=width, height=height, bg=neutral_control_color, highlightthickness=0)
-        third_x = width // 3
-        second_third_x = third_x * 2
-        canvas.create_rectangle(1, 1, third_x, height - 1, fill="#C94B4B", outline="")
-        canvas.create_rectangle(third_x, 1, second_third_x, height - 1, fill=neutral_control_color, outline="#B4BEC8")
-        canvas.create_rectangle(second_third_x, 1, width - 1, height - 1, fill="#4CAF50", outline="")
-        canvas.create_line(third_x, 1, third_x, height - 1, fill="white", width=2)
-        canvas.create_line(second_third_x, 1, second_third_x, height - 1, fill="white", width=2)
-        canvas.create_text(third_x // 2, height // 2, text="-", fill="white", font=("Segoe UI", 11, "bold"))
-        canvas.create_text(third_x + (third_x // 2), height // 2, text="∅", fill="#1F2937", font=("Segoe UI Symbol", 10, "bold"))
-        canvas.create_text(second_third_x + (third_x // 2), height // 2, text="+", fill="white", font=("Segoe UI", 11, "bold"))
-        canvas.grid(row=10, column=i + 1, padx=4, pady=1)
-        hold_send_canvases.append(canvas)
 
     status = tk.StringVar(value="Idle")
     pc_link_box = tk.Label(main_frame, width=18, relief="groove", bd=2)
@@ -334,7 +274,14 @@ def build_main_gui(root: tk.Tk) -> MainUi:
     analyze_blackbox_button = tk.Button(button_row, text="Analyze Logs", width=11)
     analyze_blackbox_button.pack(side="left", padx=(0, 2))
     level_button = tk.Button(button_row, text="Level", width=6, state="disabled")
-    level_button.pack(side="left")
+    level_button.pack(side="left", padx=(0, 6))
+    simulation_mode_var = tk.BooleanVar(value=False)
+    simulation_mode_checkbutton = tk.Checkbutton(
+        button_row,
+        text="Simulate",
+        variable=simulation_mode_var,
+    )
+    simulation_mode_checkbutton.pack(side="left")
 
     auto_frame = tk.LabelFrame(layout_grid, text="Auto Tune Session", padx=8, pady=8)
     auto_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(6, 0))
@@ -345,39 +292,19 @@ def build_main_gui(root: tk.Tk) -> MainUi:
     auto_action_frame.grid(row=0, column=0, sticky="w", pady=(0, 6))
     auto_session_button = tk.Button(auto_action_frame, text="Start Auto Session", width=18)
     auto_session_button.pack(side="left", padx=(0, 4))
-    fly_log_button = tk.Button(auto_action_frame, text="Fly/Log", width=10, state="disabled")
+    fly_log_button = tk.Button(auto_action_frame, text="Fly/Log", width=18, state="disabled")
     fly_log_button.pack(side="left", padx=(0, 4))
-    simulate_auto_session_button = tk.Button(auto_action_frame, text="Simulate", width=10)
-    simulate_auto_session_button.pack(side="left", padx=(0, 4))
+    pid_progress_button = tk.Button(auto_action_frame, text="Progress", width=10)
+    pid_progress_button.pack(side="left", padx=(0, 4))
     step_response_button = tk.Button(auto_action_frame, text="Chart Step Response", width=18)
     step_response_button.pack(side="left", padx=(0, 4))
     pid_tuning_plan_button = tk.Button(auto_action_frame, text="PID Tuning Plan", width=16)
     pid_tuning_plan_button.pack(side="left")
 
-    auto_list_frame = tk.Frame(auto_frame)
-    auto_list_frame.grid(row=1, column=0, sticky="nsew")
-    tk.Label(auto_list_frame, text="Report Files").grid(row=0, column=0, sticky="w")
-    auto_report_listbox = tk.Listbox(auto_list_frame, width=48, height=10)
-    auto_report_listbox.grid(row=1, column=0, sticky="nsew")
-    auto_list_scroll = tk.Scrollbar(auto_list_frame, orient="vertical", command=auto_report_listbox.yview)
-    auto_list_scroll.grid(row=1, column=1, sticky="ns")
-    auto_report_listbox.config(yscrollcommand=auto_list_scroll.set)
-    auto_list_frame.grid_rowconfigure(1, weight=1)
-    auto_list_frame.grid_columnconfigure(0, weight=1)
-
-    auto_buttons = tk.Frame(auto_list_frame)
-    auto_buttons.grid(row=1, column=2, sticky="ns", padx=(8, 0))
-    auto_open_selected_button = tk.Button(auto_buttons, text="Open Selected", width=13)
-    auto_open_selected_button.pack(fill="x", pady=(0, 4))
-    auto_open_all_button = tk.Button(auto_buttons, text="Open All", width=10)
-    auto_open_all_button.pack(fill="x", pady=(0, 4))
-    auto_clear_reports_button = tk.Button(auto_buttons, text="Clear", width=10)
-    auto_clear_reports_button.pack(fill="x")
-
-    auto_report_text = tk.Text(auto_frame, width=100, height=7, wrap="word")
+    auto_report_text = tk.Text(auto_frame, width=100, height=12, wrap="word")
     auto_report_text.insert("1.0", "Report summary will appear here after an auto session.")
     auto_report_text.config(state="disabled")
-    auto_report_text.grid(row=2, column=0, sticky="we", pady=(8, 0))
+    auto_report_text.grid(row=1, column=0, sticky="we", pady=(8, 0))
 
     tk.Label(
         root,
@@ -391,15 +318,10 @@ def build_main_gui(root: tk.Tk) -> MainUi:
     return MainUi(
         port_entry=port_entry,
         channel_adjust_canvases=channel_adjust_canvases,
-        target_adjust_canvases=target_adjust_canvases,
         ch_entries=ch_entries,
         off_entries=off_entries,
-        target_entries=target_entries,
-        dur_entries=dur_entries,
-        angle_entries=angle_entries,
         channel_output_canvases=channel_output_canvases,
         channel_output_fill_ids=channel_output_fill_ids,
-        hold_send_canvases=hold_send_canvases,
         level_button=level_button,
         status=status,
         pc_link_box=pc_link_box,
@@ -418,12 +340,10 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         arduino_button=arduino_button,
         auto_session_button=auto_session_button,
         fly_log_button=fly_log_button,
-        simulate_auto_session_button=simulate_auto_session_button,
+        simulation_mode_var=simulation_mode_var,
+        simulation_mode_checkbutton=simulation_mode_checkbutton,
+        pid_progress_button=pid_progress_button,
         auto_report_text=auto_report_text,
-        auto_report_listbox=auto_report_listbox,
-        auto_open_selected_button=auto_open_selected_button,
-        auto_open_all_button=auto_open_all_button,
-        auto_clear_reports_button=auto_clear_reports_button,
         step_response_button=step_response_button,
         pid_tuning_plan_button=pid_tuning_plan_button,
     )

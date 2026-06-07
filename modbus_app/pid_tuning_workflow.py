@@ -8,10 +8,12 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
+from .constants import PID_PLAN_FLY_LOG_RUNTIME_S
+
 TUNED_AXES = ("roll", "pitch")
 START_P_DEFAULTS = {"roll": 45, "pitch": 47, "yaw": 45}
-D_SWEEP_VALUES = (17, 23, 30, 36)
-OPTIONAL_D_VALUE = 42
+D_SWEEP_VALUES = (17, 23, 30, 36, 42)
+OPTIONAL_D_VALUE = None
 I_SWEEP_VALUES = (
     {"roll": 35, "pitch": 40},
     {"roll": 60, "pitch": 65},
@@ -192,62 +194,97 @@ def format_pid_tuning_plan(recommendation: PStartRecommendation) -> str:
     start_p = recommendation.start_p
     p_sweep = recommendation.p_sweep
     yaw = recommendation.yaw_final_pid_ff
+    start_d = D_SWEEP_VALUES[0]
+    d_values = ", ".join(str(v) for v in D_SWEEP_VALUES)
+    roll_p_values = ", ".join(str(v) for v in p_sweep["roll"])
+    pitch_p_values = ", ".join(str(v) for v in p_sweep["pitch"])
+    roll_i_values = ", ".join(str(row["roll"]) for row in I_SWEEP_VALUES)
+    pitch_i_values = ", ".join(str(row["pitch"]) for row in I_SWEEP_VALUES)
+    roll_ff_values = ", ".join(str(row["roll"]) for row in FF_SWEEP_VALUES)
+    pitch_ff_values = ", ".join(str(row["pitch"]) for row in FF_SWEEP_VALUES)
+    fly_log_action = (
+        "-   Once the 'Fly/Log' button is pressed, wait for spin-up, set CH8 beeper marker ON, "
+        f"then run {PID_PLAN_FLY_LOG_RUNTIME_S:.0f} sec Roll & Pitch moves."
+    )
     lines: list[str] = [
         "Supervised PID tuning plan",
         "",
-        "Safe starting point",
-        f"- Roll:  P {start_p['roll']}, D {D_SWEEP_VALUES[0]}, I 0, FF 0",
-        f"- Pitch: P {start_p['pitch']}, D {D_SWEEP_VALUES[0]}, I 0, FF 0",
-        "- Yaw:   do not test; leave current yaw during sweeps if practical.",
-        "",
         "Safety gates",
         "- Keep battery fresh.",
-        "- Write values while disarmed, then fly/log, then disarm before pulling logs.",
-        "- Use Y Correction for every step-response comparison.",
-        "- Keep final picks supervised; do not save final values automatically.",
+        "",
+        "Safe starting point to set the PID/FF before starting auto run.",
+        f"- Roll:  P {start_p['roll']}, D {start_d}, I 0, FF 0",
+        f"- Pitch: P {start_p['pitch']}, D {start_d}, I 0, FF 0",
+        f"- Yaw:   P {yaw['p']}, D {yaw['d']:2d}, I 0, FF 0",
         "",
         "D tuning, roll/pitch only",
-        "- Set I = 0 and FF = 0.",
-        f"- Log D values: {', '.join(str(v) for v in D_SWEEP_VALUES)}.",
-        f"- Optional D {OPTIONAL_D_VALUE} only if needed and motors stay cool.",
-        "- Pick the D value with best damping and least overshoot.",
+        f"- Log D values: {d_values}",
+        f"- Roll  D candidates: {d_values}",
+        f"- Pitch D candidates: {d_values}",
+        f"-   Confirm the drone is not armed.",
+        f"-   Set the Roll/Pitch 'D' value to the first setting ({start_d}).",
+        "-   Inform the user to Arm the drone and hit the 'Fly/Log' button.",
+        fly_log_action,
+        "-   Inform the user to Disarm the drone.",
+        f"-   Repeat with the next 'D' setting of ({D_SWEEP_VALUES[1]}) through {D_SWEEP_VALUES[-1]}.",
+        "- Once all the 'D' values have been logged tell the user to inspect the logs and select the correct 'D' term",
         "",
-        "P tuning, roll/pitch only",
+        "Using the selected 'D' term from the previous step test the 'P' term the same way tuning, roll/pitch only",
         "- Keep chosen D.",
-        f"- Roll P candidates: {', '.join(str(v) for v in p_sweep['roll'])}.",
-        f"- Pitch P candidates: {', '.join(str(v) for v in p_sweep['pitch'])}.",
+        f"- Roll  P candidates: {roll_p_values}.",
+        f"- Pitch P candidates: {pitch_p_values}.",
+        "-   Confirm the drone is not armed.",
+        "-   Set the Roll/Pitch 'P' value according to the setup above.",
+        "-   Inform the user to Arm the drone and hit the 'Fly/Log' button.",
+        fly_log_action,
+        "-   Inform the user to Disarm the drone.",
+        "-   Repeat with the next 'P' setting.",
+        "- Once all the 'P' values have been logged tell the user to inspect the logs and select the correct 'P' term.",
         "- Pick the highest P that tracks well without ringing or oscillation.",
         "",
-        "D re-check",
+        "Using the selected 'P' and 'D' term selected from above steps re-check the 'D' term",
         "- With chosen P, test D slightly lower/current/higher.",
-        "- Pick the best P/D combination before moving on.",
+        "-   Confirm the drone is not armed.",
+        "-   Set the Roll/Pitch 'D' value to 5 points lower.",
+        "-   Inform the user to Arm the drone and hit the 'Fly/Log' button.",
+        fly_log_action,
+        "-   Inform the user to Disarm the drone.",
+        "-   Repeat with 'D' set as above then 'D' with a 5 point higher value.",
+        "- Once all the 'D' values have been logged tell the user to inspect the logs and select the correct 'D' term.",
         "",
-        "I tuning, roll/pitch only",
+        "",
+        "- This will be the 'P' and 'D' values used throughout the rest of these test.",
+        "",
+        "- Test the I term",
+        f"- Roll:  I {roll_i_values}",
+        f"- Pitch: I {pitch_i_values}",
+        "-   Confirm the drone is not armed.",
+        "-   Set the Roll/Pitch 'I' value according to the setup above.",
+        "-   Inform the user to Arm the drone and hit the 'Fly/Log' button.",
+        fly_log_action,
+        "-   Inform the user to Disarm the drone.",
+        "-   Repeat with the next 'I' setting.",
+        "- Once all the 'I' values have been logged tell the user to inspect the logs and select the correct 'I' term.",
+        "- Pick the value that holds attitude without slow wobble or bounce-back.",
+        "",
+        "- Test the FF term",
+        f"- Roll:  FF {roll_ff_values}",
+        f"- Pitch: FF {pitch_ff_values}",
+        "-   Confirm the drone is not armed.",
+        "-   Set the Roll/Pitch 'FF' value according to the setup above.",
+        "-   Inform the user to Arm the drone and hit the 'Fly/Log' button.",
+        fly_log_action,
+        "-   Inform the user to Disarm the drone.",
+        "-   Repeat with the next 'FF' setting.",
+        "- Once all the 'FF' values have been logged tell the user to inspect the logs and select the correct 'FF' term.",
+        "- Pick FF where gyro starts with setpoint without jumping ahead.",
+        "",
+        "Yaw final recommendation, not tested",
+        f"- Yaw P {yaw['p']}, I {yaw['i']}, D {yaw['d']}, FF {yaw['ff']}.",
+        "- Treat yaw as a conservative baseline; revisit only if logs or flight feel show yaw-specific problems.",
+        "",
+        "Why this P start was chosen",
     ]
-    for row in I_SWEEP_VALUES:
-        lines.append(f"- Roll/Pitch I: {row['roll']}/{row['pitch']}")
-    lines.extend(
-        [
-            "- Use Step Response Tool, but also inspect the main trace.",
-            "- Pick the value that holds attitude without slow wobble or bounce-back.",
-            "",
-            "FF tuning, roll/pitch only",
-        ]
-    )
-    for row in FF_SWEEP_VALUES:
-        lines.append(f"- Roll/Pitch FF: {row['roll']}/{row['pitch']}")
-    lines.extend(
-        [
-            "- Use the main PIDToolbox graph.",
-            "- Pick FF where gyro starts with setpoint without jumping ahead.",
-            "",
-            "Yaw final recommendation, not tested",
-            f"- Yaw P {yaw['p']}, I {yaw['i']}, D {yaw['d']}, FF {yaw['ff']}.",
-            "- Treat yaw as a conservative baseline; revisit only if logs or flight feel show yaw-specific problems.",
-            "",
-            "Why this P start was chosen",
-        ]
-    )
     lines.extend(f"- {note}" for note in recommendation.notes)
     return "\n".join(lines).strip()
 
@@ -263,8 +300,9 @@ def generate_pid_tuning_plan_report(
     report_dir.mkdir(parents=True, exist_ok=True)
     text_path = report_dir / "pid_tuning_plan.txt"
     summary_json = report_dir / "pid_tuning_plan_summary.json"
-    text_path.write_text(format_pid_tuning_plan(recommendation) + "\n", encoding="utf-8")
-    summary_json.write_text(_recommendation_json(recommendation), encoding="utf-8")
+    plan_text = format_pid_tuning_plan(recommendation)
+    text_path.write_text(plan_text + "\n", encoding="utf-8")
+    summary_json.write_text(_recommendation_json(recommendation, plan_text), encoding="utf-8")
     return PIDTuningPlanReport(
         report_dir=str(report_dir),
         text_path=str(text_path),
@@ -314,8 +352,12 @@ def load_pid_tuning_plan(plan_text_path: str | Path) -> LoadedPIDTuningPlan:
     return _load_pid_tuning_plan_from_text(text_path, text)
 
 
-def _recommendation_json(recommendation: PStartRecommendation) -> str:
+def _recommendation_json(recommendation: PStartRecommendation, plan_text: str) -> str:
     payload = asdict(recommendation)
+    payload["plan"] = {
+        "format": "sample",
+        "text": plan_text,
+    }
     payload["workflow"] = {
         "tuned_axes": TUNED_AXES,
         "yaw_tested": False,
@@ -331,8 +373,8 @@ def _load_pid_tuning_plan_from_text(text_path: Path, text: str) -> LoadedPIDTuni
     roll_start = _line_ints(text, r"-\s*Roll:\s*P\s*(\d+),\s*D\s*(\d+),\s*I\s*(\d+),\s*FF\s*(\d+)")
     pitch_start = _line_ints(text, r"-\s*Pitch:\s*P\s*(\d+),\s*D\s*(\d+),\s*I\s*(\d+),\s*FF\s*(\d+)")
     d_sweep = _line_ints(text, r"-\s*Log D values:\s*([0-9,\s]+)")
-    roll_p = _line_ints(text, r"-\s*Roll P candidates:\s*([0-9,\s]+)")
-    pitch_p = _line_ints(text, r"-\s*Pitch P candidates:\s*([0-9,\s]+)")
+    roll_p = _line_ints(text, r"-\s*Roll\s+P candidates:\s*([0-9,\s]+)")
+    pitch_p = _line_ints(text, r"-\s*Pitch\s+P candidates:\s*([0-9,\s]+)")
     yaw = _line_ints(text, r"-\s*Yaw P\s*(\d+),\s*I\s*(\d+),\s*D\s*(\d+),\s*FF\s*(\d+)")
     optional_match = re.search(r"Optional D\s*(\d+)", text, flags=re.IGNORECASE)
 
@@ -340,10 +382,25 @@ def _load_pid_tuning_plan_from_text(text_path: Path, text: str) -> LoadedPIDTuni
         {"roll": int(match.group(1)), "pitch": int(match.group(2))}
         for match in re.finditer(r"-\s*Roll/Pitch I:\s*(\d+)\s*/\s*(\d+)", text, flags=re.IGNORECASE)
     )
+    if not i_rows:
+        roll_i = _line_ints(text, r"-\s*Roll:\s*I\s*([0-9,\s]+)")
+        pitch_i = _line_ints(text, r"-\s*Pitch:\s*I\s*([0-9,\s]+)")
+        i_rows = tuple(
+            {"roll": int(roll), "pitch": int(pitch)}
+            for roll, pitch in zip(roll_i, pitch_i)
+        )
+
     ff_rows = tuple(
         {"roll": int(match.group(1)), "pitch": int(match.group(2))}
         for match in re.finditer(r"-\s*Roll/Pitch FF:\s*(\d+)\s*/\s*(\d+)", text, flags=re.IGNORECASE)
     )
+    if not ff_rows:
+        roll_ff = _line_ints(text, r"-\s*Roll:\s*FF\s*([0-9,\s]+)")
+        pitch_ff = _line_ints(text, r"-\s*Pitch:\s*FF\s*([0-9,\s]+)")
+        ff_rows = tuple(
+            {"roll": int(roll), "pitch": int(pitch)}
+            for roll, pitch in zip(roll_ff, pitch_ff)
+        )
 
     return LoadedPIDTuningPlan(
         text_path=str(text_path),
