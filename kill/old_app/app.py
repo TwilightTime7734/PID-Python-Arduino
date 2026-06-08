@@ -92,16 +92,195 @@ from .ui import (
     require_range,
 )
 from .worker import SerialWorker
-from .controllers import HardwareStateMixin, RuntimeStateController, WidgetBindings
+from .hardware_controller import HardwareController
+
+from .controllers.timer_registry import TimerRegistry
 
 
 
-class ModbusApp(HardwareStateMixin):
+class ModbusApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.ui = build_main_gui(root)
-        WidgetBindings.attach_to(self, self.ui)
-        RuntimeStateController(self).initialize()
+        self.port_entry = self.ui.port_entry
+        self.channel_adjust_canvases = self.ui.channel_adjust_canvases
+        self.ch_entries = self.ui.ch_entries
+        self.off_entries = self.ui.off_entries
+        self.channel_output_canvases = self.ui.channel_output_canvases
+        self.channel_output_fill_ids = self.ui.channel_output_fill_ids
+        self.level_button = self.ui.level_button
+        self.status = self.ui.status
+        self.pc_link_box = self.ui.pc_link_box
+        self.horizon = self.ui.horizon
+        self.roll_text = self.ui.roll_text
+        self.pitch_text = self.ui.pitch_text
+        self.roll_pidff_vars = self.ui.roll_pidff_vars
+        self.pitch_pidff_vars = self.ui.pitch_pidff_vars
+        self.pid_ff_adjust_canvases = self.ui.pid_ff_adjust_canvases
+        self.load_pid_ff_button = self.ui.load_pid_ff_button
+        self.save_pid_ff_button = self.ui.save_pid_ff_button
+        self.fc_port_entry = self.ui.fc_port_entry
+        self.fc_baud_entry = self.ui.fc_baud_entry
+        self.scan_fc_button = self.ui.scan_fc_button
+        self.connect_fc_button = self.ui.connect_fc_button
+        self.import_blackbox_button = self.ui.import_blackbox_button
+        self.analyze_blackbox_button = self.ui.analyze_blackbox_button
+        self.arduino_button = self.ui.arduino_button
+        self.auto_session_button = self.ui.auto_session_button
+        self.auto_report_text = self.ui.auto_report_text
+        self.fly_log_button = self.ui.fly_log_button
+        self.simulation_mode_var = self.ui.simulation_mode_var
+        self.simulation_mode_checkbutton = self.ui.simulation_mode_checkbutton
+        self.pid_progress_button = self.ui.pid_progress_button
+        self.cancel_auto_session_button = self.ui.cancel_auto_session_button
+        self.step_response_button = self.ui.step_response_button
+        self.pid_tuning_plan_button = self.ui.pid_tuning_plan_button
+
+        self.start_pending = False
+        self.is_closing = False
+        self.controller = HardwareController()
+        self.run_active = False
+        self.run_port = PORT_DEFAULT
+        self.run_ser: serial.Serial | None = None
+        self.run_quant: int | None = None
+        self.run_max_count: int | None = None
+        self.adjust_repeat_after_id: str | None = None
+        self.adjust_repeat_handler: Callable[[int, int], None] | None = None
+        self.adjust_repeat_index: int | None = None
+        self.adjust_repeat_delta = 0
+        self.base_channel_outputs = CHANNEL_DEFAULTS.copy()
+        self.live_channel_outputs = self.base_channel_outputs.copy()
+        self.beeper_marker_active = False
+        self.worker = self.controller.worker
+        self.fc_service = InavSerialService()
+        self.fc_poll_after_id: str | None = None
+
+        # Centralized `after_cancel()` bookkeeping.
+        self.timer_registry = TimerRegistry(self.root.after_cancel)
+
+        self.level_active = False
+        self.level_after_id: str | None = None
+        self.level_pulse_inflight = False
+        self.level_timeout_deadline_s: float | None = None
+        self.auto_config = AdaptiveSessionConfig()
+        self.auto_controller: AdaptiveExcitationController | None = None
+        self.auto_state = AdaptiveSessionState.idle
+        self.auto_stop_reason = ""
+        self.auto_warning = ""
+        self.auto_session_start_s: float | None = None
+        self.auto_last_tick_s: float | None = None
+        self.auto_last_sample_s: float | None = None
+        self.auto_tick_after_id: str | None = None
+        self.auto_hold_after_id: str | None = None
+        self.fly_log_marker_after_id: str | None = None
+        self.auto_pulse_inflight = False
+        self.auto_hold_end_requested = False
+        self.auto_settle_until_s: float | None = None
+        self.auto_recovery_mode = False
+        self.auto_stop_after_recovery = False
+        self.auto_active_command: AdaptiveCommand | None = None
+        self.auto_event_peak_delta = 0.0
+        self.auto_event_abs_peak_delta = 0.0
+        self.auto_event_signed_peak_delta = 0.0
+        self.auto_event_response_delay_s: float | None = None
+        self.auto_event_baseline = 0.0
+        self.auto_event_start_s = 0.0
+        self.auto_axis_output_sign: dict[str, int] = {"roll": 1, "pitch": 1}
+        self.auto_probe_axes_pending: list[str] = []
+        self.auto_original_base_outputs: list[int] | None = None
+        self.auto_start_throttle_us = self.base_channel_outputs[THROTTLE_CHANNEL_INDEX]
+        self.auto_current_throttle_us = self.base_channel_outputs[THROTTLE_CHANNEL_INDEX]
+        self.auto_peak_throttle_us = self.base_channel_outputs[THROTTLE_CHANNEL_INDEX]
+        self.auto_latest_report: AutoTuneReport | None = None
+        self.auto_import_result: BlackboxImportResult | None = None
+        self.auto_latest_imported_log: str = ""
+        self.sim_active = False
+        self.sim_after_id: str | None = None
+        self.sim_plan: LoadedPIDTuningPlan | None = None
+        self.sim_plan_steps: list[dict[str, object]] = []
+        self.sim_plan_step_index = 0
+        self.sim_waiting_for_fly_log = False
+        self.sim_fly_log_active = False
+        self.sim_step_started_s: float | None = None
+        self.sim_roll_deg = 0.0
+        self.sim_pitch_deg = 0.0
+        self.sim_last_report_second = -1
+        self.blackbox_import_inflight = False
+        self.blackbox_import_dir = (Path(__file__).resolve().parent.parent / "blackbox_imports").resolve()
+        self.blackbox_msc_mount_timeout_s = 12.0
+        self.blackbox_msc_mount_poll_s = 1.0
+        self.pid_plan_active = False
+        self.pid_plan: LoadedPIDTuningPlan | None = None
+        self.pid_plan_phase = "idle"
+        self.pid_plan_index = 0
+        self.pid_plan_selected_d: int | None = None
+        self.pid_plan_selected_p: dict[str, int] | None = None
+        self.pid_plan_selected_i: dict[str, int] | None = None
+        self.pid_plan_selected_ff: dict[str, int] | None = None
+        self.pid_plan_waiting_for_fly_log = False
+        self.pid_plan_current_candidate_title = ""
+        self.pid_plan_current_candidate_phase = ""
+        self.pid_plan_current_candidate_target: dict[str, dict[str, int]] | None = None
+        self.pid_plan_fly_log_active = False
+        self.fly_log_finishing = False
+        self.pid_progress_window: tk.Toplevel | None = None
+        self.pid_progress_phase_labels: dict[str, tk.Label] = {}
+        self.pid_progress_current_var = tk.StringVar(value="No PID tuning plan is active.")
+        self.pid_progress_action_var = tk.StringVar(value="Generate or start a PID tuning plan.")
+        self.pid_progress_selection_var = tk.StringVar(value="")
+        self.pid_progress_plan_var = tk.StringVar(value="")
+        self.pid_progress_target_text: tk.Text | None = None
+        self.pid_ff_labels = ("P", "I", "D", "FF")
+        self.pid_ff_adjust_fields = [
+            ("roll", "p"),
+            ("pitch", "p"),
+            ("roll", "i"),
+            ("pitch", "i"),
+            ("roll", "d"),
+            ("pitch", "d"),
+            ("roll", "ff"),
+            ("pitch", "ff"),
+        ]
+
+    @property
+    def run_active(self) -> bool:
+        return self.controller.run_active
+
+    @run_active.setter
+    def run_active(self, value: bool) -> None:
+        self.controller.run_active = value
+
+    @property
+    def run_port(self) -> str:
+        return self.controller.run_port
+
+    @run_port.setter
+    def run_port(self, value: str) -> None:
+        self.controller.run_port = value
+
+    @property
+    def run_ser(self) -> serial.Serial | None:
+        return self.controller.run_ser
+
+    @run_ser.setter
+    def run_ser(self, value: serial.Serial | None) -> None:
+        self.controller.run_ser = value
+
+    @property
+    def run_quant(self) -> int | None:
+        return self.controller.run_quant
+
+    @run_quant.setter
+    def run_quant(self, value: int | None) -> None:
+        self.controller.run_quant = value
+
+    @property
+    def run_max_count(self) -> int | None:
+        return self.controller.run_max_count
+
+    @run_max_count.setter
+    def run_max_count(self, value: int | None) -> None:
+        self.controller.run_max_count = value
 
     def run(self) -> None:
 

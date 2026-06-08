@@ -23,31 +23,31 @@ class AdaptiveSessionState(str, Enum):
 
 @dataclass(frozen=True)
 class AdaptiveSessionConfig:
-    soft_limit_deg: float = 35.0
-    hard_limit_deg: float = 45.0
+    soft_limit_deg: float = 12.0
+    hard_limit_deg: float = 20.0
     safety_margin_deg: float = 2.0
-    recovery_entry_deg: float = 10.0
-    recovery_exit_deg: float = 4.0
+    recovery_entry_deg: float = 6.0
+    recovery_exit_deg: float = 3.0
     telemetry_stale_s: float = 1.0
     control_interval_s: float = 0.070
-    settle_deadband_deg: float = 2.5
-    force_min_us: int = 100
-    force_max_us: int = 220
-    recovery_force_us: int = 180
-    hold_min_s: float = 0.25
-    hold_max_s: float = 0.35
-    recovery_hold_s: float = 0.18
-    roll_force_us: int = 220
-    pitch_force_us: int = 220
-    roll_hold_s: float = 0.25
-    pitch_hold_s: float = 0.22
-    roll_target_peak_deg: float = 12.0
-    pitch_target_peak_deg: float = 12.0
-    settle_max_s: float = 0.45
+    settle_deadband_deg: float = 1.5
+    force_min_us: int = 5
+    force_max_us: int = 45
+    recovery_force_us: int = 45
+    hold_min_s: float = 0.06
+    hold_max_s: float = 0.12
+    recovery_hold_s: float = 0.08
+    roll_force_us: int = 45
+    pitch_force_us: int = 45
+    roll_hold_s: float = 0.08
+    pitch_hold_s: float = 0.08
+    roll_target_peak_deg: float = 3.0
+    pitch_target_peak_deg: float = 3.0
+    settle_max_s: float = 0.25
     recovery_settle_s: float = 0.05
     max_runtime_s: float = 60.0
-    target_peak_min_deg: float = 4.0
-    target_peak_max_deg: float = 12.0
+    target_peak_min_deg: float = 1.0
+    target_peak_max_deg: float = 4.0
     target_valid_events: int = 6
     target_settle_ratio: float = 0.80
     throttle_start_us: int = 1260
@@ -55,6 +55,18 @@ class AdaptiveSessionConfig:
     throttle_step_us: int = 25
     throttle_boost_peak_deg: float = 4.0
     throttle_trim_peak_deg: float = 28.0
+    probe_force_us: int = 12
+    probe_hold_s: float = 0.05
+    probe_settle_s: float = 0.12
+    probe_target_peak_deg: float = 1.0
+    probe_min_response_deg: float = 0.15
+    probe_emergency_peak_deg: float = 3.0
+    emergency_peak_deg: float = 6.0
+    abort_throttle_us: int = 1000
+    response_us_per_deg_default: float = 15.0
+    response_us_per_deg_min: float = 1.0
+    response_us_per_deg_max: float = 60.0
+    response_min_peak_deg: float = 0.2
 
     def axis_force_us(self, axis: str) -> int:
         return self.roll_force_us if axis == "roll" else self.pitch_force_us
@@ -79,6 +91,7 @@ class AdaptiveCommand:
     recovery: bool
     reason: str
     target_peak_deg: float = 0.0
+    calibration: bool = False
 
 
 @dataclass(frozen=True)
@@ -93,6 +106,7 @@ class ExcitationEvent:
     settle_success: bool
     response_delay_s: float | None
     final_error_deg: float
+    recovery: bool = False
 
 
 @dataclass(frozen=True)
@@ -154,6 +168,11 @@ class AdaptiveExcitationController:
         self.config = config or AdaptiveSessionConfig()
         self._rng = rng or random.Random()
         self._pending_commands: deque[AdaptiveCommand] = deque()
+        default_response = self._clamp_response_us_per_deg(self.config.response_us_per_deg_default)
+        self._axis_response_us_per_deg: dict[str, float] = {
+            "roll": default_response,
+            "pitch": default_response,
+        }
         self._coverage: dict[tuple[str, int], _DirectionCoverage] = {
             ("roll", -1): _DirectionCoverage(),
             ("roll", +1): _DirectionCoverage(),
@@ -166,6 +185,23 @@ class AdaptiveExcitationController:
         coverage = self._coverage.get(key)
         if coverage is not None:
             coverage.register_event(event, self.config)
+        if not event.recovery:
+            self.record_axis_response(event.axis, event.force_us, event.hold_s, event.peak_delta_deg)
+
+    def record_axis_response(self, axis: str, force_us: int, hold_s: float, peak_delta_deg: float) -> None:
+        peak = abs(float(peak_delta_deg))
+        if peak < self.config.response_min_peak_deg:
+            return
+        effective_force = float(force_us) * self._hold_scale(axis, hold_s)
+        if effective_force <= 0:
+            return
+        measured = self._clamp_response_us_per_deg(effective_force / peak)
+        current = self._axis_response_us_per_deg.get(axis, self._clamp_response_us_per_deg(self.config.response_us_per_deg_default))
+        if measured < current:
+            updated = measured
+        else:
+            updated = (current * 0.8) + (measured * 0.2)
+        self._axis_response_us_per_deg[axis] = self._clamp_response_us_per_deg(updated)
 
     def initial_throttle(self, current_throttle_us: int) -> tuple[int, str]:
         current = max(1000, min(2000, int(current_throttle_us)))
@@ -209,14 +245,14 @@ class AdaptiveExcitationController:
             },
         )
 
-    def stop_ready(self, elapsed_s: float) -> tuple[bool, str, str]:
+    def stop_ready(self, elapsed_s: float, *, session_label: str = "Fly/Log") -> tuple[bool, str, str]:
         if elapsed_s >= self.config.max_runtime_s:
             runtime_s = max(0.0, float(self.config.max_runtime_s))
             if abs(runtime_s - round(runtime_s)) < 0.05:
                 duration_text = f"{runtime_s:.0f}-second"
             else:
                 duration_text = f"{runtime_s:.1f}-second"
-            return True, f"Randomized {duration_text} auto tune complete.", ""
+            return True, f"{session_label} {duration_text} movement complete.", ""
         return False, "", ""
 
     def should_abort(self, roll_deg: float, pitch_deg: float) -> tuple[bool, str]:
@@ -281,12 +317,13 @@ class AdaptiveExcitationController:
     def _try_random_force_time(
         self, axis: str, direction: int, min_delta_deg: float, max_delta_deg: float
     ) -> AdaptiveCommand | None:
-        base_hold = max(0.05, self.config.axis_hold_s(axis))
+        us_per_deg = self._response_us_per_deg(axis)
         axis_force_max = min(self.config.force_max_us, int(self.config.axis_force_us(axis)))
         for _ in range(80):
             hold_s = self._rng.uniform(self.config.hold_min_s, self.config.hold_max_s)
-            min_force = math.ceil(min_delta_deg * 15.0 * base_hold / hold_s)
-            max_force = math.floor(max_delta_deg * 15.0 * base_hold / hold_s)
+            force_scale = us_per_deg / self._hold_scale(axis, hold_s)
+            min_force = math.ceil(min_delta_deg * force_scale)
+            max_force = math.floor(max_delta_deg * force_scale)
             min_force = max(self.config.force_min_us, min_force)
             max_force = min(axis_force_max, max_force)
             if min_force > max_force:
@@ -309,10 +346,9 @@ class AdaptiveExcitationController:
         self, axis: str, direction: int, min_delta_deg: float, max_delta_deg: float
     ) -> AdaptiveCommand | None:
         hold_s = max(self.config.hold_min_s, min(self.config.hold_max_s, self.config.axis_hold_s(axis)))
-        base_hold = max(0.05, self.config.axis_hold_s(axis))
         axis_force_max = min(self.config.force_max_us, int(self.config.axis_force_us(axis)))
         target_delta = min(max_delta_deg, max(min_delta_deg, (min_delta_deg + max_delta_deg) / 2.0))
-        force_us = round(target_delta * 15.0 * base_hold / hold_s)
+        force_us = round(target_delta * self._response_us_per_deg(axis) / self._hold_scale(axis, hold_s))
         force_us = max(self.config.force_min_us, min(axis_force_max, force_us))
         target_peak = self._predicted_peak_deg(axis, force_us, hold_s)
         if target_peak < min_delta_deg or target_peak > max_delta_deg:
@@ -329,7 +365,10 @@ class AdaptiveExcitationController:
         )
 
     def _safe_delta_deg(self, current_angle: float, direction: int) -> float:
-        limit = max(0.0, self.config.hard_limit_deg - self.config.safety_margin_deg)
+        limit = min(
+            self.config.soft_limit_deg,
+            max(0.0, self.config.hard_limit_deg - self.config.safety_margin_deg),
+        )
         if direction >= 0:
             return max(0.0, limit - current_angle)
         return max(0.0, current_angle + limit)
@@ -368,8 +407,24 @@ class AdaptiveExcitationController:
         )
 
     def _predicted_peak_deg(self, axis: str, force_us: int, hold_s: float) -> float:
+        us_per_deg = self._response_us_per_deg(axis)
+        if us_per_deg <= 0:
+            return 0.0
+        return max(0.0, (float(force_us) * self._hold_scale(axis, hold_s)) / us_per_deg)
+
+    def _hold_scale(self, axis: str, hold_s: float) -> float:
         base_hold = max(0.05, self.config.axis_hold_s(axis))
-        return max(0.0, (float(force_us) / 15.0) * (float(hold_s) / base_hold))
+        return max(0.0, float(hold_s) / base_hold)
+
+    def _response_us_per_deg(self, axis: str) -> float:
+        default = self._clamp_response_us_per_deg(self.config.response_us_per_deg_default)
+        return self._axis_response_us_per_deg.get(axis, default)
+
+    def _clamp_response_us_per_deg(self, value: float) -> float:
+        return max(
+            float(self.config.response_us_per_deg_min),
+            min(float(self.config.response_us_per_deg_max), float(value)),
+        )
 
 
 def axis_channel_index(axis: str) -> int:

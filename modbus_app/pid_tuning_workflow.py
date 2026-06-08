@@ -209,7 +209,8 @@ def format_pid_tuning_plan(recommendation: PStartRecommendation) -> str:
     pitch_ff_values = ", ".join(str(row["pitch"]) for row in FF_SWEEP_VALUES)
     fly_log_action = (
         "-   Once the 'Fly/Log' button is pressed, wait for spin-up, set CH8 beeper marker ON, "
-        f"then run {PID_PLAN_FLY_LOG_RUNTIME_S:.0f} sec Roll & Pitch moves."
+        "run roll/pitch calibration probes, then set CH8 beeper marker OFF. "
+        "Chart Step Response analyzes the BEEPERON bracket between those markers."
     )
     lines: list[str] = [
         "Supervised PID tuning plan",

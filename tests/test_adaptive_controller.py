@@ -48,11 +48,11 @@ class AdaptiveControllerTests(unittest.TestCase):
         self.assertEqual(-1, command.direction)
 
     def test_command_peak_is_bounded_by_remaining_angle_margin(self) -> None:
-        command = self.controller._random_command_for_axis("roll", current_angle=30.0, direction=1)
+        command = self.controller._random_command_for_axis("roll", current_angle=15.0, direction=1)
 
         self.assertIsNotNone(command)
         safe_limit = self.cfg.hard_limit_deg - self.cfg.safety_margin_deg
-        self.assertLessEqual(command.target_peak_deg, safe_limit - 30.0)
+        self.assertLessEqual(command.target_peak_deg, safe_limit - 15.0)
 
     def test_stop_rule_ends_at_sixty_seconds(self) -> None:
         ready, _, _ = self.controller.stop_ready(59.9)
@@ -105,6 +105,16 @@ class AdaptiveControllerTests(unittest.TestCase):
 
         self.assertEqual(1, metrics.direction["roll_pos"].total_count)
         self.assertGreater(metrics.axis_confidence["roll"], 0.0)
+
+    def test_measured_high_sensitivity_reduces_later_force(self) -> None:
+        before = self.controller._random_command_for_axis("roll", current_angle=0.0, direction=1)
+        self.assertIsNotNone(before)
+
+        self.controller.record_axis_response("roll", force_us=12, hold_s=0.05, peak_delta_deg=3.0)
+        after = self.controller._random_command_for_axis("roll", current_angle=0.0, direction=1)
+
+        self.assertIsNotNone(after)
+        self.assertLessEqual(after.force_us, before.force_us)
 
 
 if __name__ == "__main__":

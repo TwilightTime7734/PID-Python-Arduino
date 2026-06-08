@@ -118,7 +118,12 @@ def generate_step_response_report(log_paths: list[str] | tuple[str, ...], output
 
 
 def format_step_response_report(report: StepResponseReport) -> str:
-    lines = ["PIDtoolbox Step Response", f"Report: {report.html_path}", ""]
+    lines = [
+        "PIDtoolbox Step Response",
+        f"Report: {report.html_path}",
+        "Analysis uses the CH8 beeper marker window (BEEPERON through BEEPEROFF), not a fixed duration.",
+        "",
+    ]
     for log in report.logs:
         lines.append(log.label)
         if log.marker_column and log.marker_start_s is not None and log.marker_end_s is not None:
@@ -297,7 +302,15 @@ def _detect_beeper_marker_window(columns: dict[str, np.ndarray], time_col: str, 
     if flag_marker is not None:
         return flag_marker
 
-    return _MarkerWindow("", None, None, None, None, 0, "BEEPERON flight mode flag not found; full log used")
+    return _MarkerWindow(
+        "",
+        None,
+        None,
+        None,
+        None,
+        0,
+        "CH8 beeper marker window (BEEPERON/BEEPEROFF) not found; full log used",
+    )
 
 
 def _detect_beeper_mode_flag_window(
@@ -327,12 +340,21 @@ def _detect_beeper_mode_flag_window(
     times = np.asarray(columns[time_col], dtype=float)
     start_s = _time_value_s(times, start)
     end_s = _time_value_s(times, max(start, end - 1))
-    return _MarkerWindow(marker_col, start, end, start_s, end_s, int(end - start), "using BEEPERON flight mode flag")
+    duration_s = max(0.0, end_s - start_s) if start_s is not None and end_s is not None else 0.0
+    return _MarkerWindow(
+        marker_col,
+        start,
+        end,
+        start_s,
+        end_s,
+        int(end - start),
+        f"using CH8 beeper marker window ({duration_s:.2f}s, BEEPERON flight mode flag)",
+    )
 
 
 def _flight_mode_has_beeper_on(value: str) -> bool:
     tokens = [token.strip().upper() for token in str(value or "").split("|")]
-    return "BEEPERON" in tokens or "BEEPER" in tokens
+    return "BEEPERON" in tokens
 
 
 def _load_csv_text_column(csv_path: Path, candidates: list[str]) -> tuple[str, list[str]] | None:

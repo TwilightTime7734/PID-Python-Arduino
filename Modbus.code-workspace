@@ -7,5 +7,28 @@
 	"settings": {
 		"python.defaultInterpreterPath": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
 		"python.terminal.activateEnvironment": true
+	},
+	"launch": {
+		"version": "0.2.0",
+		"configurations": [
+			{
+				"name": "Python: main.py",
+				"type": "debugpy",
+				"request": "launch",
+				"program": "${workspaceFolder}/main.py",
+				"console": "integratedTerminal",
+				"cwd": "${workspaceFolder}",
+				"python": "${workspaceFolder}/.venv/Scripts/python.exe"
+			},
+			{
+				"name": "Python: Current File",
+				"type": "debugpy",
+				"request": "launch",
+				"program": "${file}",
+				"console": "integratedTerminal",
+				"cwd": "${fileDirname}",
+				"python": "${workspaceFolder}/.venv/Scripts/python.exe"
+			}
+		]
 	}
 }
