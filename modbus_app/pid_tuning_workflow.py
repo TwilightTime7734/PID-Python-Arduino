@@ -37,6 +37,20 @@ BATTERY_CHEMISTRY_VALUES = set(BATTERY_NOMINAL_VOLTAGE)
 BASELINE_NO_LOAD_RPM_INCH = 2300.0 * 4.0 * BATTERY_NOMINAL_VOLTAGE["lipo"] * 5.0
 BASELINE_DISK_LOADING_G_IN2 = 600.0 / (4.0 * 3.141592653589793 * 2.5 * 2.5)
 
+REFERENCE_TEST_THROTTLE_US = 1250
+REFERENCE_HOVER_THROTTLE_US = 1350
+REFERENCE_MOTOR_KV = 14000
+REFERENCE_PROP_DIAMETER_IN = 1.77
+REFERENCE_PROP_PITCH_IN = 1.5
+REFERENCE_BATTERY_CELLS = 2
+REFERENCE_BATTERY_CHEMISTRY = "lihv"
+REFERENCE_AUW_G = 83
+REFERENCE_MOTOR_COUNT = 4
+MIN_LEVEL_TEST_THROTTLE_US = 1125
+MAX_LEVEL_TEST_THROTTLE_US = 1350
+MIN_HOVER_THROTTLE_US = 1175
+MAX_HOVER_THROTTLE_US = 1600
+
 
 @dataclass(frozen=True)
 class PStartInputs:
@@ -63,6 +77,18 @@ PAVO_PICO_II_PRESET_INPUTS = PStartInputs(
 
 
 @dataclass(frozen=True)
+class TestThrottleEstimate:
+    """Estimated throttle targets for test-stand setup and manual verification."""
+
+    level_test_throttle_us: int
+    hover_throttle_us: int
+    lift_target_low_g: int | None
+    lift_target_mid_g: int | None
+    lift_target_high_g: int | None
+    notes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class PStartRecommendation:
     """Starting P values and the generated supervised tuning workflow."""
 
@@ -72,6 +98,7 @@ class PStartRecommendation:
     yaw_final_pid_ff: dict[str, int]
     notes: tuple[str, ...]
     inputs: PStartInputs
+    throttle_estimate: TestThrottleEstimate
 
 
 @dataclass(frozen=True)
@@ -94,6 +121,7 @@ class LoadedPIDTuningPlan:
     optional_d: int | None
     i_sweep: tuple[dict[str, int], ...]
     ff_sweep: tuple[dict[str, int], ...]
+    level_test_throttle_us: int | None = None
 
 
 def safe_p_start_information_needed() -> tuple[str, ...]:
@@ -182,6 +210,8 @@ def suggest_starting_p(inputs: PStartInputs) -> PStartRecommendation:
     yaw_final["p"] = max(30, min(YAW_FINAL_DEFAULTS["p"], int(round(YAW_FINAL_DEFAULTS["p"] * factor))))
     notes.append("Yaw is not being swept; the final yaw P was scaled conservatively from the same hardware estimate.")
 
+    throttle_estimate = estimate_test_throttle(inputs)
+
     return PStartRecommendation(
         start_p=start_p,
         start_i=dict(START_I_DEFAULTS),
@@ -189,8 +219,67 @@ def suggest_starting_p(inputs: PStartInputs) -> PStartRecommendation:
         yaw_final_pid_ff=yaw_final,
         notes=tuple(dict.fromkeys(notes)),
         inputs=inputs,
+        throttle_estimate=throttle_estimate,
     )
 
+
+
+def estimate_test_throttle(inputs: PStartInputs) -> TestThrottleEstimate:
+    """Estimate a safe test-stand throttle from build data.
+
+    This is intentionally a conservative starting estimate, not a final calibration.
+    The estimate is referenced to the Pavo Pico II preset and should be verified on
+    the actual stand before Level or Fly/Log is trusted.
+    """
+
+    notes: list[str] = []
+    chemistry = _choice(inputs.battery_chemistry, BATTERY_CHEMISTRY_VALUES, REFERENCE_BATTERY_CHEMISTRY)
+    motor_count = _bounded_int(inputs.motor_count, 1, 16, REFERENCE_MOTOR_COUNT)
+    auw_g = _positive_float(inputs.all_up_weight_g, REFERENCE_AUW_G)
+    motor_kv = _positive_float(inputs.motor_kv, REFERENCE_MOTOR_KV)
+    prop_diameter = _positive_float(inputs.prop_diameter_in, REFERENCE_PROP_DIAMETER_IN)
+    prop_pitch = _positive_float(inputs.prop_pitch_in, REFERENCE_PROP_PITCH_IN)
+    cells = _positive_float(inputs.battery_cells, REFERENCE_BATTERY_CELLS)
+
+    voltage = cells * BATTERY_NOMINAL_VOLTAGE[chemistry]
+    reference_voltage = REFERENCE_BATTERY_CELLS * BATTERY_NOMINAL_VOLTAGE[REFERENCE_BATTERY_CHEMISTRY]
+
+    speed_ratio = (motor_kv * voltage) / (REFERENCE_MOTOR_KV * reference_voltage)
+    disk_ratio = (motor_count / REFERENCE_MOTOR_COUNT) * (prop_diameter / REFERENCE_PROP_DIAMETER_IN) ** 4
+    pitch_ratio = (prop_pitch / REFERENCE_PROP_PITCH_IN) ** 0.5
+    weight_ratio = auw_g / REFERENCE_AUW_G
+    authority_index = max(0.25, min(4.0, (speed_ratio ** 2) * disk_ratio * pitch_ratio / max(0.25, weight_ratio)))
+
+    level_delta = (REFERENCE_TEST_THROTTLE_US - 1000.0) / (authority_index ** 0.5)
+    hover_delta = (REFERENCE_HOVER_THROTTLE_US - 1000.0) / (authority_index ** 0.5)
+    level_test_throttle = _clamp_int(round(1000.0 + level_delta), MIN_LEVEL_TEST_THROTTLE_US, MAX_LEVEL_TEST_THROTTLE_US)
+    hover_throttle = _clamp_int(round(1000.0 + hover_delta), MIN_HOVER_THROTTLE_US, MAX_HOVER_THROTTLE_US)
+
+    if authority_index >= 1.35:
+        notes.append("High estimated thrust authority; suggested test throttle was reduced.")
+    elif authority_index <= 0.75:
+        notes.append("Low estimated thrust authority; suggested test throttle was raised, but verify carefully.")
+    else:
+        notes.append("Estimated thrust authority is near the Pavo Pico II reference baseline.")
+    notes.append("Use the level-test throttle as a starting point only; verify on the actual stand.")
+    notes.append("For scale verification, start around 50-65% weight reduction, not full hover weight.")
+
+    lift_low: int | None = None
+    lift_mid: int | None = None
+    lift_high: int | None = None
+    if inputs.all_up_weight_g is not None:
+        lift_low = int(round(float(inputs.all_up_weight_g) * 0.50))
+        lift_mid = int(round(float(inputs.all_up_weight_g) * 0.60))
+        lift_high = int(round(float(inputs.all_up_weight_g) * 0.70))
+
+    return TestThrottleEstimate(
+        level_test_throttle_us=level_test_throttle,
+        hover_throttle_us=hover_throttle,
+        lift_target_low_g=lift_low,
+        lift_target_mid_g=lift_mid,
+        lift_target_high_g=lift_high,
+        notes=tuple(dict.fromkeys(notes)),
+    )
 
 def format_pid_tuning_plan(recommendation: PStartRecommendation) -> str:
     """Format the supervised D/P/D/I/FF plan as plain text."""
@@ -199,6 +288,7 @@ def format_pid_tuning_plan(recommendation: PStartRecommendation) -> str:
     start_i = recommendation.start_i
     p_sweep = recommendation.p_sweep
     yaw = recommendation.yaw_final_pid_ff
+    throttle = recommendation.throttle_estimate
     start_d = D_SWEEP_VALUES[0]
     d_values = ", ".join(str(v) for v in D_SWEEP_VALUES)
     roll_p_values = ", ".join(str(v) for v in p_sweep["roll"])
@@ -217,6 +307,12 @@ def format_pid_tuning_plan(recommendation: PStartRecommendation) -> str:
         "",
         "Safety gates",
         "- Keep battery fresh.",
+        "- Verify test-stand throttle before relying on Level or Fly/Log.",
+        f"- Estimated Level-test throttle start: {throttle.level_test_throttle_us} us.",
+        f"- Estimated hover throttle reference: {throttle.hover_throttle_us} us; do not use this as the first Level/FlyLog throttle.",
+        "",
+        "Throttle verification target",
+        _format_throttle_lift_target(throttle),
         "",
         "Safe starting point to set the PID/FF before starting auto run.",
         f"- Roll:  P {start_p['roll']}, D {start_d}, I {start_i['roll']}, FF 0",
@@ -292,6 +388,9 @@ def format_pid_tuning_plan(recommendation: PStartRecommendation) -> str:
         "Why this P start was chosen",
     ]
     lines.extend(f"- {note}" for note in recommendation.notes)
+    lines.append("")
+    lines.append("Why this test throttle was estimated")
+    lines.extend(f"- {note}" for note in throttle.notes)
     return "\n".join(lines).strip()
 
 
@@ -343,6 +442,7 @@ def load_pid_tuning_plan(plan_text_path: str | Path) -> LoadedPIDTuningPlan:
     if summary_path.exists():
         payload = json.loads(summary_path.read_text(encoding="utf-8"))
         workflow = payload.get("workflow", {})
+        throttle_payload = payload.get("throttle_estimate", {})
         return LoadedPIDTuningPlan(
             text_path=str(text_path),
             summary_json=str(summary_path),
@@ -355,6 +455,7 @@ def load_pid_tuning_plan(plan_text_path: str | Path) -> LoadedPIDTuningPlan:
             optional_d=_optional_int(workflow.get("optional_d", OPTIONAL_D_VALUE)),
             i_sweep=_pair_rows(workflow.get("i_sweep", I_SWEEP_VALUES)),
             ff_sweep=_pair_rows(workflow.get("ff_sweep", FF_SWEEP_VALUES)),
+            level_test_throttle_us=_optional_int(throttle_payload.get("level_test_throttle_us")),
         )
     return _load_pid_tuning_plan_from_text(text_path, text)
 
@@ -384,6 +485,7 @@ def _load_pid_tuning_plan_from_text(text_path: Path, text: str) -> LoadedPIDTuni
     pitch_p = _line_ints(text, r"-\s*Pitch\s+P candidates:\s*([0-9,\s]+)")
     yaw = _line_ints(text, r"-\s*Yaw P\s*(\d+),\s*I\s*(\d+),\s*D\s*(\d+),\s*FF\s*(\d+)")
     optional_match = re.search(r"Optional D\s*(\d+)", text, flags=re.IGNORECASE)
+    level_throttle = _line_ints(text, r"Estimated Level-test throttle start:\s*(\d+)\s*us")
 
     i_rows = tuple(
         {"roll": int(match.group(1)), "pitch": int(match.group(2))}
@@ -435,6 +537,7 @@ def _load_pid_tuning_plan_from_text(text_path: Path, text: str) -> LoadedPIDTuni
         optional_d=int(optional_match.group(1)) if optional_match else OPTIONAL_D_VALUE,
         i_sweep=i_rows if i_rows else I_SWEEP_VALUES,
         ff_sweep=ff_rows if ff_rows else FF_SWEEP_VALUES,
+        level_test_throttle_us=level_throttle[0] if level_throttle else None,
     )
 
 
@@ -483,6 +586,33 @@ def _choice(value: str, allowed: set[str], default: str) -> str:
     parsed = str(value or "").strip().lower()
     return parsed if parsed in allowed else default
 
+
+
+def _format_throttle_lift_target(throttle: TestThrottleEstimate) -> str:
+    if (
+        throttle.lift_target_low_g is None
+        or throttle.lift_target_mid_g is None
+        or throttle.lift_target_high_g is None
+    ):
+        return "- Scale check: no AUW supplied, so use a small movement test and verify manually."
+    return (
+        f"- Scale check: aim for about {throttle.lift_target_low_g}-{throttle.lift_target_high_g} g "
+        f"removed from the scale first; {throttle.lift_target_mid_g} g is the middle target."
+    )
+
+
+def _positive_float(value: int | float | None, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if parsed <= 0:
+        return float(default)
+    return parsed
+
+
+def _clamp_int(value: int, minimum: int, maximum: int) -> int:
+    return max(minimum, min(maximum, int(value)))
 
 def _bounded_int(value: int | None, minimum: int, maximum: int, default: int) -> int:
     try:

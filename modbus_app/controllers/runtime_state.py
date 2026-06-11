@@ -110,7 +110,7 @@ class RuntimeStateController:
         self_.sim_pitch_deg = 0.0
         self_.sim_last_report_second = -1
         self_.blackbox_import_inflight = False
-        self_.blackbox_import_dir = (Path(__file__).resolve().parent.parent / "blackbox_imports").resolve()
+        self_.blackbox_import_dir = (Path(__file__).resolve().parents[2] / "blackbox_imports").resolve()
         self_.blackbox_msc_mount_timeout_s = 12.0
         self_.blackbox_msc_mount_poll_s = 1.0
         self_.pid_plan_active = False

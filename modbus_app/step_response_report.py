@@ -17,6 +17,7 @@ import numpy as np
 from .blackbox_import import CSV_EXTENSIONS, RAW_BLACKBOX_EXTENSIONS, REPO_ROOT
 from .blackbox_trace_viewer import _pick_column, detect_time_column, load_blackbox_csv
 from .pidtoolbox_step_response import StepResponseResult, compute_pidtoolbox_step_response
+from .flylog_sample_report import FlyLogSampleReport, generate_flylog_sample_report
 
 
 MAX_STEP_RESPONSE_LOGS = 6
@@ -77,6 +78,7 @@ class StepResponseReport:
     decoded_csv_paths: tuple[str, ...]
     source_paths: tuple[str, ...]
     logs: tuple[StepResponseLogMetrics, ...]
+    flylog_sample_report: FlyLogSampleReport | None = None
 
 
 def generate_step_response_report(log_paths: list[str] | tuple[str, ...], output_root: str | Path) -> StepResponseReport:
@@ -92,7 +94,7 @@ def generate_step_response_report(log_paths: list[str] | tuple[str, ...], output
         if suffix not in RAW_BLACKBOX_EXTENSIONS and suffix not in CSV_EXTENSIONS:
             raise RuntimeError(f"Unsupported log type: {source.name}")
 
-    output_root_path = Path(output_root).resolve()
+    output_root_path = _resolve_report_output_root(output_root)
     report_dir = _next_report_dir(output_root_path / "reports", "step_response")
     report_dir.mkdir(parents=True, exist_ok=True)
 
@@ -101,6 +103,8 @@ def generate_step_response_report(log_paths: list[str] | tuple[str, ...], output
     for index, (source, csv_path, label) in enumerate(prepared):
         color = STEP_RESPONSE_COLORS[(index - 1) % len(STEP_RESPONSE_COLORS)]
         logs.append(_analyze_log(source, csv_path, label, color))
+
+    flylog_sample_report = generate_flylog_sample_report(prepared, report_dir)
 
     html_path = report_dir / "pidtoolbox_step_response_detail.html"
     summary_json = report_dir / "pidtoolbox_step_response_summary.json"
@@ -114,6 +118,7 @@ def generate_step_response_report(log_paths: list[str] | tuple[str, ...], output
         decoded_csv_paths=tuple(log.decoded_csv for log in logs),
         source_paths=tuple(str(source) for source in sources),
         logs=tuple(logs),
+        flylog_sample_report=flylog_sample_report,
     )
 
 
@@ -150,7 +155,50 @@ def format_step_response_report(report: StepResponseReport) -> str:
                     f"latency={metrics.latency_half_height_ms:.1f} ms"
                 )
         lines.append("")
+    if report.flylog_sample_report is not None:
+        lines.append("Deterministic Fly/Log samples")
+        lines.append(f"- summary: {report.flylog_sample_report.summary_txt}")
+        lines.append(f"- samples CSV: {report.flylog_sample_report.samples_csv}")
+        lines.append(f"- groups CSV: {report.flylog_sample_report.groups_csv}")
+        lines.append(f"- center adjustments CSV: {report.flylog_sample_report.center_adjust_csv}")
+        lines.append(f"- samples JSON: {report.flylog_sample_report.samples_json}")
+        for sample_log in report.flylog_sample_report.logs:
+            lines.append(
+                f"- {sample_log.log_label}: groups={sample_log.complete_groups}/6 complete, "
+                f"usable={sample_log.usable_groups}/6, clean={sample_log.clean_groups}/6, "
+                f"pulses={sample_log.pulse_count}, center nudges={sample_log.center_adjust_pulses}, "
+                f"pitch response={_format_optional_deg(sample_log.median_pitch_response_deg)}, "
+                f"roll response={_format_optional_deg(sample_log.median_roll_response_deg)}"
+            )
+            for warning in sample_log.warnings[:3]:
+                lines.append(f"  warning: {warning}")
+        lines.append("")
+
     return "\n".join(lines).strip()
+
+
+def _resolve_report_output_root(output_root: str | Path) -> Path:
+    """Return the canonical Blackbox report root.
+
+    Runtime state used to point at ``modbus_app/blackbox_imports``.  Step
+    Response reports belong in the project-level ``blackbox_imports`` folder,
+    so repair that legacy path here as a guardrail too.
+    """
+    path = Path(output_root).expanduser()
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+    resolved = path.resolve()
+    legacy_nested = (REPO_ROOT / "modbus_app" / "blackbox_imports").resolve()
+    canonical = (REPO_ROOT / "blackbox_imports").resolve()
+    if resolved == legacy_nested:
+        return canonical
+    return resolved
+
+
+def _format_optional_deg(value: float | None) -> str:
+    if value is None or not math.isfinite(float(value)):
+        return "n/a"
+    return f"{float(value):.1f} deg"
 
 
 def _next_report_dir(parent: Path, prefix: str) -> Path:
