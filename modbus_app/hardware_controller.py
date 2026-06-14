@@ -5,13 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 import serial
 
-from .constants import (
-    BEEPER_MARKER_CHANNEL_INDEX,
-    BEEPER_MARKER_OFF_US,
-    BEEPER_MARKER_ON_US,
-    PPM_OUTPUT_CHANNEL_COUNT,
-    PORT_DEFAULT,
-)
+from .constants import PID_TEST_CH8_OFF_US, PPM_OUTPUT_CHANNEL_COUNT, PORT_DEFAULT
 from .serial_protocol import (
     open_serial,
     run_ppm_on_serial,
@@ -33,7 +27,6 @@ class HardwareController:
         self.channel_update_inflight = False
         self.pending_channel_update_channels: list[int] | None = None
         self.pending_channel_update_offsets: list[int] | None = None
-        self.pending_marker_active: bool | None = None
         self.pending_channel_update_after: ControllerCallback | None = None
 
     @property
@@ -45,7 +38,6 @@ class HardwareController:
         port: str,
         channels: list[int],
         offsets: list[int],
-        marker_active: bool,
         callback: ControllerCallback | None = None,
     ) -> None:
         def on_start_done(ok: bool, res: object) -> None:
@@ -71,7 +63,6 @@ class HardwareController:
             self.channel_update_inflight = False
             self.pending_channel_update_channels = None
             self.pending_channel_update_offsets = None
-            self.pending_marker_active = None
             self.pending_channel_update_after = None
             if callback is not None:
                 callback(True, res)
@@ -82,7 +73,6 @@ class HardwareController:
                 port,
                 channels,
                 offsets,
-                marker_active,
                 callback=on_start_done,
             )
             return
@@ -96,7 +86,6 @@ class HardwareController:
             self._task_run_ppm_on_existing,
             channels,
             offsets,
-            marker_active,
             callback=on_start_done,
         )
 
@@ -113,7 +102,6 @@ class HardwareController:
             self.channel_update_inflight = False
             self.pending_channel_update_channels = None
             self.pending_channel_update_offsets = None
-            self.pending_marker_active = None
             self.pending_channel_update_after = None
             if callback is not None:
                 callback(True, res)
@@ -129,7 +117,6 @@ class HardwareController:
             self.channel_update_inflight = False
             self.pending_channel_update_channels = None
             self.pending_channel_update_offsets = None
-            self.pending_marker_active = None
             self.pending_channel_update_after = None
             if callback is not None:
                 callback(ok, res)
@@ -140,7 +127,6 @@ class HardwareController:
         self,
         channels: list[int],
         offsets: list[int],
-        marker_active: bool,
         callback: ControllerCallback | None = None,
     ) -> None:
         if not self.is_connected:
@@ -151,7 +137,6 @@ class HardwareController:
         if self.channel_update_inflight:
             self.pending_channel_update_channels = channels.copy()
             self.pending_channel_update_offsets = offsets.copy()
-            self.pending_marker_active = marker_active
             self.pending_channel_update_after = callback
             return
 
@@ -172,7 +157,6 @@ class HardwareController:
             if not self.is_connected:
                 self.pending_channel_update_channels = None
                 self.pending_channel_update_offsets = None
-                self.pending_marker_active = None
                 self.pending_channel_update_after = None
                 return
 
@@ -181,19 +165,16 @@ class HardwareController:
 
             next_channels = self.pending_channel_update_channels
             next_offsets = self.pending_channel_update_offsets
-            next_marker_active = self.pending_marker_active if self.pending_marker_active is not None else marker_active
             next_after = self.pending_channel_update_after
             self.pending_channel_update_channels = None
             self.pending_channel_update_offsets = None
-            self.pending_marker_active = None
             self.pending_channel_update_after = None
-            self.queue_live_channel_update(next_channels, next_offsets, next_marker_active, callback=next_after)
+            self.queue_live_channel_update(next_channels, next_offsets, callback=next_after)
 
         self.worker.submit(
             self._task_update_channels,
             channels.copy(),
             offsets.copy(),
-            marker_active,
             callback=on_live_update_done,
         )
 
@@ -203,12 +184,11 @@ class HardwareController:
         port: str,
         channels: list[int],
         offsets: list[int],
-        marker_active: bool,
     ):
         ser = open_serial(port)
         worker_self.ser = ser
         try:
-            ppm_channels = self._ppm_channels_for_firmware(channels, marker_active)
+            ppm_channels = self._ppm_channels_for_firmware(channels)
             ppm_offsets = self._ppm_offsets_for_firmware(offsets, len(ppm_channels))
             quant, max_count, version_warning = run_ppm_on_serial(ser, ppm_channels, ppm_offsets)
         except Exception:
@@ -233,11 +213,10 @@ class HardwareController:
         worker_self: SerialWorker,
         channels: list[int],
         offsets: list[int],
-        marker_active: bool,
     ):
         if worker_self.ser is None:
             raise RuntimeError("Serial not open")
-        ppm_channels = self._ppm_channels_for_firmware(channels, marker_active)
+        ppm_channels = self._ppm_channels_for_firmware(channels)
         ppm_offsets = self._ppm_offsets_for_firmware(offsets, len(ppm_channels))
         return run_ppm_on_serial(worker_self.ser, ppm_channels, ppm_offsets)
 
@@ -246,16 +225,13 @@ class HardwareController:
         worker_self: SerialWorker,
         channels: list[int],
         offsets: list[int],
-        marker_active: bool,
     ):
         if worker_self.ser is None:
             raise RuntimeError("Serial not open")
-        ppm_channels = self._ppm_channels_for_firmware(channels, marker_active)
+        ppm_channels = self._ppm_channels_for_firmware(channels)
         ppm_offsets = self._ppm_offsets_for_firmware(offsets, len(ppm_channels))
         quant, max_count, _ = run_ppm_on_serial(worker_self.ser, ppm_channels, ppm_offsets)
-        # Return the actual frame values sent to the Arduino, including the
-        # forced CH8 marker value. The UI/runtime should not keep a hidden
-        # marker state that is different from the displayed live outputs.
+        # Return the actual frame values sent to the Arduino after padding and clamping.
         return (quant, max_count, ppm_channels)
 
     def _task_shutdown(self, worker_self: SerialWorker):
@@ -273,12 +249,11 @@ class HardwareController:
         return None
 
     @staticmethod
-    def _ppm_channels_for_firmware(channels: list[int], marker_active: bool) -> list[int]:
-        count = max(PPM_OUTPUT_CHANNEL_COUNT, len(channels), BEEPER_MARKER_CHANNEL_INDEX + 1)
-        output = [BEEPER_MARKER_OFF_US] * count
+    def _ppm_channels_for_firmware(channels: list[int]) -> list[int]:
+        count = max(PPM_OUTPUT_CHANNEL_COUNT, len(channels))
+        output = [PID_TEST_CH8_OFF_US] * count
         for index, value in enumerate(channels):
             output[index] = max(1000, min(2000, int(value)))
-        output[BEEPER_MARKER_CHANNEL_INDEX] = BEEPER_MARKER_ON_US if marker_active else BEEPER_MARKER_OFF_US
         return output
 
     @staticmethod

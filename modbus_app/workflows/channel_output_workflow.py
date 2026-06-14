@@ -12,6 +12,7 @@ from ..constants import (
     OFFSET_DEFAULTS,
     THROTTLE_CHANNEL_INDEX,
 )
+from ..ch8_marker import channels_with_pid_test_ch8
 from ..ui import parse_entries, require_range
 
 
@@ -183,7 +184,6 @@ class ChannelOutputWorkflow:
         app.controller.queue_live_channel_update(
             channels.copy(),
             offsets.copy(),
-            app.beeper_marker_active,
             callback=on_live_update_done,
         )
 
@@ -222,9 +222,9 @@ class ChannelOutputWorkflow:
             return
         target = max(1000, min(2000, int(app.auto_config.abort_throttle_us)))
         channels[THROTTLE_CHANNEL_INDEX] = min(channels[THROTTLE_CHANNEL_INDEX], target)
+        channels = channels_with_pid_test_ch8(channels, active=False)
         self.apply_auto_base_outputs(channels, send_update=False)
         app.auto_original_base_outputs = None
-        app.beeper_marker_active = False
         if self.arduino_output_connected():
             self.queue_live_channel_update(channels.copy(), self.parse_offset_values_with_defaults())
 

@@ -291,10 +291,7 @@ class AutoSessionEngine:
         if app.pid_plan_fly_log_active:
             ready, stop_reason, warning = app.auto_controller.stop_ready(self.auto_elapsed_s(now))
             if ready:
-                if app.beeper_marker_active:
-                    self.auto_abort("Fly/Log safety timeout with beeper marker still on.", warning=stop_reason)
-                else:
-                    self.finish_pid_plan_fly_log(stop_reason)
+                self.finish_pid_plan_fly_log(stop_reason)
                 return
             self.schedule_tick()
             return

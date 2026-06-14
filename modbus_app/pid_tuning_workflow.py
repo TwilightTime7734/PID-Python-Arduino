@@ -298,8 +298,8 @@ def format_pid_tuning_plan(recommendation: PStartRecommendation) -> str:
     roll_ff_values = ", ".join(str(row["roll"]) for row in FF_SWEEP_VALUES)
     pitch_ff_values = ", ".join(str(row["pitch"]) for row in FF_SWEEP_VALUES)
     fly_log_action = (
-        "-   Once the 'Fly/Log' button is pressed, wait for spin-up, set CH8 beeper marker ON, "
-        "run the 6-group pitch/roll step routine, then set CH8 beeper marker OFF. "
+        "-   Once the 'Fly/Log' button is pressed, wait for spin-up, set CH8 to 2000us, "
+        "run the 6-group pitch/roll step routine, then set CH8 back to 1000us. "
         "Extract/Analyze reads the marked routine and ignores center-adjust pulses."
     )
     lines: list[str] = [

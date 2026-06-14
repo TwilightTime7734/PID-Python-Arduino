@@ -18,7 +18,6 @@ from serialUSB.inav_serial_service import (
 )
 
 from .constants import (
-    BEEPER_MARKER_SPINUP_DELAY_MS,
     FC_PORT_DEFAULT,
     LEVEL_CENTER_US,
     LEVEL_DEADBAND_DEG,
@@ -38,12 +37,12 @@ from .constants import (
 )
 from .adaptive_session import (
     AdaptiveCommand,
-    AdaptiveExcitationController,
     AdaptiveSessionConfig,
     AdaptiveSessionState,
     ExcitationEvent,
     axis_channel_index,
 )
+from .ch8_marker import channels_with_pid_test_ch8
 from .auto_tune_report import AutoTuneReport
 from .blackbox_import import BlackboxImportResult
 from .pid_tuning_workflow import (
@@ -83,10 +82,6 @@ from .tasks.worker_tasks import (
 )
 
 
-# Step 16: use the old-style exact-pulse Fly/Log path by default.
-# The adaptive/random engine remains in the project but is bypassed for
-# PID-plan Fly/Log until the deterministic marker/pulse path is verified.
-FLY_LOG_USE_DETERMINISTIC = True
 DEFAULT_TEST_THROTTLE_US = 1250
 
 
@@ -519,7 +514,7 @@ class ModbusApp(HardwareStateMixin):
             update_pid_progress_window()
             messagebox.showinfo(
                 "Fly/Log Complete",
-                "Fly/Log is complete. The CH8 beeper marker bracketed the calibration probes in Blackbox.\n\n"
+                "Fly/Log is complete. The CH8 PID test marker bracketed the calibration probes in Blackbox.\n\n"
                 "Disarm the drone now. After it is disarmed, press Next PID Plan Step.",
                 parent=self.root,
             )
@@ -527,12 +522,10 @@ class ModbusApp(HardwareStateMixin):
         def begin_fly_log_marker_off_and_complete() -> None:
             if not self.pid_plan_fly_log_active or self.fly_log_finishing:
                 return
-            if not self.beeper_marker_active:
-                finish_pid_plan_fly_log()
-                return
             self.fly_log_finishing = True
-            self.beeper_marker_active = False
-            self.status.set("Disabling channel 8 beeper log marker...")
+            self.base_channel_outputs = channels_with_pid_test_ch8(self.base_channel_outputs, active=False)
+            set_live_channel_outputs(self.base_channel_outputs.copy())
+            self.status.set("Setting CH8 back to 1000us...")
 
             def on_marker_disabled(ok: bool, res: object) -> None:
                 self.fly_log_finishing = False
@@ -540,7 +533,7 @@ class ModbusApp(HardwareStateMixin):
                     return
                 if not ok:
                     auto_abort(
-                        "Unable to disable channel 8 beeper log marker.",
+                        "Unable to set CH8 back to 1000us.",
                         warning=str(res) if not isinstance(res, Exception) else str(res),
                     )
                     return
@@ -656,11 +649,11 @@ class ModbusApp(HardwareStateMixin):
                 "The FC reports ARMED.\n\n"
                 "Pressing OK will run this sequence:\n"
                 "1. Brief spin-up on the current outputs\n"
-                "2. CH8 beeper marker ON (BEEPERON in Blackbox)\n"
+                "2. CH8 PID test marker ON (BEEPERON in Blackbox)\n"
                 "3. Small roll/pitch calibration probes\n"
-                "4. CH8 beeper marker OFF (BEEPEROFF in Blackbox)\n\n"
+                "4. CH8 PID test marker OFF (BEEPEROFF in Blackbox)\n\n"
                 "Chart Step Response analyzes the marker bracket, not a fixed time window. "
-                "You can also bracket your own logs of any length with CH8 beeper markers.\n\n"
+                "You can also bracket your own logs of any length with CH8 markers.\n\n"
                 "No PID/FF values will be written while armed.\n\n"
                 "Keep the drone secured, keep the area clear, and be ready to disarm."
             )
@@ -668,92 +661,7 @@ class ModbusApp(HardwareStateMixin):
                 self.status.set("Fly/Log canceled.")
                 return
 
-            if FLY_LOG_USE_DETERMINISTIC:
-                deterministic_fly_log_workflow.start()
-                return
-
-            self.auto_controller = AdaptiveExcitationController(self.auto_config)
-            self.auto_original_base_outputs = self.base_channel_outputs.copy()
-            self.auto_start_throttle_us = self.base_channel_outputs[THROTTLE_CHANNEL_INDEX]
-            self.auto_current_throttle_us = self.auto_start_throttle_us
-            self.auto_peak_throttle_us = self.auto_start_throttle_us
-            self.auto_stop_reason = ""
-            self.auto_warning = ""
-            self.auto_session_start_s = time.monotonic()
-            self.auto_last_tick_s = self.auto_session_start_s
-            self.auto_last_sample_s = self.auto_session_start_s
-            self.pid_plan_fly_log_active = True
-            self.fly_log_finishing = False
-            self.auto_stop_after_recovery = False
-            self.auto_axis_output_sign = {"roll": 1, "pitch": 1}
-            self.auto_probe_axes_pending = ["roll", "pitch"]
-            set_auto_state(AdaptiveSessionState.adaptive_run, "Fly/Log active")
-            self.beeper_marker_active = False
-            self.auto_session_button.config(text="Fly/Log Active", state="disabled")
-            self.cancel_auto_session_button.config(state="normal")
-            refresh_fly_log_button_state()
-            spinup_delay_s = BEEPER_MARKER_SPINUP_DELAY_MS / 1000.0
-            self.status.set(f"Preparing Fly/Log outputs. CH8 marker starts after {spinup_delay_s:.1f}s spin-up.")
-            open_pid_progress_window()
-            update_pid_progress_window()
-            set_auto_report_text(
-                "Fly/Log active\n\n"
-                f"Candidate: {self.pid_plan_current_candidate_title or 'current PID plan step'}\n"
-                f"The app is waiting {spinup_delay_s:.1f}s for spin-up before enabling the CH8 beeper marker.\n"
-                "Sequence: marker ON -> roll/pitch calibration probes -> marker OFF.\n"
-                "Chart Step Response will analyze the BEEPERON bracket in the Blackbox log.\n"
-                "No PID/FF values are being written while armed.\n\n"
-                "When complete, disarm the drone before pressing Next PID Plan Step."
-            )
-
-            def on_beeper_marker_enabled(ok: bool, res: object) -> None:
-                if not self.pid_plan_fly_log_active:
-                    return
-                if not ok:
-                    auto_abort(
-                        "Unable to enable channel 8 beeper log marker.",
-                        warning=str(res) if not isinstance(res, Exception) else str(res),
-                    )
-                    return
-                now_s = time.monotonic()
-                self.auto_session_start_s = now_s
-                self.auto_last_tick_s = now_s
-                self.auto_last_sample_s = now_s
-                self.status.set("Fly/Log marker is ON. Calibrating roll/pitch output direction.")
-                schedule_auto_tick(delay_ms=250)
-
-            def enable_beeper_marker_after_spinup() -> None:
-                self.fly_log_marker_after_id = None
-                if not self.pid_plan_fly_log_active or not auto_is_running():
-                    return
-                self.beeper_marker_active = True
-                self.status.set("Enabling channel 8 beeper log marker...")
-                queue_live_channel_update(
-                    self.base_channel_outputs.copy(),
-                    parse_offset_values_with_defaults(),
-                    after_update=on_beeper_marker_enabled,
-                )
-
-            def on_spinup_outputs_prepared(ok: bool, res: object) -> None:
-                if not self.pid_plan_fly_log_active:
-                    return
-                if not ok:
-                    auto_abort(
-                        "Unable to prepare Fly/Log outputs before marker.",
-                        warning=str(res) if not isinstance(res, Exception) else str(res),
-                    )
-                    return
-                self.status.set(f"Fly/Log spin-up wait: channel 8 marker starts in {spinup_delay_s:.1f}s.")
-                self.fly_log_marker_after_id = self.root.after(
-                    max(1, BEEPER_MARKER_SPINUP_DELAY_MS),
-                    enable_beeper_marker_after_spinup,
-                )
-
-            queue_live_channel_update(
-                self.base_channel_outputs.copy(),
-                parse_offset_values_with_defaults(),
-                after_update=on_spinup_outputs_prepared,
-            )
+            deterministic_fly_log_workflow.start()
 
         def set_sim_attitude_display() -> None:
             self.horizon.set_attitude(self.sim_roll_deg, self.sim_pitch_deg)

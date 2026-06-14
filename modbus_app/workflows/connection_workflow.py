@@ -16,6 +16,7 @@ from ..constants import (
     FC_PORT_DEFAULT,
 )
 from ..ui import parse_entries, require_range
+from ..ch8_marker import channels_with_pid_test_ch8
 
 
 class ConnectionWorkflow:
@@ -263,7 +264,7 @@ class ConnectionWorkflow:
             selected_port = self.port()
             if app.controller.is_connected and selected_port != app.controller.run_port:
                 raise RuntimeError(f"Output is active on {app.controller.run_port}. Press Disconnect Arduino before switching ports.")
-            app.beeper_marker_active = False
+            channels = channels_with_pid_test_ch8(channels, active=False)
 
             def on_start_done(ok: bool, res: object) -> None:
                 app.start_pending = False
@@ -297,7 +298,6 @@ class ConnectionWorkflow:
                 selected_port,
                 channels,
                 offsets,
-                app.beeper_marker_active,
                 callback=on_start_done,
             )
 
@@ -316,7 +316,6 @@ class ConnectionWorkflow:
                 if res is not None:
                     self.set_error("Stop error", RuntimeError("Unexpected worker result from stop task"))
                     return
-                app.beeper_marker_active = False
                 self.set_live_channel_outputs(self.parse_channel_values_with_defaults())
                 self.update_link_indicators()
                 app.status.set("PPM output stopped.")

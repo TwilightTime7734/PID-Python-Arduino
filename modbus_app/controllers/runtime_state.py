@@ -54,7 +54,6 @@ class RuntimeStateController:
         self_.adjust_repeat_delta = 0
         self_.base_channel_outputs = CHANNEL_DEFAULTS.copy()
         self_.live_channel_outputs = self_.base_channel_outputs.copy()
-        self_.beeper_marker_active = False
         self_.worker = self_.controller.worker
         self_.fc_service = InavSerialService()
         self_.fc_poll_after_id: str | None = None

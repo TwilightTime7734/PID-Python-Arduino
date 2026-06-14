@@ -103,7 +103,6 @@ class AutoSessionCompletionWorkflow:
         app = self.app
         app.auto_stop_reason = reason
         app.auto_warning = warning
-        app.beeper_marker_active = False
         if lower_throttle:
             self.lower_throttle_for_abort()
         self.stop_runtime(restore_outputs=not lower_throttle)
