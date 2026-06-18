@@ -71,7 +71,6 @@ from .workflows.auto_session_workflow import AutoSessionWorkflow
 from .workflows.auto_session_completion_workflow import AutoSessionCompletionWorkflow
 from .workflows.auto_session_engine import AutoSessionEngine
 from .workflows.deterministic_fly_log_workflow import DeterministicFlyLogWorkflow
-from .presenters.pid_progress_presenter import PidProgressPresenter
 from .tasks.worker_tasks import (
     analyze_blackbox_logs as worker_analyze_blackbox_logs,
     analyze_specific_blackbox_log as worker_analyze_specific_blackbox_log,
@@ -369,24 +368,11 @@ class ModbusApp(HardwareStateMixin):
         ) -> None:
             pid_plan_workflow.set_plan_report_text(plan, title, target, current)
 
-        def current_pid_plan_step() -> tuple[str, str, dict[str, dict[str, int]]] | None:
-            return pid_plan_workflow.current_step()
-
-        pid_progress_presenter = PidProgressPresenter(
-            app=self,
-            current_pid_plan_step=lambda: current_pid_plan_step(),
-            format_pid_values=format_pid_values,
-            set_error=lambda title, exc: set_error(title, exc),
-        )
-
         def update_pid_progress_window() -> None:
-            pid_progress_presenter.update_window()
-
-        def close_pid_progress_window() -> None:
-            pid_progress_presenter.close_window()
+            pass
 
         def open_pid_progress_window() -> None:
-            pid_progress_presenter.open_window()
+            pass
 
         def ensure_disarmed_before_pid_write() -> bool:
             while True:
@@ -1315,7 +1301,6 @@ class ModbusApp(HardwareStateMixin):
         self.analyze_blackbox_button.config(command=do_analyze_blackbox_logs)
         self.fly_log_button.config(command=fly_log_workflow.toggle)
         self.simulation_mode_checkbutton.config(command=on_simulation_mode_changed)
-        self.pid_progress_button.config(command=open_pid_progress_window)
         self.load_pid_ff_button.config(command=do_load_pid_ff_from_fc)
         self.save_pid_ff_button.config(command=do_save_pid_ff_to_fc)
         self.step_response_button.config(command=do_step_response_report)

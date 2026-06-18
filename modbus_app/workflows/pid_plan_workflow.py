@@ -145,6 +145,52 @@ class PidPlanWorkflow:
                 if isinstance(widget, tk.Entry):
                     self._set_readonly_entry_text(widget, value)
 
+    def populate_roll_values_table(self, plan: LoadedPIDTuningPlan) -> None:
+        app = self.app
+        if not hasattr(app, "roll_values_table"):
+            return
+
+        rows = [
+            [int(value) for value in plan.p_sweep.get("roll", ())],
+            [int(value) for value in plan.d_sweep],
+            [int(item.get("roll", 0)) for item in plan.i_sweep],
+            [int(item.get("roll", 0)) for item in plan.ff_sweep],
+        ]
+
+        # Roll table has 4 data rows and up to 5 value columns.
+        for row_index, values in enumerate(rows, start=1):
+            padded = values[:5] + [0] * max(0, 5 - len(values))
+            for col_index, value in enumerate(padded, start=1):
+                widgets = app.roll_values_table.grid_slaves(row=row_index, column=col_index)
+                if not widgets:
+                    continue
+                widget = widgets[0]
+                if isinstance(widget, tk.Entry):
+                    self._set_readonly_entry_text(widget, value)
+
+    def populate_pitch_values_table(self, plan: LoadedPIDTuningPlan) -> None:
+        app = self.app
+        if not hasattr(app, "pitch_values_table"):
+            return
+
+        rows = [
+            [int(value) for value in plan.p_sweep.get("pitch", ())],
+            [int(value) for value in plan.d_sweep],
+            [int(item.get("pitch", 0)) for item in plan.i_sweep],
+            [int(item.get("pitch", 0)) for item in plan.ff_sweep],
+        ]
+
+        # Pitch table has 4 data rows and up to 5 value columns.
+        for row_index, values in enumerate(rows, start=1):
+            padded = values[:5] + [0] * max(0, 5 - len(values))
+            for col_index, value in enumerate(padded, start=1):
+                widgets = app.pitch_values_table.grid_slaves(row=row_index, column=col_index)
+                if not widgets:
+                    continue
+                widget = widgets[0]
+                if isinstance(widget, tk.Entry):
+                    self._set_readonly_entry_text(widget, value)
+
     def generate_plan(self) -> None:
         app = self.app
         try:
@@ -164,6 +210,8 @@ class PidPlanWorkflow:
             report = generate_pid_tuning_plan_report(app.blackbox_import_dir, recommendation)
             loaded_plan = load_pid_tuning_plan(Path(report.text_path))
             self.populate_starting_values_table(loaded_plan)
+            self.populate_roll_values_table(loaded_plan)
+            self.populate_pitch_values_table(loaded_plan)
             summary_text = self.format_generated_plan_summary(loaded_plan)
             self.set_test_throttle_us(recommendation.throttle_estimate.level_test_throttle_us, "generated PID plan")
             self.publish_auto_report(summary_text)

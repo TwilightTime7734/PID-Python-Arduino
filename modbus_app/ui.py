@@ -296,6 +296,8 @@ class MainUi:
     roll_pidff_vars: list[tk.StringVar]
     pitch_pidff_vars: list[tk.StringVar]
     starting_values_table: tk.LabelFrame
+    roll_values_table: tk.LabelFrame
+    pitch_values_table: tk.LabelFrame
     pid_ff_adjust_canvases: list[tk.Canvas]
     load_pid_ff_button: tk.Button
     save_pid_ff_button: tk.Button
@@ -309,7 +311,6 @@ class MainUi:
     fly_log_button: tk.Button
     simulation_mode_var: tk.BooleanVar
     simulation_mode_checkbutton: tk.Checkbutton
-    pid_progress_button: tk.Button
     step_response_button: tk.Button
     pid_tuning_plan_button: tk.Button
 
@@ -485,8 +486,6 @@ def build_main_gui(root: tk.Tk) -> MainUi:
     auto_action_frame.grid(row=0, column=0, sticky="w", pady=(0, 6))
     fly_log_button = tk.Button(auto_action_frame, text="Fly/Log", width=18)
     fly_log_button.pack(side="left", padx=(0, 4))
-    pid_progress_button = tk.Button(auto_action_frame, text="Progress", width=10)
-    pid_progress_button.pack(side="left", padx=(0, 4))
     step_response_button = tk.Button(auto_action_frame, text="Chart Step Response", width=18)
     step_response_button.pack(side="left", padx=(0, 4))
     pid_tuning_plan_button = tk.Button(auto_action_frame, text="PID Tuning Plan", width=16)
@@ -565,6 +564,8 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         roll_pidff_vars=roll_pidff_vars,
         pitch_pidff_vars=pitch_pidff_vars,
         starting_values_table=starting_values_table,
+        roll_values_table=roll_values_table,
+        pitch_values_table=pitch_values_table,
         pid_ff_adjust_canvases=pid_ff_adjust_canvases,
         load_pid_ff_button=load_pid_ff_button,
         save_pid_ff_button=save_pid_ff_button,
@@ -578,7 +579,6 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         fly_log_button=fly_log_button,
         simulation_mode_var=simulation_mode_var,
         simulation_mode_checkbutton=simulation_mode_checkbutton,
-        pid_progress_button=pid_progress_button,
         step_response_button=step_response_button,
         pid_tuning_plan_button=pid_tuning_plan_button,
     )
