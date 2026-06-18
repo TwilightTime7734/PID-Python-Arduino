@@ -38,15 +38,15 @@ class FlyLogWorkflow:
         app = self.app
 
         if app.pid_plan_fly_log_active:
-            app.fly_log_button.config(text="Fly/Log Active", state="disabled")
+            app.fly_log_button.config(text="Fly/Log Active", state="normal")
         elif self.simulation_mode_enabled() and app.sim_fly_log_active:
-            app.fly_log_button.config(text="Sim Fly/Log Active", state="disabled")
+            app.fly_log_button.config(text="Sim Fly/Log Active", state="normal")
         elif app.pid_plan_active and app.pid_plan_waiting_for_fly_log:
             app.fly_log_button.config(text="Fly/Log", state="normal")
         elif self.simulation_mode_enabled() and app.sim_plan is not None and app.sim_waiting_for_fly_log:
             app.fly_log_button.config(text="Fly/Log", state="normal")
         else:
-            app.fly_log_button.config(text="Fly/Log", state="disabled")
+            app.fly_log_button.config(text="Fly/Log", state="normal")
 
     def toggle(self) -> None:
         """Main click handler for the Fly/Log button."""

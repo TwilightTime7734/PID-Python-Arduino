@@ -81,7 +81,7 @@ def _build_interactive_roll_pitch_table(
     rows: Sequence[tuple[str, Sequence[int | str]]],
     headings: Sequence[str],
     pidff_vars: list[tk.StringVar],
-) -> tk.LabelFrame:
+) -> tuple[tk.LabelFrame, dict[str, list[tk.Entry]]]:
     """Build a Roll/Pitch table with clickable entries that sync to FC/INAV section."""
     frame = tk.LabelFrame(parent, text=title, padx=6, pady=5)
     for column in range(len(headings)):
@@ -101,9 +101,12 @@ def _build_interactive_roll_pitch_table(
     # pidff_vars is indexed as: P=0, I=1, D=2, FF=3
     param_to_index = {"P": 0, "I": 1, "D": 2, "FF": 3}
     
+    value_entries: dict[str, list[tk.Entry]] = {}
+
     for row_index, (param_name, values) in enumerate(rows, start=1):
         _readonly_table_entry(frame, row_index, 0, param_name, width=10)
         param_idx = param_to_index.get(param_name, -1)
+        row_entries: list[tk.Entry] = []
         
         for column_index in range(1, len(headings)):
             value = values[column_index - 1] if column_index - 1 < len(values) else ""
@@ -111,6 +114,7 @@ def _build_interactive_roll_pitch_table(
             entry.insert(0, str(value))
             entry.config(state="readonly", readonlybackground="#FFE4E1", foreground="black")
             entry.grid(row=row_index, column=column_index, padx=2, pady=2, sticky="we")
+            row_entries.append(entry)
             
             # Initialize state: light red background, not toggled
             entry_states[entry] = {
@@ -140,8 +144,10 @@ def _build_interactive_roll_pitch_table(
                 return on_click
             
             entry.bind("<Button-1>", make_click_handler(entry, entry_states))
+
+            value_entries[str(param_name).upper()] = row_entries
     
-    return frame
+            return frame, value_entries
 
 
 def _build_interactive_pid_value_table(
@@ -151,7 +157,7 @@ def _build_interactive_pid_value_table(
     headings: Sequence[str],
     roll_pidff_vars: list[tk.StringVar],
     pitch_pidff_vars: list[tk.StringVar],
-) -> tk.LabelFrame:
+) -> tuple[tk.LabelFrame, list[list[tk.Entry]]]:
     """Build a PID value table with clickable entries that sync to FC/INAV section."""
     frame = tk.LabelFrame(parent, text=title, padx=6, pady=5)
     for column in range(len(headings)):
@@ -167,6 +173,8 @@ def _build_interactive_pid_value_table(
     # Store entry widget references and their state for color toggling
     entry_states: dict[tk.Entry, dict] = {}
     
+    value_entries: list[list[tk.Entry]] = []
+
     for row_index, (label, values) in enumerate(rows, start=1):
         # Strip "start" and "rec" from the label
         clean_label = label.replace(" start", "").replace(" rec", "")
@@ -180,12 +188,15 @@ def _build_interactive_pid_value_table(
             axis_type = "pitch"
         # Yaw rows are ignored
         
+        row_entries: list[tk.Entry] = []
+
         for column_index in range(1, len(headings)):
             value = values[column_index - 1] if column_index - 1 < len(values) else ""
             entry = tk.Entry(frame, width=8, justify="center", relief="sunken")
             entry.insert(0, str(value))
             entry.config(state="readonly", readonlybackground="#FFE4E1", foreground="black")
             entry.grid(row=row_index, column=column_index, padx=2, pady=2, sticky="we")
+            row_entries.append(entry)
             
             # Initialize state: light red background, not toggled
             entry_states[entry] = {
@@ -221,8 +232,10 @@ def _build_interactive_pid_value_table(
                     return on_click
                 
                 entry.bind("<Button-1>", make_click_handler(entry, entry_states))
+
+        value_entries.append(row_entries)
     
-    return frame
+    return frame, value_entries
 
 
 class ArtificialHorizon(tk.Canvas):
@@ -295,6 +308,9 @@ class MainUi:
     pitch_text: tk.StringVar
     roll_pidff_vars: list[tk.StringVar]
     pitch_pidff_vars: list[tk.StringVar]
+    starting_values_value_entries: list[list[tk.Entry]]
+    roll_value_entries: dict[str, list[tk.Entry]]
+    pitch_value_entries: dict[str, list[tk.Entry]]
     pid_ff_adjust_canvases: list[tk.Canvas]
     load_pid_ff_button: tk.Button
     save_pid_ff_button: tk.Button
@@ -309,7 +325,6 @@ class MainUi:
     simulation_mode_var: tk.BooleanVar
     simulation_mode_checkbutton: tk.Checkbutton
     pid_progress_button: tk.Button
-    cancel_auto_session_button: tk.Button
     step_response_button: tk.Button
     pid_tuning_plan_button: tk.Button
 
@@ -483,12 +498,10 @@ def build_main_gui(root: tk.Tk) -> MainUi:
 
     auto_action_frame = tk.Frame(auto_frame)
     auto_action_frame.grid(row=0, column=0, sticky="w", pady=(0, 6))
-    fly_log_button = tk.Button(auto_action_frame, text="Fly/Log", width=18, state="disabled")
+    fly_log_button = tk.Button(auto_action_frame, text="Fly/Log", width=18)
     fly_log_button.pack(side="left", padx=(0, 4))
     pid_progress_button = tk.Button(auto_action_frame, text="Progress", width=10)
     pid_progress_button.pack(side="left", padx=(0, 4))
-    cancel_auto_session_button = tk.Button(auto_action_frame, text="Cancel Auto Session", width=18)
-    cancel_auto_session_button.pack(side="left", padx=(0, 4))
     step_response_button = tk.Button(auto_action_frame, text="Chart Step Response", width=18)
     step_response_button.pack(side="left", padx=(0, 4))
     pid_tuning_plan_button = tk.Button(auto_action_frame, text="PID Tuning Plan", width=16)
@@ -499,14 +512,14 @@ def build_main_gui(root: tk.Tk) -> MainUi:
     for column in range(3):
         pid_table_frame.grid_columnconfigure(column, weight=1, uniform="pid_tables")
 
-    starting_values_table = _build_interactive_pid_value_table(
+    starting_values_table, starting_values_value_entries = _build_interactive_pid_value_table(
         pid_table_frame,
         "Starting values",
         (
-            ("Roll start", (42, 17, 30, 0)),
-            ("Pitch start", (44, 17, 35, 0)),
-            ("Yaw start", (42, 0, 0, 0)),
-            ("Yaw rec", (42, 0, 60, 86)),
+            ("Roll start", ("00", "00", "00", "00")),
+            ("Pitch start", ("00", "00", "00", "00")),
+            ("Yaw start", ("00", "00", "00", "00")),
+            ("Yaw rec", ("00", "00", "00", "00")),
         ),
         ("Axis", "P", "D", "I", "FF"),
         roll_pidff_vars,
@@ -514,28 +527,28 @@ def build_main_gui(root: tk.Tk) -> MainUi:
     )
     starting_values_table.grid(row=0, column=0, padx=(0, 4), sticky="nwe")
 
-    roll_values_table = _build_interactive_roll_pitch_table(
+    roll_values_table, roll_value_entries = _build_interactive_roll_pitch_table(
         pid_table_frame,
         "Roll",
         (
-            ("P", (37, 42, 47, 52)),
-            ("D", (17, 23, 30, 36, 42)),
-            ("I", (35, 60, 85, 110)),
-            ("FF", (43, 86, 129, 172)),
+            ("P", ("00", "00", "00", "00", "00")),
+            ("D", ("00", "00", "00", "00", "00")),
+            ("I", ("00", "00", "00", "00", "00")),
+            ("FF", ("00", "00", "00", "00", "00")),
         ),
         ("Gain", "1", "2", "3", "4", "5"),
         roll_pidff_vars,
     )
     roll_values_table.grid(row=0, column=1, padx=4, sticky="nwe")
 
-    pitch_values_table = _build_interactive_roll_pitch_table(
+    pitch_values_table, pitch_value_entries = _build_interactive_roll_pitch_table(
         pid_table_frame,
         "Pitch",
         (
-            ("P", (39, 44, 49, 54)),
-            ("D", (17, 23, 30, 36, 42)),
-            ("I", (40, 65, 90, 115)),
-            ("FF", (44, 89, 134, 179)),
+            ("P", ("00", "00", "00", "00", "00")),
+            ("D", ("00", "00", "00", "00", "00")),
+            ("I", ("00", "00", "00", "00", "00")),
+            ("FF", ("00", "00", "00", "00", "00")),
         ),
         ("Gain", "1", "2", "3", "4", "5"),
         pitch_pidff_vars,
@@ -566,6 +579,9 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         pitch_text=pitch_text,
         roll_pidff_vars=roll_pidff_vars,
         pitch_pidff_vars=pitch_pidff_vars,
+        starting_values_value_entries=starting_values_value_entries,
+        roll_value_entries=roll_value_entries,
+        pitch_value_entries=pitch_value_entries,
         pid_ff_adjust_canvases=pid_ff_adjust_canvases,
         load_pid_ff_button=load_pid_ff_button,
         save_pid_ff_button=save_pid_ff_button,
@@ -580,7 +596,6 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         simulation_mode_var=simulation_mode_var,
         simulation_mode_checkbutton=simulation_mode_checkbutton,
         pid_progress_button=pid_progress_button,
-        cancel_auto_session_button=cancel_auto_session_button,
         step_response_button=step_response_button,
         pid_tuning_plan_button=pid_tuning_plan_button,
     )

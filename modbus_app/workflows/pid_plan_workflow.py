@@ -60,6 +60,60 @@ class PidPlanWorkflow:
         self.stop_simulated_auto_session = stop_simulated_auto_session
         self.set_test_throttle_us = set_test_throttle_us
 
+    @staticmethod
+    def _set_readonly_entry(entry: tk.Entry, value: int | str) -> None:
+        text = f"{int(value):02d}" if isinstance(value, int) else str(value)
+        previous_state = str(entry.cget("state"))
+        entry.config(state="normal")
+        entry.delete(0, tk.END)
+        entry.insert(0, text)
+        entry.config(state=previous_state)
+
+    @staticmethod
+    def _pad_values(values: list[int], width: int) -> list[int]:
+        return values[:width] + [0] * max(0, width - len(values))
+
+    def populate_plan_tables(self, plan: LoadedPIDTuningPlan) -> None:
+        app = self.app
+        if not hasattr(app, "starting_values_value_entries"):
+            return
+
+        start_rows = [
+            [int(plan.start_p.get("roll", 0)), int(plan.d_sweep[0] if plan.d_sweep else 0), int(plan.start_i.get("roll", 0)), 0],
+            [int(plan.start_p.get("pitch", 0)), int(plan.d_sweep[0] if plan.d_sweep else 0), int(plan.start_i.get("pitch", 0)), 0],
+            [int(plan.start_p.get("yaw", 0)), 0, 0, 0],
+            [
+                int(plan.yaw_final_pid_ff.get("p", 0)),
+                int(plan.yaw_final_pid_ff.get("d", 0)),
+                int(plan.yaw_final_pid_ff.get("i", 0)),
+                int(plan.yaw_final_pid_ff.get("ff", 0)),
+            ],
+        ]
+
+        for row_entries, row_values in zip(app.starting_values_value_entries, start_rows):
+            for entry, value in zip(row_entries, row_values):
+                self._set_readonly_entry(entry, value)
+
+        roll_rows = {
+            "P": self._pad_values([int(v) for v in plan.p_sweep.get("roll", ())], 5),
+            "D": self._pad_values([int(v) for v in plan.d_sweep], 5),
+            "I": self._pad_values([int(item.get("roll", 0)) for item in plan.i_sweep], 5),
+            "FF": self._pad_values([int(item.get("roll", 0)) for item in plan.ff_sweep], 5),
+        }
+        pitch_rows = {
+            "P": self._pad_values([int(v) for v in plan.p_sweep.get("pitch", ())], 5),
+            "D": self._pad_values([int(v) for v in plan.d_sweep], 5),
+            "I": self._pad_values([int(item.get("pitch", 0)) for item in plan.i_sweep], 5),
+            "FF": self._pad_values([int(item.get("pitch", 0)) for item in plan.ff_sweep], 5),
+        }
+
+        for gain, values in roll_rows.items():
+            for entry, value in zip(app.roll_value_entries.get(gain, ()), values):
+                self._set_readonly_entry(entry, value)
+        for gain, values in pitch_rows.items():
+            for entry, value in zip(app.pitch_value_entries.get(gain, ()), values):
+                self._set_readonly_entry(entry, value)
+
     def generate_plan(self) -> None:
         app = self.app
         try:
@@ -77,6 +131,8 @@ class PidPlanWorkflow:
 
             recommendation = suggest_starting_p(inputs)
             report = generate_pid_tuning_plan_report(app.blackbox_import_dir, recommendation)
+            loaded_plan = load_pid_tuning_plan(Path(report.text_path))
+            self.populate_plan_tables(loaded_plan)
             self.set_test_throttle_us(recommendation.throttle_estimate.level_test_throttle_us, "generated PID plan")
             self.publish_auto_report(Path(report.text_path).read_text(encoding="utf-8", errors="replace"))
             app.status.set(
@@ -740,6 +796,7 @@ class PidPlanWorkflow:
         app.pid_plan_current_candidate_title = ""
         app.pid_plan_current_candidate_phase = ""
         app.pid_plan_current_candidate_target = None
+        self.populate_plan_tables(app.pid_plan)
         self.set_plan_report_text(app.pid_plan, "PID tuning plan loaded")
         self.refresh_fly_log_button_state()
         app.status.set(

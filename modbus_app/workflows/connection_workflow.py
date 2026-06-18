@@ -29,7 +29,6 @@ class ConnectionWorkflow:
         fc_baud: Callable[[], int],
         simulation_mode_enabled: Callable[[], bool],
         auto_is_running: Callable[[], bool],
-        auto_session_cancel_available: Callable[[], bool],
         refresh_level_button_state: Callable[[bool], None],
         refresh_fly_log_button_state: Callable[[], None],
         clear_pid_ff_displays: Callable[[], None],
@@ -45,7 +44,6 @@ class ConnectionWorkflow:
         self.fc_baud = fc_baud
         self.simulation_mode_enabled = simulation_mode_enabled
         self.auto_is_running = auto_is_running
-        self.auto_session_cancel_available = auto_session_cancel_available
         self.refresh_level_button_state = refresh_level_button_state
         self.refresh_fly_log_button_state = refresh_fly_log_button_state
         self.clear_pid_ff_displays = clear_pid_ff_displays
@@ -166,10 +164,6 @@ class ConnectionWorkflow:
         simulation_blocked = app.start_pending or arduino_connected or fc_connected
         app.simulation_mode_checkbutton.config(state="normal" if sim_mode or not simulation_blocked else "disabled")
         self.refresh_level_button_state(fc_connected)
-
-        app.cancel_auto_session_button.config(
-            state="normal" if self.auto_session_cancel_available() else "disabled"
-        )
         self.refresh_fly_log_button_state()
 
     def connect_fc(self) -> None:

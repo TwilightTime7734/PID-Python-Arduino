@@ -196,7 +196,6 @@ class DeterministicFlyLogWorkflow:
         app.auto_hold_end_requested = False
         self.set_auto_state(AdaptiveSessionState.adaptive_run, "Deterministic Fly/Log 6-group pulse active")
         self._set_base_marker_state(active=False)
-        app.cancel_auto_session_button.config(state="normal")
         self.refresh_fly_log_button_state()
 
         spinup_delay_s = PID_TEST_CH8_SPINUP_DELAY_MS / 1000.0

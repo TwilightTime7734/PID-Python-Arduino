@@ -1092,12 +1092,6 @@ class ModbusApp(HardwareStateMixin):
         def do_auto_session_toggle() -> None:
             auto_session_workflow.toggle()
 
-        def auto_session_cancel_available() -> bool:
-            return auto_session_workflow.cancel_available()
-
-        def do_cancel_auto_session() -> None:
-            auto_session_workflow.cancel()
-
         def on_simulation_mode_changed() -> None:
             try:
                 if simulation_mode_enabled():
@@ -1192,7 +1186,6 @@ class ModbusApp(HardwareStateMixin):
             fc_baud=fc_baud,
             simulation_mode_enabled=simulation_mode_enabled,
             auto_is_running=lambda: auto_is_running(),
-            auto_session_cancel_available=lambda: auto_session_cancel_available(),
             refresh_level_button_state=refresh_level_button_state,
             refresh_fly_log_button_state=refresh_fly_log_button_state,
             clear_pid_ff_displays=clear_pid_ff_displays,
@@ -1323,7 +1316,6 @@ class ModbusApp(HardwareStateMixin):
         self.fly_log_button.config(command=fly_log_workflow.toggle)
         self.simulation_mode_checkbutton.config(command=on_simulation_mode_changed)
         self.pid_progress_button.config(command=open_pid_progress_window)
-        self.cancel_auto_session_button.config(command=do_cancel_auto_session)
         self.load_pid_ff_button.config(command=do_load_pid_ff_from_fc)
         self.save_pid_ff_button.config(command=do_save_pid_ff_to_fc)
         self.step_response_button.config(command=do_step_response_report)
