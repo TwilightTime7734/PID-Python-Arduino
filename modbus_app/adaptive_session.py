@@ -68,12 +68,15 @@ class AdaptiveSessionConfig:
     response_us_per_deg_max: float = 60.0
     response_min_peak_deg: float = 0.2
 
+    # Return the configured maximum force for the given axis.
     def axis_force_us(self, axis: str) -> int:
         return self.roll_force_us if axis == "roll" else self.pitch_force_us
 
+    # Return the configured nominal hold duration for the given axis.
     def axis_hold_s(self, axis: str) -> float:
         return self.roll_hold_s if axis == "roll" else self.pitch_hold_s
 
+    # Return the configured target peak angle for the given axis.
     def axis_target_peak_max_deg(self, axis: str) -> float:
         return self.roll_target_peak_deg if axis == "roll" else self.pitch_target_peak_deg
 
@@ -132,6 +135,7 @@ class _DirectionCoverage:
     valid_count: int = 0
     settle_success_count: int = 0
 
+    # Record a new excitation event and update counters for validity and settling.
     def register_event(self, event: ExcitationEvent, cfg: AdaptiveSessionConfig) -> None:
         self.total_count += 1
         peak = abs(float(event.peak_delta_deg))
@@ -141,22 +145,26 @@ class _DirectionCoverage:
         if event.settle_success:
             self.settle_success_count += 1
 
+    # Return the fraction of events that settled successfully.
     def settle_ratio(self) -> float:
         if self.total_count <= 0:
             return 0.0
         return self.settle_success_count / float(self.total_count)
 
+    # Return the median peak amplitude observed so far.
     def median_peak(self) -> float:
         if not self.peak_angles:
             return 0.0
         return float(median(self.peak_angles))
 
+    # Compute a confidence score for this direction using valid events and settle performance.
     def confidence(self, cfg: AdaptiveSessionConfig, axis: str) -> float:
         target = max(1, cfg.target_valid_events)
         valid_score = min(1.0, self.valid_count / float(target))
         settle_score = min(1.0, self.settle_ratio() / max(0.01, cfg.target_settle_ratio))
         return max(0.0, min(1.0, (valid_score * 0.65) + (settle_score * 0.35)))
 
+    # Return whether this direction has met both event count and settle ratio targets.
     def target_met(self, cfg: AdaptiveSessionConfig, axis: str) -> bool:
         return self.valid_count >= cfg.target_valid_events and self.settle_ratio() >= cfg.target_settle_ratio
 
@@ -164,6 +172,7 @@ class _DirectionCoverage:
 class AdaptiveExcitationController:
     """Random roll/pitch excitation bounded by live attitude and configured runtime."""
 
+    # Initialize controller state, response estimates, and coverage tracking.
     def __init__(self, config: AdaptiveSessionConfig | None = None, rng: random.Random | None = None) -> None:
         self.config = config or AdaptiveSessionConfig()
         self._rng = rng or random.Random()
@@ -180,6 +189,7 @@ class AdaptiveExcitationController:
             ("pitch", +1): _DirectionCoverage(),
         }
 
+    # Record a completed excitation event and update coverage plus response estimates.
     def record_event(self, event: ExcitationEvent) -> None:
         key = (event.axis, 1 if event.direction >= 0 else -1)
         coverage = self._coverage.get(key)
@@ -188,6 +198,7 @@ class AdaptiveExcitationController:
         if not event.recovery:
             self.record_axis_response(event.axis, event.force_us, event.hold_s, event.peak_delta_deg)
 
+    # Update the per-axis force-to-angle response estimate using recent excitation data.
     def record_axis_response(self, axis: str, force_us: int, hold_s: float, peak_delta_deg: float) -> None:
         peak = abs(float(peak_delta_deg))
         if peak < self.config.response_min_peak_deg:
@@ -203,6 +214,7 @@ class AdaptiveExcitationController:
             updated = (current * 0.8) + (measured * 0.2)
         self._axis_response_us_per_deg[axis] = self._clamp_response_us_per_deg(updated)
 
+    # Determine an initial throttle setting for a session, respecting configured limits.
     def initial_throttle(self, current_throttle_us: int) -> tuple[int, str]:
         current = max(1000, min(2000, int(current_throttle_us)))
         target = max(self.config.throttle_start_us, current)
@@ -213,17 +225,21 @@ class AdaptiveExcitationController:
             return target, f"auto throttle floor {target}us"
         return target, f"auto throttle capped {target}us"
 
+    # Return the throttle value after an event; this controller leaves it unchanged.
     def throttle_after_event(self, current_throttle_us: int, _event: ExcitationEvent) -> tuple[int, str]:
         return max(1000, min(2000, int(current_throttle_us))), ""
 
+    # Compute overall confidence for a roll or pitch axis from both direction coverages.
     def axis_confidence(self, axis: str) -> float:
         pos = self._coverage[(axis, +1)].confidence(self.config, axis)
         neg = self._coverage[(axis, -1)].confidence(self.config, axis)
         return (pos + neg) / 2.0
 
+    # Compute confidence for a specific axis direction only.
     def direction_confidence(self, axis: str, direction: int) -> float:
         return self._coverage[(axis, 1 if direction >= 0 else -1)].confidence(self.config, axis)
 
+    # Build and return coverage metrics for both axes and directions.
     def coverage_metrics(self) -> CoverageMetrics:
         direction: dict[str, DirectionSnapshot] = {}
         for axis in ("roll", "pitch"):
@@ -245,6 +261,7 @@ class AdaptiveExcitationController:
             },
         )
 
+    # Check whether the session has reached its configured maximum runtime.
     def stop_ready(self, elapsed_s: float, *, session_label: str = "Fly/Log") -> tuple[bool, str, str]:
         if elapsed_s >= self.config.max_runtime_s:
             runtime_s = max(0.0, float(self.config.max_runtime_s))
@@ -255,23 +272,27 @@ class AdaptiveExcitationController:
             return True, f"{session_label} {duration_text} movement complete.", ""
         return False, "", ""
 
+    # Determine whether attitude has exceeded a hard safety limit and should abort immediately.
     def should_abort(self, roll_deg: float, pitch_deg: float) -> tuple[bool, str]:
         if abs(float(roll_deg)) >= self.config.hard_limit_deg or abs(float(pitch_deg)) >= self.config.hard_limit_deg:
             return True, f"Hard safety limit exceeded (roll={roll_deg:+.1f}, pitch={pitch_deg:+.1f})."
         return False, ""
 
+    # Decide whether the current attitude requires recovery mode.
     def should_recover(self, roll_deg: float, pitch_deg: float) -> bool:
         return (
             abs(float(roll_deg)) >= self.config.recovery_entry_deg
             or abs(float(pitch_deg)) >= self.config.recovery_entry_deg
         )
 
+    # Check whether the vehicle has recovered to within recovery exit thresholds.
     def recovery_complete(self, roll_deg: float, pitch_deg: float) -> bool:
         return (
             abs(float(roll_deg)) <= self.config.recovery_exit_deg
             and abs(float(pitch_deg)) <= self.config.recovery_exit_deg
         )
 
+    # Return the next adaptive excitation command, or a recovery command if needed.
     def next_command(self, roll_deg: float, pitch_deg: float, recovery_mode: bool = False) -> AdaptiveCommand | None:
         if recovery_mode:
             self._pending_commands.clear()
@@ -282,6 +303,7 @@ class AdaptiveExcitationController:
             return None
         return self._pending_commands.popleft()
 
+    # Queue a new random excitation cycle for roll and pitch.
     def _queue_random_cycle(self, roll_deg: float, pitch_deg: float) -> None:
         directions = {
             "roll": self._rng.choice((-1, 1)),
@@ -295,6 +317,7 @@ class AdaptiveExcitationController:
             if command is not None:
                 self._pending_commands.append(command)
 
+    # Choose a safe random command for one axis based on current attitude and limits.
     def _random_command_for_axis(self, axis: str, current_angle: float, direction: int) -> AdaptiveCommand | None:
         safe_direction = 1 if direction >= 0 else -1
         max_delta = self._safe_delta_deg(current_angle, safe_direction)
@@ -314,6 +337,7 @@ class AdaptiveExcitationController:
             return command
         return self._fallback_force_time(axis, safe_direction, min_delta, max_delta)
 
+    # Attempt to generate a valid random force and hold time for a target peak range.
     def _try_random_force_time(
         self, axis: str, direction: int, min_delta_deg: float, max_delta_deg: float
     ) -> AdaptiveCommand | None:
@@ -342,6 +366,7 @@ class AdaptiveExcitationController:
             )
         return None
 
+    # Fall back to a deterministic force/time choice when random sampling fails.
     def _fallback_force_time(
         self, axis: str, direction: int, min_delta_deg: float, max_delta_deg: float
     ) -> AdaptiveCommand | None:
@@ -364,6 +389,7 @@ class AdaptiveExcitationController:
             target_peak_deg=target_peak,
         )
 
+    # Compute the safe remaining angle change before approaching soft or hard limits.
     def _safe_delta_deg(self, current_angle: float, direction: int) -> float:
         limit = min(
             self.config.soft_limit_deg,
@@ -373,6 +399,7 @@ class AdaptiveExcitationController:
             return max(0.0, limit - current_angle)
         return max(0.0, current_angle + limit)
 
+    # Choose a direction that moves attitude back toward center.
     def _toward_center_direction(self, current_angle: float) -> int:
         if current_angle > 0:
             return -1
@@ -380,6 +407,7 @@ class AdaptiveExcitationController:
             return 1
         return self._rng.choice((-1, 1))
 
+    # Build a recovery command to return attitude to safe bounds.
     def _recovery_command(self, roll_deg: float, pitch_deg: float) -> AdaptiveCommand | None:
         axis = "roll" if abs(roll_deg) >= abs(pitch_deg) else "pitch"
         angle = roll_deg if axis == "roll" else pitch_deg
@@ -406,20 +434,24 @@ class AdaptiveExcitationController:
             target_peak_deg=target_peak,
         )
 
+    # Predict the expected peak angle for a given force and hold duration.
     def _predicted_peak_deg(self, axis: str, force_us: int, hold_s: float) -> float:
         us_per_deg = self._response_us_per_deg(axis)
         if us_per_deg <= 0:
             return 0.0
         return max(0.0, (float(force_us) * self._hold_scale(axis, hold_s)) / us_per_deg)
 
+    # Convert a hold duration into a scaling factor relative to the axis base hold time.
     def _hold_scale(self, axis: str, hold_s: float) -> float:
         base_hold = max(0.05, self.config.axis_hold_s(axis))
         return max(0.0, float(hold_s) / base_hold)
 
+    # Get the current response rate for the axis, clamped to configured bounds.
     def _response_us_per_deg(self, axis: str) -> float:
         default = self._clamp_response_us_per_deg(self.config.response_us_per_deg_default)
         return self._axis_response_us_per_deg.get(axis, default)
 
+    # Clamp a response rate to the configured minimum and maximum bounds.
     def _clamp_response_us_per_deg(self, value: float) -> float:
         return max(
             float(self.config.response_us_per_deg_min),
@@ -427,6 +459,7 @@ class AdaptiveExcitationController:
         )
 
 
+# Map an axis name to its channel index used by other systems.
 def axis_channel_index(axis: str) -> int:
     if axis == "roll":
         return 0
