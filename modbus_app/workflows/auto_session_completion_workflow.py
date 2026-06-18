@@ -28,8 +28,7 @@ class AutoSessionCompletionWorkflow:
         ensure_disarmed_before_blackbox_import: Callable[[str, int], bool],
         do_fc_disconnect: Callable[..., None],
         set_auto_state: Callable[..., None],
-        set_auto_button_idle: Callable[[], None],
-        set_auto_report_text: Callable[[str], None],
+        publish_auto_report: Callable[[str], None],
         format_blackbox_report: Callable[[BlackboxImportResult], str],
         auto_session_payload: Callable[[], dict[str, object]],
         auto_abort: Callable[..., None],
@@ -51,8 +50,7 @@ class AutoSessionCompletionWorkflow:
         self.ensure_disarmed_before_blackbox_import = ensure_disarmed_before_blackbox_import
         self.do_fc_disconnect = do_fc_disconnect
         self.set_auto_state = set_auto_state
-        self.set_auto_button_idle = set_auto_button_idle
-        self.set_auto_report_text = set_auto_report_text
+        self.publish_auto_report = publish_auto_report
         self.format_blackbox_report = format_blackbox_report
         self.auto_session_payload = auto_session_payload
         self.auto_abort = auto_abort
@@ -125,14 +123,12 @@ class AutoSessionCompletionWorkflow:
             selected_port = self.fc_port()
             selected_baud = self.fc_baud()
             if not self.ensure_disarmed_before_blackbox_import(selected_port, selected_baud):
-                self.set_auto_button_idle()
                 app.status.set("Auto blackbox pipeline canceled; disarm the drone before pulling logs.")
                 return
             if app.fc_service.is_connected:
                 self.do_fc_disconnect(update_status=False)
             app.blackbox_import_inflight = True
             self.set_auto_state(AdaptiveSessionState.import_analyze, "Import/analyze running")
-            app.auto_session_button.config(text="Running Analysis...", state="disabled")
             app.status.set("Auto session finished. Pulling and analyzing blackbox logs...")
 
             def on_auto_pull_done(ok: bool, res: object) -> None:
@@ -180,7 +176,7 @@ class AutoSessionCompletionWorkflow:
                     self.auto_abort("Unexpected analyze result in auto pipeline.")
                     return
                 app.auto_import_result = res
-                self.set_auto_report_text(self.format_blackbox_report(res))
+                self.publish_auto_report(self.format_blackbox_report(res))
                 app.worker.submit(
                     self.worker_generate_auto_report,
                     res,
@@ -192,7 +188,6 @@ class AutoSessionCompletionWorkflow:
 
             def on_auto_report_done(ok: bool, res: object) -> None:
                 app.blackbox_import_inflight = False
-                self.set_auto_button_idle()
                 if not ok:
                     self.auto_abort(
                         "Auto pipeline failed while generating report artifacts.",
@@ -207,7 +202,7 @@ class AutoSessionCompletionWorkflow:
                     report_text = Path(res.summary_txt).read_text(encoding="utf-8", errors="replace")
                 except Exception:
                     report_text = f"Report generated at {res.report_dir}\nSummary file: {res.summary_txt}"
-                self.set_auto_report_text(report_text)
+                self.publish_auto_report(report_text)
                 self.set_auto_state(AdaptiveSessionState.report_ready, "Ready")
                 app.status.set(f"Auto report ready: {res.report_dir}")
 

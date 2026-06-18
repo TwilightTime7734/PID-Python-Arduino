@@ -55,17 +55,11 @@ class AutoSessionWorkflow:
             AdaptiveSessionState.import_analyze,
         }
 
-    def set_button_idle(self) -> None:
-        self.app.auto_session_button.config(text="Start Auto Session", state="normal")
-
     def abort(self, reason: str, warning: str = "", continue_pipeline: bool = False) -> None:
         self.complete_auto_session(AdaptiveSessionState.aborted, reason, warning, lower_throttle=True)
         self.app.pid_plan_fly_log_active = False
         self.refresh_fly_log_button_state()
         self.app.status.set(f"Auto session aborted: {reason}")
-        self.set_button_idle()
-        if self.app.pid_plan_active:
-            self.app.auto_session_button.config(text="Next PID Plan Step", state="normal")
         self.update_pid_progress_window()
         if continue_pipeline:
             self.begin_auto_pipeline()
@@ -116,7 +110,6 @@ class AutoSessionWorkflow:
                 self.complete_auto_session(AdaptiveSessionState.aborted, "Canceled by user.", lower_throttle=True)
                 app.pid_plan_fly_log_active = False
                 self.refresh_fly_log_button_state()
-                self.set_button_idle()
                 app.status.set("Auto session canceled.")
                 canceled = True
             if app.pid_plan_active:

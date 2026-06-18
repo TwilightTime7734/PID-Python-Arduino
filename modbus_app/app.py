@@ -188,11 +188,10 @@ class ModbusApp(HardwareStateMixin):
         def staged_roll_pitch_pid_ff_values() -> dict[str, dict[str, int]]:
             return fc_pid_ff_workflow.staged_roll_pitch_values()
 
-        def set_auto_report_text(text: str) -> None:
-            self.auto_report_text.config(state="normal")
-            self.auto_report_text.delete("1.0", tk.END)
-            self.auto_report_text.insert("1.0", text.strip() + ("\n" if text and not text.endswith("\n") else ""))
-            self.auto_report_text.config(state="disabled")
+        def publish_auto_report(text: str) -> None:
+            summary = " ".join(line.strip() for line in text.splitlines() if line.strip())
+            if summary:
+                self.status.set(summary[:240])
 
         def auto_elapsed_s(now_s: float | None = None) -> float:
             return auto_session_helpers.elapsed_s(now_s)
@@ -322,7 +321,7 @@ class ModbusApp(HardwareStateMixin):
             fc_baud=fc_baud,
             simulation_mode_enabled=simulation_mode_enabled,
             auto_is_running=lambda: auto_is_running(),
-            set_auto_report_text=set_auto_report_text,
+            publish_auto_report=publish_auto_report,
             set_error=lambda title, exc: set_error(title, exc),
             disconnect_fc=lambda *args, **kwargs: do_fc_disconnect(*args, **kwargs),
         )
@@ -333,9 +332,8 @@ class ModbusApp(HardwareStateMixin):
         pid_plan_workflow = PidPlanWorkflow(
             app=self,
             auto_is_running=lambda: auto_is_running(),
-            set_auto_report_text=set_auto_report_text,
+            publish_auto_report=publish_auto_report,
             set_error=lambda title, exc: set_error(title, exc),
-            set_auto_button_idle=lambda: set_auto_button_idle(),
             refresh_fly_log_button_state=refresh_fly_log_button_state,
             update_progress_window=lambda: update_pid_progress_window(),
             open_progress_window=lambda: open_pid_progress_window(),
@@ -483,9 +481,6 @@ class ModbusApp(HardwareStateMixin):
         def stop_auto_session_runtime(restore_outputs: bool = True) -> None:
             auto_session_completion.stop_runtime(restore_outputs)
 
-        def set_auto_button_idle() -> None:
-            auto_session_workflow.set_button_idle()
-
         def complete_auto_session(
             next_state: AdaptiveSessionState,
             reason: str,
@@ -508,7 +503,6 @@ class ModbusApp(HardwareStateMixin):
             self.pid_plan_current_candidate_title = ""
             self.pid_plan_current_candidate_phase = ""
             self.pid_plan_current_candidate_target = None
-            self.auto_session_button.config(text="Next PID Plan Step", state="normal")
             refresh_fly_log_button_state()
             self.status.set(f"Fly/Log complete: {completed_title or reason}")
             update_pid_progress_window()
@@ -955,7 +949,7 @@ class ModbusApp(HardwareStateMixin):
                 lines.extend(["", "When simulated Fly/Log finishes, press Next Sim Step to preview the next tuning candidate."])
             else:
                 lines.extend(["", "Press Fly/Log to stimulate the simulated drone for this candidate."])
-            set_auto_report_text("\n".join(lines))
+            publish_auto_report("\n".join(lines))
 
         def stop_simulated_auto_session(message: str = "", restore_display: bool = True, clear_walkthrough: bool = False) -> None:
             if self.sim_after_id is not None:
@@ -1231,8 +1225,7 @@ class ModbusApp(HardwareStateMixin):
             ensure_disarmed_before_blackbox_import=ensure_disarmed_before_blackbox_import,
             do_fc_disconnect=do_fc_disconnect,
             set_auto_state=set_auto_state,
-            set_auto_button_idle=set_auto_button_idle,
-            set_auto_report_text=set_auto_report_text,
+            publish_auto_report=publish_auto_report,
             format_blackbox_report=format_blackbox_report,
             auto_session_payload=auto_session_payload,
             auto_abort=lambda *args, **kwargs: auto_abort(*args, **kwargs),
@@ -1261,7 +1254,7 @@ class ModbusApp(HardwareStateMixin):
             refresh_fly_log_button_state=refresh_fly_log_button_state,
             open_pid_progress_window=open_pid_progress_window,
             update_pid_progress_window=update_pid_progress_window,
-            set_auto_report_text=set_auto_report_text,
+            publish_auto_report=publish_auto_report,
         )
 
 
@@ -1327,7 +1320,6 @@ class ModbusApp(HardwareStateMixin):
         self.connect_fc_button.config(command=do_fc_toggle)
         self.import_blackbox_button.config(command=do_pull_blackbox_logs)
         self.analyze_blackbox_button.config(command=do_analyze_blackbox_logs)
-        self.auto_session_button.config(command=do_auto_session_toggle)
         self.fly_log_button.config(command=fly_log_workflow.toggle)
         self.simulation_mode_checkbutton.config(command=on_simulation_mode_changed)
         self.pid_progress_button.config(command=open_pid_progress_window)
@@ -1361,6 +1353,8 @@ class ModbusApp(HardwareStateMixin):
 
 def main() -> None:
     root = tk.Tk()
+    root.attributes("-topmost", True)
+    root.after_idle(lambda: root.attributes("-topmost", True))
     app = ModbusApp(root)
     app.run()
 

@@ -167,27 +167,6 @@ class ConnectionWorkflow:
         app.simulation_mode_checkbutton.config(state="normal" if sim_mode or not simulation_blocked else "disabled")
         self.refresh_level_button_state(fc_connected)
 
-        if app.auto_state == AdaptiveSessionState.import_analyze:
-            app.auto_session_button.config(text="Running Analysis...", state="disabled")
-        elif self.auto_is_running():
-            app.auto_session_button.config(
-                text="Fly/Log Active" if app.pid_plan_fly_log_active else "Auto Session Active",
-                state="disabled",
-            )
-        elif sim_mode:
-            if app.sim_active or app.sim_fly_log_active:
-                app.auto_session_button.config(text="Simulation Active", state="disabled")
-            elif app.sim_waiting_for_fly_log:
-                app.auto_session_button.config(text="Next Sim Step", state="disabled")
-            elif app.sim_plan is not None and app.sim_plan_step_index < len(app.sim_plan_steps):
-                app.auto_session_button.config(text="Next Sim Step", state="normal")
-            else:
-                app.auto_session_button.config(text="Start Auto Session", state="normal")
-        elif app.pid_plan_active:
-            app.auto_session_button.config(text="Next PID Plan Step", state="normal")
-        else:
-            app.auto_session_button.config(text="Start Auto Session", state="normal")
-
         app.cancel_auto_session_button.config(
             state="normal" if self.auto_session_cancel_available() else "disabled"
         )

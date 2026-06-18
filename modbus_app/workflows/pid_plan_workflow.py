@@ -38,9 +38,8 @@ class PidPlanWorkflow:
         self,
         app: Any,
         auto_is_running: Callable[[], bool],
-        set_auto_report_text: Callable[[str], None],
+        publish_auto_report: Callable[[str], None],
         set_error: Callable[[str, Exception], None],
-        set_auto_button_idle: Callable[[], None],
         refresh_fly_log_button_state: Callable[[], None],
         update_progress_window: Callable[[], None],
         open_progress_window: Callable[[], None],
@@ -51,9 +50,8 @@ class PidPlanWorkflow:
     ) -> None:
         self.app = app
         self.auto_is_running = auto_is_running
-        self.set_auto_report_text = set_auto_report_text
+        self.publish_auto_report = publish_auto_report
         self.set_error = set_error
-        self.set_auto_button_idle = set_auto_button_idle
         self.refresh_fly_log_button_state = refresh_fly_log_button_state
         self.update_progress_window = update_progress_window
         self.open_progress_window = open_progress_window
@@ -80,7 +78,7 @@ class PidPlanWorkflow:
             recommendation = suggest_starting_p(inputs)
             report = generate_pid_tuning_plan_report(app.blackbox_import_dir, recommendation)
             self.set_test_throttle_us(recommendation.throttle_estimate.level_test_throttle_us, "generated PID plan")
-            self.set_auto_report_text(Path(report.text_path).read_text(encoding="utf-8", errors="replace"))
+            self.publish_auto_report(Path(report.text_path).read_text(encoding="utf-8", errors="replace"))
             app.status.set(
                 f"PID tuning plan generated: {report.report_dir}. "
                 f"Shared test throttle set to {recommendation.throttle_estimate.level_test_throttle_us}us."
@@ -149,7 +147,7 @@ class PidPlanWorkflow:
         if target:
             lines.extend(["", "Target for this step", self.format_pid_values(target)])
         lines.extend(["", plan.text])
-        self.set_auto_report_text("\n".join(lines))
+        self.publish_auto_report("\n".join(lines))
 
     def stage_pid_ff_values(self, target: PidValues) -> None:
         for axis in ("roll", "pitch"):
@@ -289,7 +287,6 @@ class PidPlanWorkflow:
         app.pid_plan_current_candidate_title = ""
         app.pid_plan_current_candidate_phase = ""
         app.pid_plan_current_candidate_target = None
-        self.set_auto_button_idle()
         self.refresh_fly_log_button_state()
         app.status.set(message)
         self.update_progress_window()
@@ -655,7 +652,6 @@ class PidPlanWorkflow:
             app.pid_plan_current_candidate_title = title
             app.pid_plan_current_candidate_phase = step_phase
             app.pid_plan_current_candidate_target = target
-            app.auto_session_button.config(text="Next PID Plan Step", state="normal")
             self.refresh_fly_log_button_state()
             app.status.set("Safe-start PID/FF values staged for the first P log. Press Save before Fly/Log.")
             self.update_progress_window()
@@ -708,7 +704,6 @@ class PidPlanWorkflow:
             app.pid_plan_current_candidate_target = None
             app.status.set(f"PID plan step skipped: {title}")
         self.advance_after_step()
-        app.auto_session_button.config(text="Next PID Plan Step", state="normal")
         self.refresh_fly_log_button_state()
         self.update_progress_window()
         messagebox.showinfo(
@@ -746,7 +741,6 @@ class PidPlanWorkflow:
         app.pid_plan_current_candidate_phase = ""
         app.pid_plan_current_candidate_target = None
         self.set_plan_report_text(app.pid_plan, "PID tuning plan loaded")
-        app.auto_session_button.config(text="Next PID Plan Step", state="normal")
         self.refresh_fly_log_button_state()
         app.status.set(
             f"PID tuning plan loaded: {app.pid_plan.text_path}. "

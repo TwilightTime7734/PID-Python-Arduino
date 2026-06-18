@@ -37,7 +37,7 @@ class BlackboxWorkflow:
         fc_baud: Callable[[], int],
         simulation_mode_enabled: Callable[[], bool],
         auto_is_running: Callable[[], bool],
-        set_auto_report_text: Callable[[str], None],
+        publish_auto_report: Callable[[str], None],
         set_error: Callable[[str, Exception], None],
         disconnect_fc: Callable[..., None],
     ) -> None:
@@ -46,7 +46,7 @@ class BlackboxWorkflow:
         self.fc_baud = fc_baud
         self.simulation_mode_enabled = simulation_mode_enabled
         self.auto_is_running = auto_is_running
-        self.set_auto_report_text = set_auto_report_text
+        self.publish_auto_report = publish_auto_report
         self.set_error = set_error
         self.disconnect_fc = disconnect_fc
 
@@ -164,7 +164,7 @@ class BlackboxWorkflow:
                     else:
                         app.status.set(f"Imported {imported_count} Blackbox file(s) to {app.blackbox_import_dir}.")
 
-                self.set_auto_report_text(self.format_blackbox_report(res))
+                self.publish_auto_report(self.format_blackbox_report(res))
 
             app.worker.submit(
                 worker_enter_msc_and_import_blackbox_logs,
@@ -219,7 +219,7 @@ class BlackboxWorkflow:
                 if res.pid_report is not None and res.pid_report.headline:
                     summary_head = res.pid_report.headline
                 app.status.set(f"Blackbox analysis complete: {summary_head}. Generating report...")
-                self.set_auto_report_text(self.format_blackbox_report(res))
+                self.publish_auto_report(self.format_blackbox_report(res))
                 app.auto_latest_report = None
 
                 session_payload = {
@@ -245,7 +245,7 @@ class BlackboxWorkflow:
                                 "(for the HTML chart viewer: numpy and plotly)."
                             )
                         app.status.set("Blackbox analysis complete, but report generation failed.")
-                        self.set_auto_report_text(
+                        self.publish_auto_report(
                             f"{self.format_blackbox_report(res)}\n\nReport generation error: {error_text}"
                         )
                         return
@@ -258,7 +258,7 @@ class BlackboxWorkflow:
                         report_text = Path(res2.summary_txt).read_text(encoding="utf-8", errors="replace")
                     except Exception:
                         report_text = f"Report generated at {res2.report_dir}\nSummary file: {res2.summary_txt}"
-                    self.set_auto_report_text(report_text)
+                    self.publish_auto_report(report_text)
                     app.status.set(f"Blackbox report generated: {res2.report_dir}")
 
                 app.worker.submit(
@@ -309,7 +309,7 @@ class BlackboxWorkflow:
             app.step_response_button.config(state="disabled")
             count = len(selected_logs)
             app.status.set(f"Generating step response report for {count} log file(s)...")
-            self.set_auto_report_text(
+            self.publish_auto_report(
                 f"Step response generation started for {count} log file(s).\n"
                 "Raw logs will be decoded with tools/blackbox_decode_INAV.exe."
             )
@@ -324,7 +324,7 @@ class BlackboxWorkflow:
                     self.set_error("Step response error", RuntimeError("Unexpected step-response task result."))
                     return
 
-                self.set_auto_report_text(format_step_response_report(res))
+                self.publish_auto_report(format_step_response_report(res))
                 app.status.set(f"Step response report generated: {res.report_dir}")
 
             app.worker.submit(

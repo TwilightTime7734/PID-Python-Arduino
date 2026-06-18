@@ -94,7 +94,7 @@ class DeterministicFlyLogWorkflow:
         refresh_fly_log_button_state: Callable[[], None],
         open_pid_progress_window: Callable[[], None],
         update_pid_progress_window: Callable[[], None],
-        set_auto_report_text: Callable[[str], None],
+        publish_auto_report: Callable[[str], None],
     ) -> None:
         self.app = app
         self.auto_is_running = auto_is_running
@@ -108,19 +108,11 @@ class DeterministicFlyLogWorkflow:
         self.refresh_fly_log_button_state = refresh_fly_log_button_state
         self.open_pid_progress_window = open_pid_progress_window
         self.update_pid_progress_window = update_pid_progress_window
-        self.set_auto_report_text = set_auto_report_text
+        self.publish_auto_report = publish_auto_report
 
     def _trace(self, message: str) -> None:
         app = self.app
-        line = f"[FlyLog deterministic] {message}"
-        app.status.set(line)
-        try:
-            app.auto_report_text.config(state="normal")
-            app.auto_report_text.insert("end", line + "\n")
-            app.auto_report_text.see("end")
-            app.auto_report_text.config(state="disabled")
-        except Exception:
-            pass
+        app.status.set(f"[FlyLog deterministic] {message}")
 
     def _schedule(self, delay_ms: int, callback: Callable[[], None]) -> None:
         app = self.app
@@ -204,12 +196,11 @@ class DeterministicFlyLogWorkflow:
         app.auto_hold_end_requested = False
         self.set_auto_state(AdaptiveSessionState.adaptive_run, "Deterministic Fly/Log 6-group pulse active")
         self._set_base_marker_state(active=False)
-        app.auto_session_button.config(text="Fly/Log Active", state="disabled")
         app.cancel_auto_session_button.config(state="normal")
         self.refresh_fly_log_button_state()
 
         spinup_delay_s = PID_TEST_CH8_SPINUP_DELAY_MS / 1000.0
-        self.set_auto_report_text(
+        self.publish_auto_report(
             "Deterministic Fly/Log active\n\n"
             f"Candidate: {app.pid_plan_current_candidate_title or 'current PID plan step'}\n"
             f"Mode: {self.SAMPLE_GROUP_COUNT} exact bidirectional pitch/roll sample groups, "

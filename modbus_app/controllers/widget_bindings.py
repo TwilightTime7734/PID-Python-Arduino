@@ -36,8 +36,6 @@ class WidgetBindings:
         app.import_blackbox_button = ui.import_blackbox_button
         app.analyze_blackbox_button = ui.analyze_blackbox_button
         app.arduino_button = ui.arduino_button
-        app.auto_session_button = ui.auto_session_button
-        app.auto_report_text = ui.auto_report_text
         app.fly_log_button = ui.fly_log_button
         app.simulation_mode_var = ui.simulation_mode_var
         app.simulation_mode_checkbutton = ui.simulation_mode_checkbutton
