@@ -484,7 +484,7 @@ def build_main_gui(root: tk.Tk) -> MainUi:
 
     auto_action_frame = tk.Frame(auto_frame)
     auto_action_frame.grid(row=0, column=0, sticky="w", pady=(0, 6))
-    fly_log_button = tk.Button(auto_action_frame, text="Fly/Log", width=18)
+    fly_log_button = tk.Button(auto_action_frame, text="Test", width=18)
     fly_log_button.pack(side="left", padx=(0, 4))
     step_response_button = tk.Button(auto_action_frame, text="Chart Step Response", width=18)
     step_response_button.pack(side="left", padx=(0, 4))
