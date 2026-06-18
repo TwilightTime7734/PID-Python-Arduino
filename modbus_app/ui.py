@@ -81,7 +81,7 @@ def _build_interactive_roll_pitch_table(
     rows: Sequence[tuple[str, Sequence[int | str]]],
     headings: Sequence[str],
     pidff_vars: list[tk.StringVar],
-) -> tuple[tk.LabelFrame, dict[str, list[tk.Entry]]]:
+) -> tk.LabelFrame:
     """Build a Roll/Pitch table with clickable entries that sync to FC/INAV section."""
     frame = tk.LabelFrame(parent, text=title, padx=6, pady=5)
     for column in range(len(headings)):
@@ -101,12 +101,9 @@ def _build_interactive_roll_pitch_table(
     # pidff_vars is indexed as: P=0, I=1, D=2, FF=3
     param_to_index = {"P": 0, "I": 1, "D": 2, "FF": 3}
     
-    value_entries: dict[str, list[tk.Entry]] = {}
-
     for row_index, (param_name, values) in enumerate(rows, start=1):
         _readonly_table_entry(frame, row_index, 0, param_name, width=10)
         param_idx = param_to_index.get(param_name, -1)
-        row_entries: list[tk.Entry] = []
         
         for column_index in range(1, len(headings)):
             value = values[column_index - 1] if column_index - 1 < len(values) else ""
@@ -114,7 +111,6 @@ def _build_interactive_roll_pitch_table(
             entry.insert(0, str(value))
             entry.config(state="readonly", readonlybackground="#FFE4E1", foreground="black")
             entry.grid(row=row_index, column=column_index, padx=2, pady=2, sticky="we")
-            row_entries.append(entry)
             
             # Initialize state: light red background, not toggled
             entry_states[entry] = {
@@ -144,10 +140,8 @@ def _build_interactive_roll_pitch_table(
                 return on_click
             
             entry.bind("<Button-1>", make_click_handler(entry, entry_states))
-
-            value_entries[str(param_name).upper()] = row_entries
     
-            return frame, value_entries
+    return frame
 
 
 def _build_interactive_pid_value_table(
@@ -157,7 +151,7 @@ def _build_interactive_pid_value_table(
     headings: Sequence[str],
     roll_pidff_vars: list[tk.StringVar],
     pitch_pidff_vars: list[tk.StringVar],
-) -> tuple[tk.LabelFrame, list[list[tk.Entry]]]:
+) -> tk.LabelFrame:
     """Build a PID value table with clickable entries that sync to FC/INAV section."""
     frame = tk.LabelFrame(parent, text=title, padx=6, pady=5)
     for column in range(len(headings)):
@@ -173,8 +167,6 @@ def _build_interactive_pid_value_table(
     # Store entry widget references and their state for color toggling
     entry_states: dict[tk.Entry, dict] = {}
     
-    value_entries: list[list[tk.Entry]] = []
-
     for row_index, (label, values) in enumerate(rows, start=1):
         # Strip "start" and "rec" from the label
         clean_label = label.replace(" start", "").replace(" rec", "")
@@ -188,15 +180,12 @@ def _build_interactive_pid_value_table(
             axis_type = "pitch"
         # Yaw rows are ignored
         
-        row_entries: list[tk.Entry] = []
-
         for column_index in range(1, len(headings)):
             value = values[column_index - 1] if column_index - 1 < len(values) else ""
             entry = tk.Entry(frame, width=8, justify="center", relief="sunken")
             entry.insert(0, str(value))
             entry.config(state="readonly", readonlybackground="#FFE4E1", foreground="black")
             entry.grid(row=row_index, column=column_index, padx=2, pady=2, sticky="we")
-            row_entries.append(entry)
             
             # Initialize state: light red background, not toggled
             entry_states[entry] = {
@@ -232,10 +221,8 @@ def _build_interactive_pid_value_table(
                     return on_click
                 
                 entry.bind("<Button-1>", make_click_handler(entry, entry_states))
-
-        value_entries.append(row_entries)
     
-    return frame, value_entries
+    return frame
 
 
 class ArtificialHorizon(tk.Canvas):
@@ -308,9 +295,7 @@ class MainUi:
     pitch_text: tk.StringVar
     roll_pidff_vars: list[tk.StringVar]
     pitch_pidff_vars: list[tk.StringVar]
-    starting_values_value_entries: list[list[tk.Entry]]
-    roll_value_entries: dict[str, list[tk.Entry]]
-    pitch_value_entries: dict[str, list[tk.Entry]]
+    starting_values_table: tk.LabelFrame
     pid_ff_adjust_canvases: list[tk.Canvas]
     load_pid_ff_button: tk.Button
     save_pid_ff_button: tk.Button
@@ -512,7 +497,7 @@ def build_main_gui(root: tk.Tk) -> MainUi:
     for column in range(3):
         pid_table_frame.grid_columnconfigure(column, weight=1, uniform="pid_tables")
 
-    starting_values_table, starting_values_value_entries = _build_interactive_pid_value_table(
+    starting_values_table = _build_interactive_pid_value_table(
         pid_table_frame,
         "Starting values",
         (
@@ -527,7 +512,7 @@ def build_main_gui(root: tk.Tk) -> MainUi:
     )
     starting_values_table.grid(row=0, column=0, padx=(0, 4), sticky="nwe")
 
-    roll_values_table, roll_value_entries = _build_interactive_roll_pitch_table(
+    roll_values_table = _build_interactive_roll_pitch_table(
         pid_table_frame,
         "Roll",
         (
@@ -541,7 +526,7 @@ def build_main_gui(root: tk.Tk) -> MainUi:
     )
     roll_values_table.grid(row=0, column=1, padx=4, sticky="nwe")
 
-    pitch_values_table, pitch_value_entries = _build_interactive_roll_pitch_table(
+    pitch_values_table = _build_interactive_roll_pitch_table(
         pid_table_frame,
         "Pitch",
         (
@@ -579,9 +564,7 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         pitch_text=pitch_text,
         roll_pidff_vars=roll_pidff_vars,
         pitch_pidff_vars=pitch_pidff_vars,
-        starting_values_value_entries=starting_values_value_entries,
-        roll_value_entries=roll_value_entries,
-        pitch_value_entries=pitch_value_entries,
+        starting_values_table=starting_values_table,
         pid_ff_adjust_canvases=pid_ff_adjust_canvases,
         load_pid_ff_button=load_pid_ff_button,
         save_pid_ff_button=save_pid_ff_button,

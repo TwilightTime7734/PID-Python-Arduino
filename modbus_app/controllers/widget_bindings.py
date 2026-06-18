@@ -26,9 +26,7 @@ class WidgetBindings:
         app.pitch_text = ui.pitch_text
         app.roll_pidff_vars = ui.roll_pidff_vars
         app.pitch_pidff_vars = ui.pitch_pidff_vars
-        app.starting_values_value_entries = ui.starting_values_value_entries
-        app.roll_value_entries = ui.roll_value_entries
-        app.pitch_value_entries = ui.pitch_value_entries
+        app.starting_values_table = ui.starting_values_table
         app.pid_ff_adjust_canvases = ui.pid_ff_adjust_canvases
         app.load_pid_ff_button = ui.load_pid_ff_button
         app.save_pid_ff_button = ui.save_pid_ff_button
