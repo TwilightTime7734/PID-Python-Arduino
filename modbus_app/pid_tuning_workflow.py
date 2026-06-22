@@ -282,7 +282,7 @@ def estimate_test_throttle(inputs: PStartInputs) -> TestThrottleEstimate:
     )
 
 def format_pid_tuning_plan(recommendation: PStartRecommendation) -> str:
-    """Format the supervised D/P/D/I/FF plan as plain text."""
+    """Format the supervised P/D/I/FF plan as plain text."""
 
     start_p = recommendation.start_p
     start_i = recommendation.start_i
@@ -299,86 +299,97 @@ def format_pid_tuning_plan(recommendation: PStartRecommendation) -> str:
     pitch_ff_values = ", ".join(str(row["pitch"]) for row in FF_SWEEP_VALUES)
     fly_log_action = (
         "-   Once the 'Fly/Log' button is pressed, wait for spin-up, set CH8 beeper marker ON, "
-        "run roll/pitch calibration probes, then set CH8 beeper marker OFF. "
-        "Chart Step Response analyzes the BEEPERON bracket between those markers."
+        "run the 6-group pitch/roll step routine, then set CH8 beeper marker OFF. "
+        "Extract/Analyze reads the marked routine and ignores center-adjust pulses."
     )
     lines: list[str] = [
         "Supervised PID tuning plan",
         "",
+        "Tuning order",
+        "- Filters first.",
+        "- Tune P first; P is the main authority that makes the axis respond.",
+        "- Tune D after P; D damps the response once there is enough P to damp.",
+        "- Tune I after P/D are close.",
+        "- Leave FF/CD at 0 until the PID response is usable; revisit FF/CD last for stick feel only if needed.",
+        "",
         "Safety gates",
         "- Keep battery fresh.",
         "- Verify test-stand throttle before relying on Level or Fly/Log.",
-        f"- Estimated Level-test throttle start: {throttle.level_test_throttle_us} us.",
-        f"- Estimated hover throttle reference: {throttle.hover_throttle_us} us; do not use this as the first Level/FlyLog throttle.",
+        f"- Active Level/FlyLog test throttle: {throttle.level_test_throttle_us} us. This is the value the program will use.",
+        f"- Hover throttle estimate only: {throttle.hover_throttle_us} us. This is a reference number, not an automatic throttle change.",
+        "- Do not raise the test throttle toward hover until the stand test has been verified safe.",
         "",
         "Throttle verification target",
         _format_throttle_lift_target(throttle),
         "",
-        "Safe starting point to set the PID/FF before starting auto run.",
+        "Safe starting point / first P log",
+        "- This first log uses the generated starting P values with starting D, starting I, and FF 0.",
         f"- Roll:  P {start_p['roll']}, D {start_d}, I {start_i['roll']}, FF 0",
         f"- Pitch: P {start_p['pitch']}, D {start_d}, I {start_i['pitch']}, FF 0",
         f"- Yaw:   P {yaw['p']}, D {yaw['d']:2d}, I 0, FF 0",
+        "-   Confirm the drone is not armed.",
+        "-   Stage/save the safe-start values if needed.",
+        "-   Arm the drone and hit the 'Fly/Log' button.",
+        fly_log_action,
+        "-   Disarm the drone.",
         "",
-        "D tuning, roll/pitch only",
+        "P tuning, roll/pitch only",
+        f"- Roll  P candidates: {roll_p_values}.",
+        f"- Pitch P candidates: {pitch_p_values}.",
+        f"- Keep D at the starting value ({start_d}), keep starting I, and keep FF 0.",
+        "- The safe-start log already covers the generated starting P value; do not repeat that exact candidate unless you want a duplicate check.",
+        "-   Confirm the drone is not armed.",
+        "-   Set the Roll/Pitch 'P' value according to the candidate.",
+        "-   Arm the drone and hit the 'Fly/Log' button.",
+        fly_log_action,
+        "-   Disarm the drone.",
+        "-   Repeat with the next 'P' setting.",
+        "- Once all the 'P' values have been logged, inspect the logs and select the correct 'P' term.",
+        "- Pick the highest P that tracks well without ringing, oscillation, or ugly bounce-back.",
+        "",
+        "D tuning, roll/pitch only after P is selected",
         f"- Log D values: {d_values}",
         f"- Roll  D candidates: {d_values}",
         f"- Pitch D candidates: {d_values}",
-        f"-   Confirm the drone is not armed.",
-        f"-   Set the Roll/Pitch 'D' value to the first setting ({start_d}).",
-        "-   Inform the user to Arm the drone and hit the 'Fly/Log' button.",
-        fly_log_action,
-        "-   Inform the user to Disarm the drone.",
-        f"-   Repeat with the next 'D' setting of ({D_SWEEP_VALUES[1]}) through {D_SWEEP_VALUES[-1]}.",
-        "- Once all the 'D' values have been logged tell the user to inspect the logs and select the correct 'D' term",
-        "",
-        "Using the selected 'D' term from the previous step test the 'P' term the same way tuning, roll/pitch only",
-        "- Keep chosen D.",
-        f"- Roll  P candidates: {roll_p_values}.",
-        f"- Pitch P candidates: {pitch_p_values}.",
+        "- Keep the chosen P from the previous step.",
+        "- Keep starting I and FF 0.",
+        f"- The starting D ({start_d}) was already used during P selection; compare it against the higher D logs.",
         "-   Confirm the drone is not armed.",
-        "-   Set the Roll/Pitch 'P' value according to the setup above.",
-        "-   Inform the user to Arm the drone and hit the 'Fly/Log' button.",
+        "-   Set the Roll/Pitch 'D' value according to the candidate.",
+        "-   Arm the drone and hit the 'Fly/Log' button.",
         fly_log_action,
-        "-   Inform the user to Disarm the drone.",
-        "-   Repeat with the next 'P' setting.",
-        "- Once all the 'P' values have been logged tell the user to inspect the logs and select the correct 'P' term.",
-        "- Pick the highest P that tracks well without ringing or oscillation.",
+        "-   Disarm the drone.",
+        "-   Repeat with the next 'D' setting.",
+        "- Once all the 'D' values have been logged, inspect the logs and select the correct 'D' term.",
+        "- Pick the lowest D that controls overshoot and bounce without adding motor noise or heat.",
         "",
-        "Using the selected 'P' and 'D' term selected from above steps re-check the 'D' term",
-        "- With chosen P, test D slightly lower/current/higher.",
-        "-   Confirm the drone is not armed.",
-        "-   Set the Roll/Pitch 'D' value to 5 points lower.",
-        "-   Inform the user to Arm the drone and hit the 'Fly/Log' button.",
-        fly_log_action,
-        "-   Inform the user to Disarm the drone.",
-        "-   Repeat with 'D' set as above then 'D' with a 5 point higher value.",
-        "- Once all the 'D' values have been logged tell the user to inspect the logs and select the correct 'D' term.",
+        "- This will be the 'P' and 'D' values used throughout the rest of these tests.",
         "",
-        "",
-        "- This will be the 'P' and 'D' values used throughout the rest of these test.",
-        "",
-        "- Test the I term",
+        "I tuning, roll/pitch only",
         f"- Roll:  I {roll_i_values}",
         f"- Pitch: I {pitch_i_values}",
+        "- Keep chosen P and chosen D.",
+        "- Keep FF 0.",
         "-   Confirm the drone is not armed.",
-        "-   Set the Roll/Pitch 'I' value according to the setup above.",
-        "-   Inform the user to Arm the drone and hit the 'Fly/Log' button.",
+        "-   Set the Roll/Pitch 'I' value according to the candidate.",
+        "-   Arm the drone and hit the 'Fly/Log' button.",
         fly_log_action,
-        "-   Inform the user to Disarm the drone.",
+        "-   Disarm the drone.",
         "-   Repeat with the next 'I' setting.",
-        "- Once all the 'I' values have been logged tell the user to inspect the logs and select the correct 'I' term.",
+        "- Once all the 'I' values have been logged, inspect the logs and select the correct 'I' term.",
         "- Pick the value that holds attitude without slow wobble or bounce-back.",
         "",
-        "- Test the FF term",
+        "FF/CD tuning, last and optional",
         f"- Roll:  FF {roll_ff_values}",
         f"- Pitch: FF {pitch_ff_values}",
+        "- Only use this section after P, D, and I are already usable.",
         "-   Confirm the drone is not armed.",
-        "-   Set the Roll/Pitch 'FF' value according to the setup above.",
-        "-   Inform the user to Arm the drone and hit the 'Fly/Log' button.",
+        "-   Set the Roll/Pitch 'FF' value according to the candidate.",
+        "-   Arm the drone and hit the 'Fly/Log' button.",
         fly_log_action,
-        "-   Inform the user to Disarm the drone.",
+        "-   Disarm the drone.",
         "-   Repeat with the next 'FF' setting.",
-        "- Once all the 'FF' values have been logged tell the user to inspect the logs and select the correct 'FF' term.",
+        "- Once all the 'FF' values have been logged, inspect the logs and select the correct 'FF' term.",
         "- Pick FF where gyro starts with setpoint without jumping ahead.",
         "",
         "Yaw final recommendation, not tested",
@@ -388,11 +399,7 @@ def format_pid_tuning_plan(recommendation: PStartRecommendation) -> str:
         "Why this P start was chosen",
     ]
     lines.extend(f"- {note}" for note in recommendation.notes)
-    lines.append("")
-    lines.append("Why this test throttle was estimated")
-    lines.extend(f"- {note}" for note in throttle.notes)
     return "\n".join(lines).strip()
-
 
 def generate_pid_tuning_plan_report(
     output_root: str | Path,
@@ -485,7 +492,9 @@ def _load_pid_tuning_plan_from_text(text_path: Path, text: str) -> LoadedPIDTuni
     pitch_p = _line_ints(text, r"-\s*Pitch\s+P candidates:\s*([0-9,\s]+)")
     yaw = _line_ints(text, r"-\s*Yaw P\s*(\d+),\s*I\s*(\d+),\s*D\s*(\d+),\s*FF\s*(\d+)")
     optional_match = re.search(r"Optional D\s*(\d+)", text, flags=re.IGNORECASE)
-    level_throttle = _line_ints(text, r"Estimated Level-test throttle start:\s*(\d+)\s*us")
+    level_throttle = _line_ints(text, r"Active Level/FlyLog test throttle:\s*(\d+)\s*us")
+    if not level_throttle:
+        level_throttle = _line_ints(text, r"Estimated Level-test throttle start:\s*(\d+)\s*us")
 
     i_rows = tuple(
         {"roll": int(match.group(1)), "pitch": int(match.group(2))}

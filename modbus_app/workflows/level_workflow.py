@@ -8,12 +8,6 @@ from collections.abc import Callable
 from ..constants import (
     LEVEL_CENTER_US,
     LEVEL_DEADBAND_DEG,
-    LEVEL_FULL_SCALE_DEG,
-    LEVEL_LOOP_INTERVAL_MS,
-    LEVEL_MAX_DELTA_US,
-    LEVEL_MIN_DELTA_US,
-    LEVEL_PULSE_TIMEOUT_S,
-    LEVEL_TIMEOUT_DEFAULT_S,
     PITCH_CHANNEL_INDEX,
     PULSE_STATUS_REJECTED,
     ROLL_CHANNEL_INDEX,
@@ -24,6 +18,23 @@ from ..tasks.worker_tasks import hold_channel_until_stop as worker_hold_channel_
 
 class LevelWorkflow:
     """Owns the Level button state and auto-level pulse loop."""
+
+    # Fixed-dose corrections. Angle feedback is used only to choose the
+    # direction, choose coarse vs fine mode, and decide whether to continue.
+    # It is never used to scale into a big pulse, which avoids the overshoot
+    # seen with the older angle-chasing level logic.
+    COARSE_FORCE_US = 70
+    COARSE_HOLD_S = 0.07
+    FINE_FORCE_US = 27
+    FINE_HOLD_S = 0.03
+    FINE_TUNE_ENTER_DEG = 4.0
+    CORRECTION_SETTLE_MS = 250
+    EMERGENCY_ATTITUDE_DEG = 70.0
+    # The old timeout was too short for large initial errors. One press of
+    # Level should keep nudging until it is centered, the safety limit is hit,
+    # or the pulse budget is exhausted.
+    MAX_LEVEL_RUN_S = 45.0
+    MAX_CORRECTION_PULSES = 90
 
     def __init__(
         self,
@@ -78,23 +89,30 @@ class LevelWorkflow:
         if update_status and was_active and not app.is_closing:
             app.status.set(reason)
 
-    def target_from_angle(self, angle_deg: float) -> int | None:
-        abs_angle = abs(angle_deg)
+    def correction_from_angle(self, angle_deg: float) -> tuple[int, int, float, str] | None:
+        abs_angle = abs(float(angle_deg))
         if abs_angle <= LEVEL_DEADBAND_DEG:
             return None
-        ratio = min(1.0, abs_angle / LEVEL_FULL_SCALE_DEG)
-        delta = max(LEVEL_MIN_DELTA_US, round(LEVEL_MAX_DELTA_US * ratio))
+        if abs_angle <= self.FINE_TUNE_ENTER_DEG:
+            delta = self.FINE_FORCE_US
+            hold_s = self.FINE_HOLD_S
+            mode = "fine"
+        else:
+            delta = self.COARSE_FORCE_US
+            hold_s = self.COARSE_HOLD_S
+            mode = "coarse"
         if angle_deg > 0:
-            return LEVEL_CENTER_US - delta
-        return LEVEL_CENTER_US + delta
+            return LEVEL_CENTER_US - delta, delta, hold_s, mode
+        return LEVEL_CENTER_US + delta, delta, hold_s, mode
 
     def attitude_is_settled(self, roll_deg: float, pitch_deg: float) -> bool:
         return abs(roll_deg) <= LEVEL_DEADBAND_DEG and abs(pitch_deg) <= LEVEL_DEADBAND_DEG
 
-    def schedule_step(self, delay_ms: int = LEVEL_LOOP_INTERVAL_MS) -> None:
+    def schedule_step(self, delay_ms: int | None = None) -> None:
         app = self.app
         self.cancel_timer()
-        app.level_after_id = app.root.after(max(1, delay_ms), self.run_step)
+        delay = self.CORRECTION_SETTLE_MS if delay_ms is None else delay_ms
+        app.level_after_id = app.root.after(max(1, delay), self.run_step)
 
     def run_step(self) -> None:
         app = self.app
@@ -108,7 +126,23 @@ class LevelWorkflow:
             self.stop(update_status=True, reason="Auto-level stopped: FC is disconnected.")
             return
         if app.level_timeout_deadline_s is not None and time.monotonic() >= app.level_timeout_deadline_s:
-            self.stop(update_status=True, reason=f"Auto-level timed out after {LEVEL_TIMEOUT_DEFAULT_S:.3g}s.")
+            self.stop(
+                update_status=True,
+                reason=(
+                    f"Auto-level stopped after {self.MAX_LEVEL_RUN_S:.0f}s. "
+                    "Press Level again only if it is still safely away from the hard stops."
+                ),
+            )
+            return
+        pulse_count = int(getattr(app, "level_pulse_count", 0))
+        if pulse_count >= self.MAX_CORRECTION_PULSES:
+            self.stop(
+                update_status=True,
+                reason=(
+                    f"Auto-level stopped after {self.MAX_CORRECTION_PULSES} correction nudges. "
+                    "Press Level again only if it is still safely away from the hard stops."
+                ),
+            )
             return
         if app.level_pulse_inflight:
             self.schedule_step()
@@ -118,21 +152,44 @@ class LevelWorkflow:
         if sample is None:
             self.schedule_step()
             return
+        absolute_sample = None
+        try:
+            absolute_sample = app.fc_service.latest_absolute_attitude()
+        except Exception:
+            absolute_sample = None
+        safety_sample = absolute_sample or sample
+        if (
+            abs(float(safety_sample.roll_deg)) >= self.EMERGENCY_ATTITUDE_DEG
+            or abs(float(safety_sample.pitch_deg)) >= self.EMERGENCY_ATTITUDE_DEG
+        ):
+            self.stop(
+                update_status=True,
+                reason=(
+                    f"Auto-level stopped: attitude safety limit reached "
+                    f"(roll={float(safety_sample.roll_deg):+.1f}, "
+                    f"pitch={float(safety_sample.pitch_deg):+.1f})."
+                ),
+            )
+            return
         if self.attitude_is_settled(sample.roll_deg, sample.pitch_deg):
             self.stop(update_status=True, reason="Auto-level complete: roll and pitch are centered.")
             return
 
-        roll_target_us = self.target_from_angle(sample.roll_deg)
-        pitch_target_us = self.target_from_angle(sample.pitch_deg)
-        axis_targets: list[tuple[int, int, float]] = []
-        if roll_target_us is not None:
-            axis_targets.append((ROLL_CHANNEL_INDEX, roll_target_us, abs(sample.roll_deg)))
-        if pitch_target_us is not None:
-            axis_targets.append((PITCH_CHANNEL_INDEX, pitch_target_us, abs(sample.pitch_deg)))
+        roll_correction = self.correction_from_angle(sample.roll_deg)
+        pitch_correction = self.correction_from_angle(sample.pitch_deg)
+        axis_targets: list[tuple[int, int, float, int, float, str]] = []
+        if roll_correction is not None:
+            target_us, force_us, hold_s, mode = roll_correction
+            axis_targets.append((ROLL_CHANNEL_INDEX, target_us, abs(sample.roll_deg), force_us, hold_s, mode))
+        if pitch_correction is not None:
+            target_us, force_us, hold_s, mode = pitch_correction
+            axis_targets.append((PITCH_CHANNEL_INDEX, target_us, abs(sample.pitch_deg), force_us, hold_s, mode))
         if not axis_targets:
             self.stop(update_status=True, reason="Auto-level complete: roll and pitch are centered.")
             return
-        channel_index, target_us, _ = max(axis_targets, key=lambda item: item[2])
+        channel_index, target_us, angle_error_deg, force_us, hold_s, correction_mode = max(
+            axis_targets, key=lambda item: item[2]
+        )
 
         try:
             offsets = self.parse_offsets()
@@ -144,6 +201,17 @@ class LevelWorkflow:
         active_outputs = app.base_channel_outputs.copy()
         active_outputs[channel_index] = target_us
         self.set_live_channel_outputs(active_outputs)
+        axis_name = "roll" if channel_index == ROLL_CHANNEL_INDEX else "pitch"
+        direction = target_us - LEVEL_CENTER_US
+        direction_text = "+" if direction >= 0 else ""
+        pulse_count = int(getattr(app, "level_pulse_count", 0)) + 1
+        app.level_pulse_count = pulse_count
+        app.status.set(
+            f"Auto-level {correction_mode} nudge {pulse_count}/{self.MAX_CORRECTION_PULSES}: "
+            f"{axis_name} CH{channel_index + 1} {LEVEL_CENTER_US}->{target_us} "
+            f"({direction_text}{direction}us) for {hold_s:.3g}s; "
+            f"error {angle_error_deg:.1f} deg; waiting {self.CORRECTION_SETTLE_MS}ms."
+        )
         app.level_pulse_inflight = True
 
         def on_level_pulse_done(ok: bool, res: object) -> None:
@@ -169,7 +237,7 @@ class LevelWorkflow:
             channel_index,
             target_us,
             offsets[channel_index],
-            LEVEL_PULSE_TIMEOUT_S,
+            hold_s,
             callback=on_level_pulse_done,
         )
 
@@ -191,9 +259,22 @@ class LevelWorkflow:
                 self.stop(update_status=False)
                 self.set_error("Level error", res if isinstance(res, Exception) else RuntimeError(str(res)))
                 return
+            reference = None
+            try:
+                reference = app.fc_service.attitude_reference()
+            except Exception:
+                reference = None
+            ref_text = ""
+            if reference is not None:
+                ref_text = f" Level reference roll={reference.roll_deg:+.1f}, pitch={reference.pitch_deg:+.1f}."
             app.status.set(
-                f"Auto-level active at shared test throttle {test_throttle_us}us "
-                f"({LEVEL_TIMEOUT_DEFAULT_S:.3g}s timeout). Press Level again to stop."
+                f"Auto-level active at shared test throttle {test_throttle_us}us. "
+                f"Coarse +/-{self.COARSE_FORCE_US}us for {self.COARSE_HOLD_S:.3g}s above "
+                f"{self.FINE_TUNE_ENTER_DEG:.1f} deg; fine +/-{self.FINE_FORCE_US}us for "
+                f"{self.FINE_HOLD_S:.3g}s near center; settle {self.CORRECTION_SETTLE_MS}ms. "
+                f"Leveling is relative to the captured quiet reference.{ref_text} "
+                f"One press continues until centered, safety stop, {self.MAX_CORRECTION_PULSES} nudges, "
+                f"or {self.MAX_LEVEL_RUN_S:.0f}s. Press Level again to stop."
             )
             self.run_step()
 
@@ -209,10 +290,19 @@ class LevelWorkflow:
                 raise RuntimeError("Press Connect Arduino before using Level.")
             if not app.fc_service.is_connected:
                 raise RuntimeError("Connect FC before using Level.")
-            if app.fc_service.latest_attitude() is None:
-                raise RuntimeError("No FC attitude sample yet. Wait a moment, then press Level again.")
+            reference_ready = True
+            try:
+                reference_ready = app.fc_service.attitude_reference_ready()
+            except Exception:
+                reference_ready = app.fc_service.latest_attitude() is not None
+            if not reference_ready or app.fc_service.latest_attitude() is None:
+                raise RuntimeError(
+                    "No FC level reference yet. Keep the drone still for 3 seconds after FC connect, "
+                    "then press Level again."
+                )
             app.level_active = True
-            app.level_timeout_deadline_s = time.monotonic() + LEVEL_TIMEOUT_DEFAULT_S
+            app.level_pulse_count = 0
+            app.level_timeout_deadline_s = time.monotonic() + self.MAX_LEVEL_RUN_S
             self.update_link_indicators()
             self._prepare_shared_test_throttle_and_start()
         except Exception as exc:

@@ -6,7 +6,6 @@ from collections.abc import Callable
 import serial
 
 from .constants import (
-    AUX_CHANNEL_OFF_US,
     BEEPER_MARKER_CHANNEL_INDEX,
     BEEPER_MARKER_OFF_US,
     BEEPER_MARKER_ON_US,
@@ -254,7 +253,10 @@ class HardwareController:
         ppm_channels = self._ppm_channels_for_firmware(channels, marker_active)
         ppm_offsets = self._ppm_offsets_for_firmware(offsets, len(ppm_channels))
         quant, max_count, _ = run_ppm_on_serial(worker_self.ser, ppm_channels, ppm_offsets)
-        return (quant, max_count, channels)
+        # Return the actual frame values sent to the Arduino, including the
+        # forced CH8 marker value. The UI/runtime should not keep a hidden
+        # marker state that is different from the displayed live outputs.
+        return (quant, max_count, ppm_channels)
 
     def _task_shutdown(self, worker_self: SerialWorker):
         if worker_self.ser is None:
@@ -273,7 +275,7 @@ class HardwareController:
     @staticmethod
     def _ppm_channels_for_firmware(channels: list[int], marker_active: bool) -> list[int]:
         count = max(PPM_OUTPUT_CHANNEL_COUNT, len(channels), BEEPER_MARKER_CHANNEL_INDEX + 1)
-        output = [AUX_CHANNEL_OFF_US] * count
+        output = [BEEPER_MARKER_OFF_US] * count
         for index, value in enumerate(channels):
             output[index] = max(1000, min(2000, int(value)))
         output[BEEPER_MARKER_CHANNEL_INDEX] = BEEPER_MARKER_ON_US if marker_active else BEEPER_MARKER_OFF_US

@@ -20,9 +20,8 @@ class PidProgressPresenter:
 
     PHASES = (
         ("safe_start", "Safe Start"),
-        ("d_sweep", "D Sweep"),
         ("p_sweep", "P Sweep"),
-        ("d_recheck", "D Re-check"),
+        ("d_sweep", "D Sweep"),
         ("i_sweep", "I Sweep"),
         ("ff_sweep", "FF Sweep"),
         ("final_write", "Final"),
@@ -42,7 +41,7 @@ class PidProgressPresenter:
         self.set_error = set_error
 
     def normalize_phase(self, phase: str) -> str:
-        if phase == "d_optional":
+        if phase in ("d_optional", "d_recheck"):
             return "d_sweep"
         return phase
 
@@ -118,8 +117,8 @@ class PidProgressPresenter:
             else f"Roll {app.pid_plan_selected_ff['roll']} / Pitch {app.pid_plan_selected_ff['pitch']}"
         )
         return (
-            f"Chosen D: {'--' if app.pid_plan_selected_d is None else app.pid_plan_selected_d}\n"
             f"Chosen P: {selected_p}\n"
+            f"Chosen D: {'--' if app.pid_plan_selected_d is None else app.pid_plan_selected_d}\n"
             f"Chosen I: {selected_i}\n"
             f"Chosen FF: {selected_ff}"
         )

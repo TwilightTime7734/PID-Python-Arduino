@@ -25,6 +25,9 @@ from dataclasses import dataclass
 
 from ..adaptive_session import AdaptiveSessionState
 from ..constants import (
+    BEEPER_MARKER_CHANNEL_INDEX,
+    BEEPER_MARKER_OFF_US,
+    BEEPER_MARKER_ON_US,
     BEEPER_MARKER_SPINUP_DELAY_MS,
     LEVEL_CENTER_US,
     PITCH_CHANNEL_INDEX,
@@ -155,6 +158,25 @@ class DeterministicFlyLogWorkflow:
         except Exception:
             return self.DEFAULT_TEST_THROTTLE_US
 
+    def _channels_with_marker_state(self, channels: list[int], *, active: bool) -> list[int]:
+        """Return a channel list that explicitly carries the CH8 marker value.
+
+        The hardware controller also has a marker flag, but keeping the marker
+        value in the actual channel list makes the app display and the Arduino
+        frame agree. This avoids a hidden marker state where CH8 can appear low
+        in the live outputs even though the marker flag is true.
+        """
+        output = channels.copy()
+        while len(output) <= BEEPER_MARKER_CHANNEL_INDEX:
+            output.append(BEEPER_MARKER_OFF_US)
+        output[BEEPER_MARKER_CHANNEL_INDEX] = BEEPER_MARKER_ON_US if active else BEEPER_MARKER_OFF_US
+        return output
+
+    def _set_base_marker_state(self, *, active: bool) -> None:
+        app = self.app
+        app.base_channel_outputs = self._channels_with_marker_state(app.base_channel_outputs, active=active)
+        self.set_live_channel_outputs(app.base_channel_outputs.copy())
+
     def _pitch_steps(self) -> list[_FlyLogPulseStep]:
         return [
             _FlyLogPulseStep("pitch", PITCH_CHANNEL_INDEX, self.PITCH_FORCE_US, self.PITCH_HOLD_S),
@@ -198,6 +220,7 @@ class DeterministicFlyLogWorkflow:
         app.auto_hold_end_requested = False
         self.set_auto_state(AdaptiveSessionState.adaptive_run, "Deterministic Fly/Log 6-group pulse active")
         app.beeper_marker_active = False
+        self._set_base_marker_state(active=False)
         app.auto_session_button.config(text="Fly/Log Active", state="disabled")
         app.cancel_auto_session_button.config(state="normal")
         self.refresh_fly_log_button_state()
@@ -252,7 +275,8 @@ class DeterministicFlyLogWorkflow:
         if not app.pid_plan_fly_log_active or not self.auto_is_running():
             return
         app.beeper_marker_active = True
-        self._trace("Enabling CH8 beeper marker.")
+        self._set_base_marker_state(active=True)
+        self._trace("Enabling CH8 beeper marker on channel 8 (2000us).")
 
         def on_marker_enabled(ok: bool, res: object) -> None:
             if not app.pid_plan_fly_log_active:

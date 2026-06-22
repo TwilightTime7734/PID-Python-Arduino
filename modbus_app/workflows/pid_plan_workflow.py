@@ -2,7 +2,7 @@
 
 This module owns the guided PID plan progression: generating/loading a plan,
 staging candidate values, asking the user to choose winners, and advancing from
-safe start through D/P/I/FF sweeps to the final values.
+safe start through P/D/I/FF sweeps to the final values.
 
 The live Fly/Log hardware routine still lives in app.py for now. This workflow
 only prepares/stages candidates and tells the existing app when Fly/Log is
@@ -197,6 +197,57 @@ class PidPlanWorkflow:
             return None
         return {"roll": int(roll_value), "pitch": int(pitch_value)}
 
+    def ask_candidate_action(self, title: str, prompt: str) -> str:
+        """Ask how to handle a PID-plan candidate.
+
+        Returns one of:
+        - "stage": stage target values into the GUI boxes
+        - "already_saved": enable Fly/Log without staging/saving values
+        - "skip": skip this candidate and move on
+        - "cancel": stop the guided PID plan
+        """
+        app = self.app
+        dialog = tk.Toplevel(app.root)
+        dialog.title("PID Plan Step")
+        dialog.transient(app.root)
+        dialog.resizable(False, False)
+
+        result = {"action": "cancel"}
+
+        outer = tk.Frame(dialog, padx=14, pady=12)
+        outer.pack(fill="both", expand=True)
+
+        tk.Label(outer, text=title, font=("Segoe UI", 10, "bold"), anchor="w", justify="left").pack(fill="x")
+        tk.Label(outer, text=prompt, anchor="w", justify="left", wraplength=620).pack(fill="x", pady=(8, 12))
+
+        buttons = tk.Frame(outer)
+        buttons.pack(fill="x")
+
+        def choose(action: str) -> None:
+            result["action"] = action
+            dialog.destroy()
+
+        tk.Button(buttons, text="Stage Values", width=18, command=lambda: choose("stage")).pack(side="left", padx=(0, 6))
+        tk.Button(buttons, text="Already Saved - Enable Fly/Log", width=28, command=lambda: choose("already_saved")).pack(side="left", padx=(0, 6))
+        tk.Button(buttons, text="Skip Candidate", width=18, command=lambda: choose("skip")).pack(side="left", padx=(0, 6))
+        tk.Button(buttons, text="Stop Plan", width=14, command=lambda: choose("cancel")).pack(side="left")
+
+        dialog.protocol("WM_DELETE_WINDOW", lambda: choose("cancel"))
+        dialog.bind("<Escape>", lambda _event: choose("cancel"))
+
+        dialog.update_idletasks()
+        try:
+            x = app.root.winfo_rootx() + max(0, (app.root.winfo_width() - dialog.winfo_width()) // 2)
+            y = app.root.winfo_rooty() + max(0, (app.root.winfo_height() - dialog.winfo_height()) // 2)
+            dialog.geometry(f"+{x}+{y}")
+        except Exception:
+            pass
+
+        dialog.grab_set()
+        dialog.focus_set()
+        app.root.wait_window(dialog)
+        return str(result["action"])
+
     def d_candidates(self) -> tuple[int, ...]:
         app = self.app
         if app.pid_plan is None:
@@ -209,10 +260,17 @@ class PidPlanWorkflow:
         app = self.app
         if app.pid_plan is None:
             return ()
-        return tuple(
-            {"roll": int(roll), "pitch": int(pitch)}
-            for roll, pitch in zip(app.pid_plan.p_sweep.get("roll", ()), app.pid_plan.p_sweep.get("pitch", ()))
-        )
+        rows: list[dict[str, int]] = []
+        start_roll = int(app.pid_plan.start_p["roll"])
+        start_pitch = int(app.pid_plan.start_p["pitch"])
+        for roll, pitch in zip(app.pid_plan.p_sweep.get("roll", ()), app.pid_plan.p_sweep.get("pitch", ())):
+            row = {"roll": int(roll), "pitch": int(pitch)}
+            # Safe Start already logs the generated starting P with the first D value.
+            # Do not ask the user to run that exact same P candidate twice.
+            if row["roll"] == start_roll and row["pitch"] == start_pitch:
+                continue
+            rows.append(row)
+        return tuple(rows)
 
     def d_recheck_candidates(self) -> tuple[int, ...]:
         app = self.app
@@ -245,6 +303,19 @@ class PidPlanWorkflow:
             if app.pid_plan_phase == "safe_start":
                 return True
 
+            if app.pid_plan_phase == "p_sweep" and app.pid_plan_index >= len(self.p_candidates()):
+                candidates = self.p_candidates()
+                initial = candidates[-1] if candidates else app.pid_plan.start_p
+                selected = self.ask_pid_pair("Choose P", "P", initial["roll"], initial["pitch"])
+                if selected is None:
+                    app.status.set("PID plan paused; P winners are required before D sweep.")
+                    return False
+                app.pid_plan_selected_p = selected
+                app.pid_plan_phase = "d_sweep"
+                app.pid_plan_index = 0
+                self.update_progress_window()
+                continue
+
             if app.pid_plan_phase == "d_sweep" and app.pid_plan_index >= len(self.d_candidates()):
                 optional_d = app.pid_plan.optional_d
                 if optional_d is not None and optional_d not in app.pid_plan.d_sweep:
@@ -258,10 +329,10 @@ class PidPlanWorkflow:
                         return True
                 chosen = self.ask_pid_value("Choose D", "Enter the best Roll/Pitch D from the D sweep.", app.pid_plan.d_sweep[0])
                 if chosen is None:
-                    app.status.set("PID plan paused; D winner is required before P sweep.")
+                    app.status.set("PID plan paused; D winner is required before I sweep.")
                     return False
                 app.pid_plan_selected_d = int(chosen)
-                app.pid_plan_phase = "p_sweep"
+                app.pid_plan_phase = "i_sweep"
                 app.pid_plan_index = 0
                 self.update_progress_window()
                 continue
@@ -270,23 +341,10 @@ class PidPlanWorkflow:
                 initial = app.pid_plan.optional_d if app.pid_plan.optional_d is not None else app.pid_plan.d_sweep[0]
                 chosen = self.ask_pid_value("Choose D", "Enter the best Roll/Pitch D from the D sweep.", int(initial))
                 if chosen is None:
-                    app.status.set("PID plan paused; D winner is required before P sweep.")
+                    app.status.set("PID plan paused; D winner is required before I sweep.")
                     return False
                 app.pid_plan_selected_d = int(chosen)
-                app.pid_plan_phase = "p_sweep"
-                app.pid_plan_index = 0
-                self.update_progress_window()
-                continue
-
-            if app.pid_plan_phase == "p_sweep" and app.pid_plan_index >= len(self.p_candidates()):
-                candidates = self.p_candidates()
-                initial = candidates[-1] if candidates else app.pid_plan.start_p
-                selected = self.ask_pid_pair("Choose P", "P", initial["roll"], initial["pitch"])
-                if selected is None:
-                    app.status.set("PID plan paused; P winners are required before D re-check.")
-                    return False
-                app.pid_plan_selected_p = selected
-                app.pid_plan_phase = "d_recheck"
+                app.pid_plan_phase = "i_sweep"
                 app.pid_plan_index = 0
                 self.update_progress_window()
                 continue
@@ -347,19 +405,21 @@ class PidPlanWorkflow:
                 0,
             )
             return (
-                "Safe start / first D log",
-                f"This writes safe starting P values with Roll I {app.pid_plan.start_i['roll']}, Pitch I {app.pid_plan.start_i['pitch']}, FF = 0, and the first D value.",
+                "Safe start / first P log",
+                f"This writes the generated starting P values with Roll I {app.pid_plan.start_i['roll']}, Pitch I {app.pid_plan.start_i['pitch']}, FF = 0, and starting D {start_d}.",
                 target,
             )
 
         if app.pid_plan_phase == "d_sweep":
+            if app.pid_plan_selected_p is None:
+                return None
             candidates = self.d_candidates()
             if app.pid_plan_index >= len(candidates):
                 return None
             d_value = candidates[app.pid_plan_index]
             target = self.roll_pitch_target(
-                app.pid_plan.start_p["roll"],
-                app.pid_plan.start_p["pitch"],
+                app.pid_plan_selected_p["roll"],
+                app.pid_plan_selected_p["pitch"],
                 d_value,
                 d_value,
                 app.pid_plan.start_i["roll"],
@@ -367,15 +427,19 @@ class PidPlanWorkflow:
                 0,
                 0,
             )
-            return (f"D sweep {app.pid_plan_index + 2}/{len(app.pid_plan.d_sweep)}", f"Log Roll/Pitch D {d_value}.", target)
+            return (
+                f"D sweep {app.pid_plan_index + 2}/{len(app.pid_plan.d_sweep)}",
+                f"Log Roll/Pitch D {d_value} with chosen P.",
+                target,
+            )
 
         if app.pid_plan_phase == "d_optional":
-            if app.pid_plan.optional_d is None or app.pid_plan_index >= 1:
+            if app.pid_plan_selected_p is None or app.pid_plan.optional_d is None or app.pid_plan_index >= 1:
                 return None
             d_value = int(app.pid_plan.optional_d)
             target = self.roll_pitch_target(
-                app.pid_plan.start_p["roll"],
-                app.pid_plan.start_p["pitch"],
+                app.pid_plan_selected_p["roll"],
+                app.pid_plan_selected_p["pitch"],
                 d_value,
                 d_value,
                 app.pid_plan.start_i["roll"],
@@ -383,11 +447,9 @@ class PidPlanWorkflow:
                 0,
                 0,
             )
-            return ("Optional D sweep", f"Log optional Roll/Pitch D {d_value}.", target)
+            return ("Optional D sweep", f"Log optional Roll/Pitch D {d_value} with chosen P.", target)
 
         if app.pid_plan_phase == "p_sweep":
-            if app.pid_plan_selected_d is None:
-                return None
             candidates = self.p_candidates()
             if app.pid_plan_index >= len(candidates):
                 return None
@@ -395,8 +457,8 @@ class PidPlanWorkflow:
             target = self.roll_pitch_target(
                 row["roll"],
                 row["pitch"],
-                app.pid_plan_selected_d,
-                app.pid_plan_selected_d,
+                start_d,
+                start_d,
                 app.pid_plan.start_i["roll"],
                 app.pid_plan.start_i["pitch"],
                 0,
@@ -404,7 +466,7 @@ class PidPlanWorkflow:
             )
             return (
                 f"P sweep {app.pid_plan_index + 1}/{len(candidates)}",
-                f"Log Roll P {row['roll']} and Pitch P {row['pitch']} with D {app.pid_plan_selected_d}.",
+                f"Log Roll P {row['roll']} and Pitch P {row['pitch']} with starting D {start_d}.",
                 target,
             )
 
@@ -480,7 +542,7 @@ class PidPlanWorkflow:
     def advance_after_step(self) -> None:
         app = self.app
         if app.pid_plan_phase == "safe_start":
-            app.pid_plan_phase = "d_sweep"
+            app.pid_plan_phase = "p_sweep"
             app.pid_plan_index = 0
             return
         app.pid_plan_index += 1
@@ -595,7 +657,7 @@ class PidPlanWorkflow:
             app.pid_plan_current_candidate_target = target
             app.auto_session_button.config(text="Next PID Plan Step", state="normal")
             self.refresh_fly_log_button_state()
-            app.status.set("Safe-start PID/FF values staged. Press Save before Fly/Log.")
+            app.status.set("Safe-start PID/FF values staged for the first P log. Press Save before Fly/Log.")
             self.update_progress_window()
             messagebox.showinfo(
                 "Safe Start Ready",
@@ -608,31 +670,37 @@ class PidPlanWorkflow:
         current = self.read_fc_pid_ff_values(tuple(target.keys()))
         self.set_plan_report_text(app.pid_plan, f"PID plan step: {title}", target, current)
         prompt = (
-            f"{title}\n\n"
             f"{instruction}\n\n"
             "Required sequence for this candidate:\n"
             "1. DISARM the drone.\n"
-            "2. Stage these PID/FF values into the FC / INAV boxes.\n"
-            "3. Press Save in the FC / INAV section while disarmed.\n"
-            "4. Arm, then press Fly/Log for this candidate.\n"
-            "5. Land and DISARM before pressing Next PID Plan Step.\n\n"
-            "Yes: stage these target values in the boxes.\n"
-            "No: skip this step and mark it done.\n"
-            "Cancel: stop the guided PID plan.\n\n"
+            "2. Either stage/save the target values, or use Already Saved if the FC already has them.\n"
+            "3. Arm, then press Fly/Log for this candidate.\n"
+            "4. Land and DISARM before pressing Next PID Plan Step.\n\n"
+            "Button choices:\n"
+            "Stage Values: copy target values into the FC / INAV boxes.\n"
+            "Already Saved - Enable Fly/Log: do not rewrite values; enable Fly/Log for this candidate.\n"
+            "Skip Candidate: skip this candidate and move on.\n"
+            "Stop Plan: stop the guided PID plan.\n\n"
             "Current vs target:\n"
             f"{self.format_pid_target_check(current, target)}"
         )
-        choice = messagebox.askyesnocancel("PID Plan Step", prompt, parent=app.root)
-        if choice is None:
+        action = self.ask_candidate_action(title, prompt)
+        if action == "cancel":
             self.complete("PID tuning plan stopped by user.")
             return
-        if choice:
+        if action == "stage":
             self.stage_pid_ff_values(target)
             app.pid_plan_waiting_for_fly_log = True
             app.pid_plan_current_candidate_title = title
             app.pid_plan_current_candidate_phase = step_phase
             app.pid_plan_current_candidate_target = target
             app.status.set(f"PID plan step staged: {title}. Press Save before Fly/Log.")
+        elif action == "already_saved":
+            app.pid_plan_waiting_for_fly_log = True
+            app.pid_plan_current_candidate_title = title
+            app.pid_plan_current_candidate_phase = step_phase
+            app.pid_plan_current_candidate_target = target
+            app.status.set(f"PID plan step enabled without staging: {title}. Press Fly/Log when armed.")
         else:
             app.pid_plan_waiting_for_fly_log = False
             app.pid_plan_current_candidate_title = ""
@@ -646,10 +714,15 @@ class PidPlanWorkflow:
         messagebox.showinfo(
             "PID Plan Step Ready",
             (
-                "Values are ready for this candidate.\n\n"
+                "Values are staged for this candidate.\n\n"
                 "Press Save while disarmed, then arm the drone, press Fly/Log, and disarm before pressing Next PID Plan Step."
-                if choice
-                else "This candidate was skipped. Press Next PID Plan Step when ready for the next candidate."
+                if action == "stage"
+                else (
+                    "Fly/Log is enabled without staging values.\n\n"
+                    "Use this only when the FC already has the correct PID/FF values saved. Arm, press Fly/Log, then disarm before pressing Next PID Plan Step."
+                    if action == "already_saved"
+                    else "This candidate was skipped. Press Next PID Plan Step when ready for the next candidate."
+                )
             ),
             parent=app.root,
         )
