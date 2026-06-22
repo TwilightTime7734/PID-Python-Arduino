@@ -164,8 +164,8 @@ def format_step_response_report(report: StepResponseReport) -> str:
         lines.append(f"- samples JSON: {report.flylog_sample_report.samples_json}")
         for sample_log in report.flylog_sample_report.logs:
             lines.append(
-                f"- {sample_log.log_label}: groups={sample_log.complete_groups}/6 complete, "
-                f"usable={sample_log.usable_groups}/6, clean={sample_log.clean_groups}/6, "
+                f"- {sample_log.log_label}: pulse pairs complete={sample_log.complete_groups}, "
+                f"usable={sample_log.usable_groups}, clean={sample_log.clean_groups}, "
                 f"pulses={sample_log.pulse_count}, center nudges={sample_log.center_adjust_pulses}, "
                 f"pitch response={_format_optional_deg(sample_log.median_pitch_response_deg)}, "
                 f"roll response={_format_optional_deg(sample_log.median_roll_response_deg)}"

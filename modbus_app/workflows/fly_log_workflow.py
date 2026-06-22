@@ -19,6 +19,8 @@ from typing import Any
 class FlyLogWorkflow:
     """Controls the Fly/Log button entry point and enabled/disabled state."""
 
+    READY_LABEL = "Fly / Log"
+
     def __init__(
         self,
         app: Any,
@@ -38,15 +40,15 @@ class FlyLogWorkflow:
         app = self.app
 
         if app.pid_plan_fly_log_active:
-            app.fly_log_button.config(text="Test Active", state="normal")
+            app.fly_log_button.config(text="Fly / Log Active", state="normal")
         elif self.simulation_mode_enabled() and app.sim_fly_log_active:
-            app.fly_log_button.config(text="Sim Test Active", state="normal")
+            app.fly_log_button.config(text="Sim Fly / Log Active", state="normal")
         elif app.pid_plan_active and app.pid_plan_waiting_for_fly_log:
-            app.fly_log_button.config(text="Test", state="normal")
+            app.fly_log_button.config(text=self.READY_LABEL, state="normal")
         elif self.simulation_mode_enabled() and app.sim_plan is not None and app.sim_waiting_for_fly_log:
-            app.fly_log_button.config(text="Test", state="normal")
+            app.fly_log_button.config(text=self.READY_LABEL, state="normal")
         else:
-            app.fly_log_button.config(text="Test", state="normal")
+            app.fly_log_button.config(text=self.READY_LABEL, state="normal")
 
     def toggle(self) -> None:
         """Main click handler for the Fly/Log button."""

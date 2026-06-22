@@ -15,8 +15,11 @@ from serialUSB.inav_serial_service import InavSerialService
 from .constants import (
     FC_PORT_DEFAULT,
     FLY_LOG_SAFETY_TIMEOUT_S,
+    PITCH_CHANNEL_INDEX,
     PID_PLAN_FLY_LOG_RUNTIME_S,
     PORT_DEFAULT,
+    PULSE_STATUS_REJECTED,
+    ROLL_CHANNEL_INDEX,
     THROTTLE_CHANNEL_INDEX,
 )
 from .adaptive_session import (
@@ -29,6 +32,9 @@ from .ch8_marker import channels_with_pid_test_ch8
 from .blackbox_import import BlackboxImportResult
 from .pid_tuning_workflow import (
     LoadedPIDTuningPlan,
+    PStartInputs,
+    TestPulseProfile,
+    estimate_test_pulse_profile,
     load_pid_tuning_plan,
 )
 
@@ -54,6 +60,7 @@ from .tasks.worker_tasks import (
     analyze_specific_blackbox_log as worker_analyze_specific_blackbox_log,
     enter_msc_and_import_blackbox_logs as worker_enter_msc_and_import_blackbox_logs,
     generate_auto_report as worker_generate_auto_report,
+    hold_channel_until_stop as worker_hold_channel_until_stop,
     read_movement_attitude as worker_read_movement_attitude,
 )
 
@@ -119,8 +126,113 @@ class ModbusApp(HardwareStateMixin):
                 self.status.set(f"Test throttle set to {throttle}us from {source}.")
             return throttle
 
+        def _combo_values(combo) -> list[str]:
+            values = combo.cget("values")
+            if isinstance(values, str):
+                return [str(value) for value in self.root.tk.splitlist(values)]
+            return [str(value) for value in values]
+
+        def _set_combo_value(combo, value_text: str, *, numeric_key) -> None:
+            values = _combo_values(combo)
+            if value_text not in values:
+                values.append(value_text)
+                values.sort(key=numeric_key)
+                combo.configure(values=tuple(values))
+            combo.set(value_text)
+
+        def _format_pulse_force_us(value: int | float) -> str:
+            return str(int(round(float(value))))
+
+        def _format_pulse_hold_s(value: int | float) -> str:
+            return f"{float(value):.2f}"
+
+        def set_test_pulse_profile(profile: TestPulseProfile | None, source: str = "") -> TestPulseProfile:
+            if profile is None:
+                profile = estimate_test_pulse_profile(PStartInputs())
+            self.test_pulse_profile_base = profile
+            _set_combo_value(
+                self.pulse_force_combo,
+                _format_pulse_force_us(profile.main_force_us),
+                numeric_key=lambda item: int(round(float(item))),
+            )
+            _set_combo_value(
+                self.pulse_time_combo,
+                _format_pulse_hold_s(profile.main_hold_s),
+                numeric_key=lambda item: float(item),
+            )
+            return profile
+
+        def read_pulse_force_us() -> int:
+            raw = self.pulse_force_combo.get().strip()
+            try:
+                force_us = int(round(float(raw)))
+            except ValueError as exc:
+                raise RuntimeError("Pulse force must be a number of microseconds.") from exc
+            if force_us < 1 or force_us > 500:
+                raise RuntimeError("Pulse force must be between 1 and 500us.")
+            _set_combo_value(
+                self.pulse_force_combo,
+                _format_pulse_force_us(force_us),
+                numeric_key=lambda item: int(round(float(item))),
+            )
+            return force_us
+
+        def read_pulse_hold_s() -> float:
+            raw = self.pulse_time_combo.get().strip()
+            try:
+                hold_s = float(raw)
+            except ValueError as exc:
+                raise RuntimeError("Pulse time must be a number of seconds.") from exc
+            if hold_s < 0.01 or hold_s > 2.0:
+                raise RuntimeError("Pulse time must be between 0.01 and 2.00 seconds.")
+            _set_combo_value(
+                self.pulse_time_combo,
+                _format_pulse_hold_s(hold_s),
+                numeric_key=lambda item: float(item),
+            )
+            return hold_s
+
+        def sync_pulse_dropdowns_from_user(event=None) -> None:
+            try:
+                force_us = read_pulse_force_us()
+                hold_s = read_pulse_hold_s()
+            except RuntimeError as exc:
+                self.status.set(str(exc))
+                return
+            self.status.set(f"Fly/Log main pulse set to +/-{force_us}us for {hold_s:.2f}s.")
+
+        def current_plan_test_pulse_profile() -> TestPulseProfile | None:
+            plan = getattr(self, "pid_plan", None)
+            return getattr(plan, "test_pulse_profile", None)
+
+        def current_test_pulse_profile() -> TestPulseProfile:
+            profile = current_plan_test_pulse_profile()
+            if profile is None:
+                profile = getattr(self, "test_pulse_profile_base", None)
+            if profile is None:
+                profile = estimate_test_pulse_profile(PStartInputs())
+            return replace(
+                profile,
+                main_force_us=read_pulse_force_us(),
+                main_hold_s=read_pulse_hold_s(),
+            )
+
+        set_test_pulse_profile(current_plan_test_pulse_profile())
+
         def read_auto_tune_config() -> AdaptiveSessionConfig:
-            return AdaptiveSessionConfig(throttle_start_us=get_test_throttle_us())
+            config = AdaptiveSessionConfig(throttle_start_us=get_test_throttle_us())
+            pulse = current_test_pulse_profile()
+            return replace(
+                config,
+                force_max_us=max(config.force_max_us, int(pulse.main_force_us)),
+                roll_force_us=int(pulse.main_force_us),
+                pitch_force_us=int(pulse.main_force_us),
+                roll_hold_s=float(pulse.main_hold_s),
+                pitch_hold_s=float(pulse.main_hold_s),
+                hold_max_s=max(config.hold_max_s, float(pulse.main_hold_s)),
+                probe_force_us=int(pulse.probe_force_us),
+                probe_hold_s=float(pulse.probe_hold_s),
+            )
 
         def simulation_mode_enabled() -> bool:
             return bool(self.simulation_mode_var.get())
@@ -317,6 +429,7 @@ class ModbusApp(HardwareStateMixin):
             stage_pid_ff_var=set_pid_ff_var,
             stop_simulated_auto_session=lambda *args, **kwargs: stop_simulated_auto_session(*args, **kwargs),
             set_test_throttle_us=set_test_throttle_us,
+            set_test_pulse_profile=set_test_pulse_profile,
         )
 
         def do_pid_tuning_plan() -> None:
@@ -437,6 +550,100 @@ class ModbusApp(HardwareStateMixin):
 
         def auto_is_running() -> bool:
             return auto_session_workflow.is_running()
+
+        def test_pulse_axis_channel(profile: TestPulseProfile) -> tuple[str, int]:
+            axis = str(profile.test_axis).strip().lower()
+            if axis == "pitch":
+                return "pitch", PITCH_CHANNEL_INDEX
+            return "roll", ROLL_CHANNEL_INDEX
+
+        def set_test_pulse_buttons_state(state: str) -> None:
+            self.pulse_positive_button.config(state=state)
+            self.pulse_negative_button.config(state=state)
+
+        def do_test_pulse(direction: int) -> None:
+            try:
+                if getattr(self, "manual_pulse_inflight", False):
+                    self.status.set("Test pulse already in progress.")
+                    return
+                if auto_is_running():
+                    self.status.set("Wait for the active Auto/FlyLog task to finish first.")
+                    return
+                if self.level_active:
+                    self.status.set("Stop auto-level before testing the pulse.")
+                    return
+                if self.sim_active or self.sim_fly_log_active:
+                    self.status.set("Stop simulation before testing the pulse.")
+                    return
+                if not arduino_output_connected():
+                    raise RuntimeError("Connect Arduino output before testing the pulse.")
+
+                profile = current_test_pulse_profile()
+                axis, channel_index = test_pulse_axis_channel(profile)
+                signed_force_us = int(profile.main_force_us) * (1 if direction >= 0 else -1)
+                hold_s = float(profile.main_hold_s)
+                if len(self.base_channel_outputs) <= channel_index:
+                    raise RuntimeError("Base channel output list is too short for a test pulse.")
+                offsets = parse_offset_values_with_defaults()
+                if len(offsets) <= channel_index:
+                    raise RuntimeError("Offset list is too short for a test pulse.")
+
+                base_value = int(self.base_channel_outputs[channel_index])
+                target = max(1000, min(2000, base_value + signed_force_us))
+                active_outputs = self.base_channel_outputs.copy()
+                active_outputs[channel_index] = target
+                set_live_channel_outputs(active_outputs)
+                self.manual_pulse_inflight = True
+                set_test_pulse_buttons_state("disabled")
+                hold_ms = max(1, round(hold_s * 1000))
+                direction_text = "+" if signed_force_us >= 0 else ""
+                self.status.set(
+                    f"Testing {axis} pulse: CH{channel_index + 1} {base_value}->{target} "
+                    f"({direction_text}{signed_force_us}us) for {hold_s:.2f}s."
+                )
+
+                def finish_test_pulse(status_text: str) -> None:
+                    self.manual_pulse_inflight = False
+                    set_test_pulse_buttons_state("normal")
+                    set_live_channel_outputs(self.base_channel_outputs.copy())
+                    self.status.set(status_text)
+
+                def complete_test_pulse() -> None:
+                    finish_test_pulse(
+                        f"Test pulse complete: {axis} {direction_text}{signed_force_us}us for {hold_s:.2f}s."
+                    )
+
+                def on_test_pulse_done(ok: bool, res: object) -> None:
+                    if not ok:
+                        finish_test_pulse("Test pulse failed.")
+                        set_error("Test pulse error", res if isinstance(res, Exception) else RuntimeError(str(res)))
+                        return
+                    if not isinstance(res, int):
+                        finish_test_pulse("Test pulse failed.")
+                        set_error("Test pulse error", RuntimeError("Unexpected test pulse result from worker."))
+                        return
+                    if res == PULSE_STATUS_REJECTED:
+                        finish_test_pulse("Test pulse rejected by firmware.")
+                        set_error("Test pulse error", RuntimeError("Firmware rejected the test pulse command."))
+                        return
+                    self.status.set(
+                        f"Test pulse accepted; firmware hold is {hold_ms}ms. Returning to neutral after hold."
+                    )
+                    self.root.after(hold_ms, complete_test_pulse)
+
+                self.worker.submit(
+                    worker_hold_channel_until_stop,
+                    channel_index,
+                    target,
+                    offsets[channel_index],
+                    hold_s,
+                    callback=on_test_pulse_done,
+                )
+            except Exception as exc:
+                self.manual_pulse_inflight = False
+                set_test_pulse_buttons_state("normal")
+                set_live_channel_outputs(self.base_channel_outputs.copy())
+                set_error("Test pulse error", exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
 
         def schedule_auto_tick(delay_ms: int | None = None) -> None:
             auto_session_engine.schedule_tick(delay_ms)
@@ -601,14 +808,23 @@ class ModbusApp(HardwareStateMixin):
                 return
 
             self.auto_config = replace(read_auto_tune_config(), max_runtime_s=FLY_LOG_SAFETY_TIMEOUT_S)
+            pulse = current_test_pulse_profile()
+            pulse_text = (
+                f"{pulse.aircraft_name}: {pulse.test_axis} start probe +/-{pulse.probe_force_us}us for "
+                f"{pulse.probe_hold_s:.2f}s; main sequence 10 positive and 10 negative "
+                f"{pulse.test_axis} pulses at dropdown-selected +/-{pulse.main_force_us}us for "
+                f"{pulse.main_hold_s:.2f}s each; neutral wait {pulse.neutral_wait_ms}ms."
+            )
             prompt = (
                 f"Fly/Log candidate: {self.pid_plan_current_candidate_title or 'current PID plan step'}\n\n"
                 "The FC reports ARMED.\n\n"
                 "Pressing OK will run this sequence:\n"
                 "1. Brief spin-up on the current outputs\n"
-                "2. CH8 PID test marker ON (BEEPERON in Blackbox)\n"
-                "3. Small roll/pitch calibration probes\n"
-                "4. CH8 PID test marker OFF (BEEPEROFF in Blackbox)\n\n"
+                "2. Small pre-marker start probes\n"
+                "3. CH8 PID test marker ON (BEEPERON in Blackbox)\n"
+                "4. Marked deterministic one-axis pulse pairs\n"
+                "5. CH8 PID test marker OFF (BEEPEROFF in Blackbox)\n\n"
+                f"Pulse profile: {pulse_text}\n\n"
                 "Chart Step Response analyzes the marker bracket, not a fixed time window. "
                 "You can also bracket your own logs of any length with CH8 markers.\n\n"
                 "No PID/FF values will be written while armed.\n\n"
@@ -1206,6 +1422,7 @@ class ModbusApp(HardwareStateMixin):
             parse_offset_values_with_defaults=parse_offset_values_with_defaults,
             set_live_channel_outputs=set_live_channel_outputs,
             get_test_throttle_us=get_test_throttle_us,
+            get_test_pulse_profile=current_test_pulse_profile,
             begin_fly_log_marker_off_and_complete=begin_fly_log_marker_off_and_complete,
             refresh_fly_log_button_state=refresh_fly_log_button_state,
             open_pid_progress_window=open_pid_progress_window,
@@ -1287,11 +1504,18 @@ class ModbusApp(HardwareStateMixin):
 
         scan_fc_ports(update_status=False)
 
+        for pulse_combo in (self.pulse_force_combo, self.pulse_time_combo):
+            pulse_combo.bind("<<ComboboxSelected>>", sync_pulse_dropdowns_from_user)
+            pulse_combo.bind("<FocusOut>", sync_pulse_dropdowns_from_user)
+            pulse_combo.bind("<Return>", sync_pulse_dropdowns_from_user)
+
         self.scan_fc_button.config(command=scan_fc_ports)
         self.connect_fc_button.config(command=do_fc_toggle)
         self.import_blackbox_button.config(command=do_pull_blackbox_logs)
         self.analyze_blackbox_button.config(command=do_analyze_blackbox_logs)
         self.fly_log_button.config(command=fly_log_workflow.toggle)
+        self.pulse_positive_button.config(command=lambda: do_test_pulse(1))
+        self.pulse_negative_button.config(command=lambda: do_test_pulse(-1))
         self.simulation_mode_checkbutton.config(command=on_simulation_mode_changed)
         self.load_pid_ff_button.config(command=do_load_pid_ff_from_fc)
         self.save_pid_ff_button.config(command=do_save_pid_ff_to_fc)

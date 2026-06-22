@@ -22,6 +22,7 @@ from serialUSB.inav_serial_service import FF_SETTING_NAME, PID_SETTING_NAME
 from ..dialogs.pid_tuning_dialog import ask_pid_tuning_inputs
 from ..pid_tuning_workflow import (
     LoadedPIDTuningPlan,
+    TestPulseProfile,
     find_latest_pid_tuning_plan,
     generate_pid_tuning_plan_report,
     load_pid_tuning_plan,
@@ -47,6 +48,7 @@ class PidPlanWorkflow:
         stage_pid_ff_var: Callable[[str, str, int], None],
         stop_simulated_auto_session: Callable[..., None],
         set_test_throttle_us: Callable[[int | None, str], int],
+        set_test_pulse_profile: Callable[[TestPulseProfile | None, str], TestPulseProfile],
     ) -> None:
         self.app = app
         self.auto_is_running = auto_is_running
@@ -59,6 +61,7 @@ class PidPlanWorkflow:
         self.stage_pid_ff_var = stage_pid_ff_var
         self.stop_simulated_auto_session = stop_simulated_auto_session
         self.set_test_throttle_us = set_test_throttle_us
+        self.set_test_pulse_profile = set_test_pulse_profile
 
     @staticmethod
     def _format_series(values: tuple[int, ...] | list[int]) -> str:
@@ -82,6 +85,7 @@ class PidPlanWorkflow:
         yaw_reco_d = int(plan.yaw_final_pid_ff.get("d", 0))
         yaw_reco_i = int(plan.yaw_final_pid_ff.get("i", 0))
         yaw_reco_ff = int(plan.yaw_final_pid_ff.get("ff", 0))
+        pulse = plan.test_pulse_profile
 
         lines = [
             "Starting point",
@@ -107,6 +111,18 @@ class PidPlanWorkflow:
             f"I:  {yaw_reco_i:02d}",
             f"FF: {yaw_reco_ff:02d}",
         ]
+        if pulse is not None:
+            lines.extend(
+                [
+                    "",
+                    "Test pulse profile",
+                    f"Aircraft: {pulse.aircraft_name}",
+                    f"Test axis: {pulse.test_axis}",
+                    f"Start probe: +/-{pulse.probe_force_us}us for {pulse.probe_hold_s:.2f}s",
+                    f"Fly/Log pulse: 10 positive and 10 negative at +/-{pulse.main_force_us}us for {pulse.main_hold_s:.2f}s",
+                    f"Neutral wait: {pulse.neutral_wait_ms}ms",
+                ]
+            )
         return "\n".join(lines)
 
     @staticmethod
@@ -233,11 +249,14 @@ class PidPlanWorkflow:
             self.stage_pid_ff_values(self.starting_roll_pitch_target(loaded_plan))
             summary_text = self.format_generated_plan_summary(loaded_plan)
             self.set_test_throttle_us(recommendation.throttle_estimate.level_test_throttle_us, "generated PID plan")
+            self.set_test_pulse_profile(loaded_plan.test_pulse_profile, "generated PID plan")
             self.publish_auto_report(summary_text)
             messagebox.showinfo("PID Tuning Plan", summary_text, parent=app.root)
             app.status.set(
                 f"PID tuning plan generated: {report.report_dir}. "
-                f"Shared test throttle set to {recommendation.throttle_estimate.level_test_throttle_us}us."
+                f"Shared test throttle set to {recommendation.throttle_estimate.level_test_throttle_us}us; "
+                f"Fly/Log pulse +/-{recommendation.test_pulse_profile.main_force_us}us for "
+                f"{recommendation.test_pulse_profile.main_hold_s:.2f}s."
             )
         except Exception as exc:
             self.set_error("PID tuning plan error", exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
@@ -885,6 +904,7 @@ class PidPlanWorkflow:
         plan_path = self.locate_plan_file()
         app.pid_plan = load_pid_tuning_plan(plan_path)
         self.set_test_throttle_us(app.pid_plan.level_test_throttle_us, "loaded PID plan")
+        self.set_test_pulse_profile(app.pid_plan.test_pulse_profile, "loaded PID plan")
         app.pid_plan_active = True
         app.pid_plan_phase = "safe_start"
         app.pid_plan_index = 0

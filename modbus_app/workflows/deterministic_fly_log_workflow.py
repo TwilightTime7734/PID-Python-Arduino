@@ -1,15 +1,14 @@
-"""Deterministic Fly/Log paired-pulse workflow.
+"""Deterministic Fly/Log one-axis paired-pulse workflow.
 
 This gives PID-plan Fly/Log a simple, repeatable path that is closer to the
 old exact-pulse exciter, but avoids the oversized one-way pulse that pushed the
 stand into the hard stop. The sequence uses measured doses in both directions:
 
-    marker on -> six sample groups -> marker off
+    marker on -> ten one-axis pulse pairs -> marker off
 
-Each sample group is:
+Each sample pair is:
 
-    pitch +, pitch -, pitch -, pitch + -> center check/slow adjust ->
-    roll +, roll -, roll -, roll + -> center check/slow adjust
+    selected axis +, selected axis - -> center check/slow adjust
 
 Attitude feedback is used only as a safety/quality check and for slow centering
 between sample sections. It is not used to stop the main test pulses. The
@@ -33,6 +32,7 @@ from ..constants import (
     PULSE_STATUS_REJECTED,
     THROTTLE_CHANNEL_INDEX,
 )
+from ..pid_tuning_workflow import PStartInputs, TestPulseProfile, estimate_test_pulse_profile
 from ..tasks.worker_tasks import hold_channel_until_stop as worker_hold_channel_until_stop
 
 
@@ -45,25 +45,20 @@ class _FlyLogPulseStep:
 
 
 class DeterministicFlyLogWorkflow:
-    """Runs exact pitch/roll pulse pairs bracketed by the CH8 marker."""
+    """Runs exact one-axis pulse pairs bracketed by the CH8 marker."""
 
     # Shared/generated plan throttle is preferred. This is only a fallback.
     DEFAULT_TEST_THROTTLE_US = 1250
 
-    # Current useful movement settings from test-stand logs.
-    PITCH_FORCE_US = 125
-    PITCH_HOLD_S = 0.35
-    ROLL_FORCE_US = 125
-    ROLL_HOLD_S = 0.35
+    # Main pulse force/hold comes from the generated PID plan's aircraft profile.
 
-    # Run the full Pitch/Roll sample group multiple times so one Blackbox file
-    # contains enough clean sections for PID analysis.
-    SAMPLE_GROUP_COUNT = 6
+    # Ten + pulses and ten - pulses for the selected axis.
+    PULSE_PAIR_COUNT = 10
 
     # Wait after each pulse before the next command. Important: the Arduino pulse
     # command returns after it is accepted, not after the timed hold completes, so
     # code below waits for hold time + this neutral period before continuing.
-    NEUTRAL_WAIT_AFTER_PULSE_MS = 300
+    # Neutral wait after each pulse also comes from the generated PID plan.
     GROUP_SETTLE_WAIT_MS = 1000
     MARKER_SETTLE_MS = 150
     EMERGENCY_ATTITUDE_DEG = 45.0
@@ -90,6 +85,7 @@ class DeterministicFlyLogWorkflow:
         parse_offset_values_with_defaults: Callable[[], list[int]],
         set_live_channel_outputs: Callable[[list[int]], None],
         get_test_throttle_us: Callable[[], int],
+        get_test_pulse_profile: Callable[[], TestPulseProfile],
         begin_fly_log_marker_off_and_complete: Callable[[], None],
         refresh_fly_log_button_state: Callable[[], None],
         open_pid_progress_window: Callable[[], None],
@@ -104,11 +100,13 @@ class DeterministicFlyLogWorkflow:
         self.parse_offset_values_with_defaults = parse_offset_values_with_defaults
         self.set_live_channel_outputs = set_live_channel_outputs
         self.get_test_throttle_us = get_test_throttle_us
+        self.get_test_pulse_profile = get_test_pulse_profile
         self.begin_fly_log_marker_off_and_complete = begin_fly_log_marker_off_and_complete
         self.refresh_fly_log_button_state = refresh_fly_log_button_state
         self.open_pid_progress_window = open_pid_progress_window
         self.update_pid_progress_window = update_pid_progress_window
         self.publish_auto_report = publish_auto_report
+        self._active_test_pulse_profile: TestPulseProfile | None = None
 
     def _trace(self, message: str) -> None:
         app = self.app
@@ -148,29 +146,45 @@ class DeterministicFlyLogWorkflow:
         except Exception:
             return self.DEFAULT_TEST_THROTTLE_US
 
+    def _test_pulse_profile(self) -> TestPulseProfile:
+        profile = self._active_test_pulse_profile
+        if profile is not None:
+            return profile
+        try:
+            return self.get_test_pulse_profile()
+        except Exception:
+            return estimate_test_pulse_profile(PStartInputs())
+
+    def _neutral_wait_after_pulse_ms(self) -> int:
+        return max(0, int(self._test_pulse_profile().neutral_wait_ms))
+
+    def _fly_log_axis(self) -> str:
+        axis = str(self._test_pulse_profile().test_axis).strip().lower()
+        return axis if axis in {"roll", "pitch"} else "roll"
+
+    @staticmethod
+    def _axis_channel_index(axis: str) -> int:
+        return ROLL_CHANNEL_INDEX if axis == "roll" else PITCH_CHANNEL_INDEX
+
     def _set_base_marker_state(self, *, active: bool) -> None:
         app = self.app
         app.base_channel_outputs = channels_with_pid_test_ch8(app.base_channel_outputs, active=active)
         self.set_live_channel_outputs(app.base_channel_outputs.copy())
 
-    def _pitch_steps(self) -> list[_FlyLogPulseStep]:
+    def _axis_pair_steps(self) -> list[_FlyLogPulseStep]:
+        profile = self._test_pulse_profile()
+        axis = self._fly_log_axis()
+        channel_index = self._axis_channel_index(axis)
+        force_us = int(profile.main_force_us)
+        hold_s = float(profile.main_hold_s)
         return [
-            _FlyLogPulseStep("pitch", PITCH_CHANNEL_INDEX, self.PITCH_FORCE_US, self.PITCH_HOLD_S),
-            _FlyLogPulseStep("pitch", PITCH_CHANNEL_INDEX, -self.PITCH_FORCE_US, self.PITCH_HOLD_S),
-            _FlyLogPulseStep("pitch", PITCH_CHANNEL_INDEX, -self.PITCH_FORCE_US, self.PITCH_HOLD_S),
-            _FlyLogPulseStep("pitch", PITCH_CHANNEL_INDEX, self.PITCH_FORCE_US, self.PITCH_HOLD_S),
-        ]
-
-    def _roll_steps(self) -> list[_FlyLogPulseStep]:
-        return [
-            _FlyLogPulseStep("roll", ROLL_CHANNEL_INDEX, self.ROLL_FORCE_US, self.ROLL_HOLD_S),
-            _FlyLogPulseStep("roll", ROLL_CHANNEL_INDEX, -self.ROLL_FORCE_US, self.ROLL_HOLD_S),
-            _FlyLogPulseStep("roll", ROLL_CHANNEL_INDEX, -self.ROLL_FORCE_US, self.ROLL_HOLD_S),
-            _FlyLogPulseStep("roll", ROLL_CHANNEL_INDEX, self.ROLL_FORCE_US, self.ROLL_HOLD_S),
+            _FlyLogPulseStep(axis, channel_index, force_us, hold_s),
+            _FlyLogPulseStep(axis, channel_index, -force_us, hold_s),
         ]
 
     def start(self) -> None:
         app = self.app
+        self._active_test_pulse_profile = self.get_test_pulse_profile()
         app.auto_controller = None
         app.auto_original_base_outputs = app.base_channel_outputs.copy()
         test_throttle_us = self._test_throttle_us()
@@ -194,23 +208,28 @@ class DeterministicFlyLogWorkflow:
         app.auto_probe_axes_pending = []
         app.auto_pulse_inflight = False
         app.auto_hold_end_requested = False
-        self.set_auto_state(AdaptiveSessionState.adaptive_run, "Deterministic Fly/Log 6-group pulse active")
+        axis = self._fly_log_axis()
+        self.set_auto_state(AdaptiveSessionState.adaptive_run, "Deterministic Fly/Log one-axis pulse active")
         self._set_base_marker_state(active=False)
         self.refresh_fly_log_button_state()
 
         spinup_delay_s = PID_TEST_CH8_SPINUP_DELAY_MS / 1000.0
+        pulse_profile = self._test_pulse_profile()
         self.publish_auto_report(
             "Deterministic Fly/Log active\n\n"
             f"Candidate: {app.pid_plan_current_candidate_title or 'current PID plan step'}\n"
-            f"Mode: {self.SAMPLE_GROUP_COUNT} exact bidirectional pitch/roll sample groups, "
-            f"shared test throttle {test_throttle_us}us, pitch and roll +/-125us for 0.35s each\n"
-            f"Neutral wait after every pulse: {self.NEUTRAL_WAIT_AFTER_PULSE_MS}ms\n"
+            f"Mode: one-axis {axis} test, {self.PULSE_PAIR_COUNT} positive and "
+            f"{self.PULSE_PAIR_COUNT} negative main pulses, "
+            f"shared test throttle {test_throttle_us}us, {pulse_profile.aircraft_name} pulse profile, "
+            f"{axis} +/-{pulse_profile.main_force_us}us for {pulse_profile.main_hold_s:.2f}s each\n"
+            f"Start probe reference: {axis} +/-{pulse_profile.probe_force_us}us "
+            f"for {pulse_profile.probe_hold_s:.2f}s\n"
+            f"Neutral wait after every pulse: {self._neutral_wait_after_pulse_ms()}ms\n"
             f"Slow center adjust when 8-25 deg off: +/-{self.CENTER_ADJUST_FORCE_US}us for "
             f"{self.CENTER_ADJUST_HOLD_S:.3g}s, up to {self.CENTER_ADJUST_MAX_PULSES} nudges\n"
-            f"Settle wait between sample groups: {self.GROUP_SETTLE_WAIT_MS}ms\n"
+            f"Settle wait between pulse pairs: {self.GROUP_SETTLE_WAIT_MS}ms\n"
             f"Spin-up before CH8 marker: {spinup_delay_s:.1f}s\n"
-            "Sequence per group: pitch + - - + -> center adjust/check -> "
-            "roll + - - + -> center adjust/check.\n"
+            f"Sequence per pair: {axis} + -> {axis} - -> center adjust/check.\n"
             "Attitude is checked only as safety/center quality, not used to stop the main pulses.\n"
             "The adaptive/random movement engine is bypassed for this Fly/Log run.\n\n"
         )
@@ -232,15 +251,40 @@ class DeterministicFlyLogWorkflow:
                 return
             self._trace(
                 f"Base outputs prepared at throttle {app.base_channel_outputs[THROTTLE_CHANNEL_INDEX]}us. "
-                f"Marker starts in {spinup_delay_s:.1f}s."
+                f"Start probes begin in {spinup_delay_s:.1f}s."
             )
-            self._schedule(max(1, PID_TEST_CH8_SPINUP_DELAY_MS), self._enable_marker)
+            self._schedule(max(1, PID_TEST_CH8_SPINUP_DELAY_MS), self._run_start_probe_sequence)
 
         self.queue_live_channel_update(
             app.base_channel_outputs.copy(),
             self.parse_offset_values_with_defaults(),
             after_update=on_spinup_outputs_prepared,
         )
+
+    def _start_probe_steps(self) -> list[_FlyLogPulseStep]:
+        profile = self._test_pulse_profile()
+        axis = self._fly_log_axis()
+        channel_index = self._axis_channel_index(axis)
+        force_us = max(0, int(profile.probe_force_us))
+        hold_s = max(0.01, float(profile.probe_hold_s))
+        if force_us <= 0:
+            return []
+        return [
+            _FlyLogPulseStep(axis, channel_index, force_us, hold_s),
+            _FlyLogPulseStep(axis, channel_index, -force_us, hold_s),
+        ]
+
+    def _run_start_probe_sequence(self) -> None:
+        app = self.app
+        app.fly_log_marker_after_id = None
+        if not app.pid_plan_fly_log_active or not self.auto_is_running():
+            return
+        steps = self._start_probe_steps()
+        if not steps:
+            self._enable_marker()
+            return
+        self._trace("Running small pre-marker start probes before CH8 marker.")
+        self._run_step_list(steps, 0, next_callback=self._enable_marker)
 
     def _enable_marker(self) -> None:
         app = self.app
@@ -263,8 +307,10 @@ class DeterministicFlyLogWorkflow:
             app.auto_session_start_s = now_s
             app.auto_last_tick_s = now_s
             app.auto_last_sample_s = now_s
-            self._trace("CH8 marker is ON. Scheduling 6 pitch/roll sample groups.")
-            self._schedule(self.MARKER_SETTLE_MS, lambda: self._run_sample_group(0))
+            self._trace(
+                f"CH8 marker is ON. Scheduling {self.PULSE_PAIR_COUNT} {self._fly_log_axis()} pulse pairs."
+            )
+            self._schedule(self.MARKER_SETTLE_MS, lambda: self._run_pulse_pair(0))
 
         self.queue_live_channel_update(
             app.base_channel_outputs.copy(),
@@ -272,44 +318,34 @@ class DeterministicFlyLogWorkflow:
             after_update=on_marker_enabled,
         )
 
-    def _run_sample_group(self, group_index: int) -> None:
+    def _run_pulse_pair(self, pair_index: int) -> None:
         app = self.app
         app.fly_log_marker_after_id = None
         if not app.pid_plan_fly_log_active or not self.auto_is_running():
             return
-        if group_index >= self.SAMPLE_GROUP_COUNT:
+        if pair_index >= self.PULSE_PAIR_COUNT:
             self._finish_sequence()
             return
-        self._trace(f"Starting sample group {group_index + 1}/{self.SAMPLE_GROUP_COUNT}: Pitch + - - +.")
+        axis = self._fly_log_axis()
+        self._trace(f"Starting {axis} pulse pair {pair_index + 1}/{self.PULSE_PAIR_COUNT}: + then -.")
         self._run_step_list(
-            self._pitch_steps(),
+            self._axis_pair_steps(),
             0,
             next_callback=lambda: self._center_or_adjust(
-                context=f"group {group_index + 1} before roll",
-                next_callback=lambda: self._run_roll_section(group_index),
+                context=f"{axis} pair {pair_index + 1}",
+                next_callback=lambda: self._finish_pair(pair_index),
             ),
         )
 
-    def _run_roll_section(self, group_index: int) -> None:
-        self._trace(f"Sample group {group_index + 1}/{self.SAMPLE_GROUP_COUNT}: Roll + - - +.")
-        self._run_step_list(
-            self._roll_steps(),
-            0,
-            next_callback=lambda: self._center_or_adjust(
-                context=f"group {group_index + 1} after roll",
-                next_callback=lambda: self._finish_group(group_index),
-            ),
-        )
-
-    def _finish_group(self, group_index: int) -> None:
-        if group_index + 1 >= self.SAMPLE_GROUP_COUNT:
+    def _finish_pair(self, pair_index: int) -> None:
+        if pair_index + 1 >= self.PULSE_PAIR_COUNT:
             self._finish_sequence()
             return
         self._trace(
-            f"Sample group {group_index + 1}/{self.SAMPLE_GROUP_COUNT} complete; "
-            f"settling {self.GROUP_SETTLE_WAIT_MS}ms before next group."
+            f"Pulse pair {pair_index + 1}/{self.PULSE_PAIR_COUNT} complete; "
+            f"settling {self.GROUP_SETTLE_WAIT_MS}ms before next pair."
         )
-        self._schedule(self.GROUP_SETTLE_WAIT_MS, lambda: self._run_sample_group(group_index + 1))
+        self._schedule(self.GROUP_SETTLE_WAIT_MS, lambda: self._run_pulse_pair(pair_index + 1))
 
     def _run_step_list(
         self,
@@ -541,7 +577,7 @@ class DeterministicFlyLogWorkflow:
         app.auto_pulse_inflight = True
         direction_text = "+" if step.signed_force_us >= 0 else ""
         hold_ms = max(1, round(step.hold_s * 1000))
-        wait_ms = max(0, int(self.NEUTRAL_WAIT_AFTER_PULSE_MS))
+        wait_ms = self._neutral_wait_after_pulse_ms()
         next_total_delay_ms = hold_ms + wait_ms
         self._trace(
             f"Issuing {label} pulse: CH{channel_index + 1} "
@@ -608,5 +644,6 @@ class DeterministicFlyLogWorkflow:
         if emergency:
             self.auto_abort(reason, continue_pipeline=False)
             return
-        self._trace("All deterministic Fly/Log sample groups complete; marker will turn off.")
+        self._trace("All deterministic Fly/Log one-axis pulse pairs complete; marker will turn off.")
+        self._active_test_pulse_profile = None
         self.begin_fly_log_marker_off_and_complete()

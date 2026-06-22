@@ -32,6 +32,7 @@ BATTERY_NOMINAL_VOLTAGE = {
     "liion": 3.6,
 }
 BATTERY_CHEMISTRY_VALUES = set(BATTERY_NOMINAL_VOLTAGE)
+TEST_AXIS_VALUES = {"roll", "pitch"}
 BASELINE_NO_LOAD_RPM_INCH = 2300.0 * 4.0 * BATTERY_NOMINAL_VOLTAGE["lipo"] * 5.0
 BASELINE_DISK_LOADING_G_IN2 = 600.0 / (4.0 * 3.141592653589793 * 2.5 * 2.5)
 
@@ -54,6 +55,8 @@ MAX_HOVER_THROTTLE_US = 1600
 class PStartInputs:
     """Information used to choose a conservative roll/pitch P starting point."""
 
+    aircraft_name: str = "Custom"
+    test_axis: str = "roll"
     all_up_weight_g: int | None = None
     motor_kv: int | None = None
     prop_diameter_in: float | None = None
@@ -64,6 +67,8 @@ class PStartInputs:
 
 
 PAVO_PICO_II_PRESET_INPUTS = PStartInputs(
+    aircraft_name="BETAFPV Pavo Pico 2",
+    test_axis="roll",
     all_up_weight_g=83,
     motor_kv=14000,
     prop_diameter_in=1.77,
@@ -72,6 +77,53 @@ PAVO_PICO_II_PRESET_INPUTS = PStartInputs(
     battery_chemistry="lihv",
     motor_count=4,
 )
+
+SEVEN_INCH_PRESET_INPUTS = PStartInputs(
+    aircraft_name="7 inch quad",
+    test_axis="roll",
+    all_up_weight_g=900,
+    motor_kv=1300,
+    prop_diameter_in=7.0,
+    prop_pitch_in=4.0,
+    battery_cells=6,
+    battery_chemistry="lipo",
+    motor_count=4,
+)
+
+TEN_INCH_PRESET_INPUTS = PStartInputs(
+    aircraft_name="10 inch quad",
+    test_axis="roll",
+    all_up_weight_g=1800,
+    motor_kv=900,
+    prop_diameter_in=10.0,
+    prop_pitch_in=4.5,
+    battery_cells=6,
+    battery_chemistry="lipo",
+    motor_count=4,
+)
+
+AIRCRAFT_PRESET_INPUTS = {
+    "Custom": PStartInputs(),
+    "BETAFPV Pavo Pico 2": PAVO_PICO_II_PRESET_INPUTS,
+    "7 inch quad": SEVEN_INCH_PRESET_INPUTS,
+    "10 inch quad": TEN_INCH_PRESET_INPUTS,
+}
+
+
+@dataclass(frozen=True)
+class TestPulseProfile:
+    """Recommended test-stand stick pulse envelope for the selected aircraft."""
+
+    aircraft_name: str
+    test_axis: str
+    probe_force_us: int
+    probe_hold_s: float
+    main_force_us: int
+    main_hold_s: float
+    neutral_wait_ms: int
+    target_response_min_deg: float
+    target_response_max_deg: float
+    notes: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -97,6 +149,7 @@ class PStartRecommendation:
     notes: tuple[str, ...]
     inputs: PStartInputs
     throttle_estimate: TestThrottleEstimate
+    test_pulse_profile: TestPulseProfile
 
 
 @dataclass(frozen=True)
@@ -120,6 +173,7 @@ class LoadedPIDTuningPlan:
     i_sweep: tuple[dict[str, int], ...]
     ff_sweep: tuple[dict[str, int], ...]
     level_test_throttle_us: int | None = None
+    test_pulse_profile: TestPulseProfile | None = None
 
 
 def safe_p_start_information_needed() -> tuple[str, ...]:
@@ -131,6 +185,8 @@ def safe_p_start_information_needed() -> tuple[str, ...]:
         "Prop size, ideally diameter and pitch in inches.",
         "Battery cell count and chemistry, such as 2S LiPo or 4S Li-ion.",
         "Motor count, defaulting to 4 for a quad.",
+        "Aircraft preset, or custom values for the actual build.",
+        "Fly/Log test axis: roll or pitch.",
     )
 
 
@@ -209,6 +265,7 @@ def suggest_starting_p(inputs: PStartInputs) -> PStartRecommendation:
     notes.append("Yaw is not being swept; the final yaw P was scaled conservatively from the same hardware estimate.")
 
     throttle_estimate = estimate_test_throttle(inputs)
+    test_pulse_profile = estimate_test_pulse_profile(inputs)
 
     return PStartRecommendation(
         start_p=start_p,
@@ -218,6 +275,7 @@ def suggest_starting_p(inputs: PStartInputs) -> PStartRecommendation:
         notes=tuple(dict.fromkeys(notes)),
         inputs=inputs,
         throttle_estimate=throttle_estimate,
+        test_pulse_profile=test_pulse_profile,
     )
 
 
@@ -279,6 +337,76 @@ def estimate_test_throttle(inputs: PStartInputs) -> TestThrottleEstimate:
         notes=tuple(dict.fromkeys(notes)),
     )
 
+
+def estimate_test_pulse_profile(inputs: PStartInputs) -> TestPulseProfile:
+    """Estimate conservative stick probe/pulse sizes for the selected aircraft."""
+
+    aircraft_name = str(inputs.aircraft_name or "Custom").strip() or "Custom"
+    test_axis = _choice(inputs.test_axis, TEST_AXIS_VALUES, "roll")
+    notes: list[str] = []
+    prop_diameter = _positive_float(inputs.prop_diameter_in, REFERENCE_PROP_DIAMETER_IN)
+
+    if prop_diameter >= 9.0:
+        probe_force = 8
+        probe_hold = 0.05
+        main_force = 80
+        main_hold = 0.25
+        neutral_wait = 400
+        target_min = 8.0
+        target_max = 22.0
+        notes.append("10 inch class props carry high inertia; use a smaller, shorter main pulse first.")
+    elif prop_diameter >= 6.5:
+        probe_force = 10
+        probe_hold = 0.05
+        main_force = 100
+        main_hold = 0.30
+        neutral_wait = 350
+        target_min = 8.0
+        target_max = 25.0
+        notes.append("7 inch class props get a reduced pulse compared with the micro baseline.")
+    elif prop_diameter <= 2.5:
+        probe_force = 12
+        probe_hold = 0.05
+        main_force = 125
+        main_hold = 0.35
+        neutral_wait = 300
+        target_min = 10.0
+        target_max = 25.0
+        notes.append("Micro prop class keeps the current proven Pavo Pico II Fly/Log pulse.")
+    else:
+        probe_force = 10
+        probe_hold = 0.05
+        main_force = 110
+        main_hold = 0.32
+        neutral_wait = 325
+        target_min = 8.0
+        target_max = 25.0
+        notes.append("Mid-size prop class uses a moderate pulse between the micro and long-range presets.")
+
+    if inputs.motor_kv is not None and inputs.battery_cells is not None:
+        chemistry = _choice(inputs.battery_chemistry, BATTERY_CHEMISTRY_VALUES, "lipo")
+        voltage = float(inputs.battery_cells) * BATTERY_NOMINAL_VOLTAGE[chemistry]
+        speed_index = (float(inputs.motor_kv) * voltage) / (REFERENCE_MOTOR_KV * REFERENCE_BATTERY_CELLS * BATTERY_NOMINAL_VOLTAGE[REFERENCE_BATTERY_CHEMISTRY])
+        if prop_diameter >= 6.5 and speed_index >= 0.55:
+            main_force = max(70, main_force - 10)
+            notes.append("Motor/cell speed is strong for this prop class, so the main pulse was reduced another 10us.")
+
+    notes.append("Use the smallest pulse that produces a clean 8-25 degree one-axis response.")
+    notes.append("If the rig rebounds, clips, or nears a mechanical stop, reduce force before increasing hold time.")
+
+    return TestPulseProfile(
+        aircraft_name=aircraft_name,
+        test_axis=test_axis,
+        probe_force_us=int(probe_force),
+        probe_hold_s=float(probe_hold),
+        main_force_us=int(main_force),
+        main_hold_s=float(main_hold),
+        neutral_wait_ms=int(neutral_wait),
+        target_response_min_deg=float(target_min),
+        target_response_max_deg=float(target_max),
+        notes=tuple(dict.fromkeys(notes)),
+    )
+
 def format_pid_tuning_plan(recommendation: PStartRecommendation) -> str:
     """Format the supervised P/D/I/FF plan as plain text."""
 
@@ -287,6 +415,7 @@ def format_pid_tuning_plan(recommendation: PStartRecommendation) -> str:
     p_sweep = recommendation.p_sweep
     yaw = recommendation.yaw_final_pid_ff
     throttle = recommendation.throttle_estimate
+    pulse = recommendation.test_pulse_profile
     start_d = D_SWEEP_VALUES[0]
     d_values = ", ".join(str(v) for v in D_SWEEP_VALUES)
     roll_p_values = ", ".join(str(v) for v in p_sweep["roll"])
@@ -296,8 +425,11 @@ def format_pid_tuning_plan(recommendation: PStartRecommendation) -> str:
     roll_ff_values = ", ".join(str(row["roll"]) for row in FF_SWEEP_VALUES)
     pitch_ff_values = ", ".join(str(row["pitch"]) for row in FF_SWEEP_VALUES)
     fly_log_action = (
-        "-   Once the 'Fly/Log' button is pressed, wait for spin-up, set CH8 to 2000us, "
-        "run the 6-group pitch/roll step routine, then set CH8 back to 1000us. "
+        "-   Once the 'Fly/Log' button is pressed, wait for spin-up, run the pre-marker "
+        f"{pulse.test_axis} +/-{pulse.probe_force_us}us start probes, set CH8 to 2000us, "
+        f"run the marked {pulse.test_axis} step routine using +/-{pulse.main_force_us}us "
+        f"for {pulse.main_hold_s:.2f}s, "
+        "then set CH8 back to 1000us. "
         "Extract/Analyze reads the marked routine and ignores center-adjust pulses."
     )
     lines: list[str] = [
@@ -312,10 +444,21 @@ def format_pid_tuning_plan(recommendation: PStartRecommendation) -> str:
         "",
         "Safety gates",
         "- Keep battery fresh.",
+        f"- Aircraft profile: {pulse.aircraft_name}.",
+        f"- Fly/Log test axis: {pulse.test_axis}.",
         "- Verify test-stand throttle before relying on Level or Fly/Log.",
         f"- Active Level/FlyLog test throttle: {throttle.level_test_throttle_us} us. This is the value the program will use.",
         f"- Hover throttle estimate only: {throttle.hover_throttle_us} us. This is a reference number, not an automatic throttle change.",
         "- Do not raise the test throttle toward hover until the stand test has been verified safe.",
+        "- For a one-axis rig, zero the inactive axis in the INAV mixer before logging that axis.",
+        "",
+        "Test pulse profile",
+        f"- Start probe: +/-{pulse.probe_force_us} us for {pulse.probe_hold_s:.2f} s.",
+        f"- Main Fly/Log pulse: +/-{pulse.main_force_us} us for {pulse.main_hold_s:.2f} s on {pulse.test_axis}.",
+        f"- Neutral wait after each main pulse: {pulse.neutral_wait_ms} ms.",
+        "- Main Fly/Log sample count: 10 positive and 10 negative pulses.",
+        f"- Target one-axis peak response: {pulse.target_response_min_deg:.0f}-{pulse.target_response_max_deg:.0f} deg.",
+        "- Reduce pulse force if the rig rebounds, clips, or approaches a hard stop.",
         "",
         "Throttle verification target",
         _format_throttle_lift_target(throttle),
@@ -397,6 +540,8 @@ def format_pid_tuning_plan(recommendation: PStartRecommendation) -> str:
         "Why this P start was chosen",
     ]
     lines.extend(f"- {note}" for note in recommendation.notes)
+    lines.extend(["", "Why this pulse profile was chosen"])
+    lines.extend(f"- {note}" for note in pulse.notes)
     return "\n".join(lines).strip()
 
 def generate_pid_tuning_plan_report(
@@ -461,6 +606,7 @@ def load_pid_tuning_plan(plan_text_path: str | Path) -> LoadedPIDTuningPlan:
             i_sweep=_pair_rows(workflow.get("i_sweep", I_SWEEP_VALUES)),
             ff_sweep=_pair_rows(workflow.get("ff_sweep", FF_SWEEP_VALUES)),
             level_test_throttle_us=_optional_int(throttle_payload.get("level_test_throttle_us")),
+            test_pulse_profile=_test_pulse_profile_from_payload(payload.get("test_pulse_profile")),
         )
     return _load_pid_tuning_plan_from_text(text_path, text)
 
@@ -545,6 +691,7 @@ def _load_pid_tuning_plan_from_text(text_path: Path, text: str) -> LoadedPIDTuni
         i_sweep=i_rows if i_rows else I_SWEEP_VALUES,
         ff_sweep=ff_rows if ff_rows else FF_SWEEP_VALUES,
         level_test_throttle_us=level_throttle[0] if level_throttle else None,
+        test_pulse_profile=_test_pulse_profile_from_text(text),
     )
 
 
@@ -582,6 +729,53 @@ def _optional_int(value: object) -> int | None:
     if value is None:
         return None
     return int(value)
+
+
+def _test_pulse_profile_from_payload(payload: object) -> TestPulseProfile | None:
+    if not isinstance(payload, dict):
+        return None
+    try:
+        raw_notes = payload.get("notes", ())
+        notes = tuple(str(item) for item in raw_notes) if isinstance(raw_notes, (list, tuple)) else ()
+        return TestPulseProfile(
+            aircraft_name=str(payload.get("aircraft_name", "Custom")),
+            test_axis=_choice(str(payload.get("test_axis", "roll")), TEST_AXIS_VALUES, "roll"),
+            probe_force_us=int(payload["probe_force_us"]),
+            probe_hold_s=float(payload["probe_hold_s"]),
+            main_force_us=int(payload["main_force_us"]),
+            main_hold_s=float(payload["main_hold_s"]),
+            neutral_wait_ms=int(payload["neutral_wait_ms"]),
+            target_response_min_deg=float(payload["target_response_min_deg"]),
+            target_response_max_deg=float(payload["target_response_max_deg"]),
+            notes=notes,
+        )
+    except Exception:
+        return None
+
+
+def _test_pulse_profile_from_text(text: str) -> TestPulseProfile | None:
+    aircraft_match = re.search(r"-\s*Aircraft profile:\s*([^\n.]+)", text, flags=re.IGNORECASE)
+    axis_match = re.search(r"-\s*Fly/Log test axis:\s*(roll|pitch)", text, flags=re.IGNORECASE)
+    probe = _line_ints(text, r"-\s*Start probe:\s*\+/-\s*(\d+)\s*us")
+    main = _line_ints(text, r"-\s*Main Fly/Log pulse:\s*\+/-\s*(\d+)\s*us")
+    neutral = _line_ints(text, r"-\s*Neutral wait after each main pulse:\s*(\d+)\s*ms")
+    response = _line_ints(text, r"-\s*Target one-axis peak response:\s*(\d+)\s*-\s*(\d+)\s*deg")
+    probe_hold_match = re.search(r"-\s*Start probe:.*?for\s*([0-9.]+)\s*s", text, flags=re.IGNORECASE)
+    main_hold_match = re.search(r"-\s*Main Fly/Log pulse:.*?for\s*([0-9.]+)\s*s", text, flags=re.IGNORECASE)
+    if not probe or not main or probe_hold_match is None or main_hold_match is None:
+        return None
+    return TestPulseProfile(
+        aircraft_name=aircraft_match.group(1).strip() if aircraft_match else "Custom",
+        test_axis=_choice(axis_match.group(1) if axis_match else "roll", TEST_AXIS_VALUES, "roll"),
+        probe_force_us=probe[0],
+        probe_hold_s=float(probe_hold_match.group(1)),
+        main_force_us=main[0],
+        main_hold_s=float(main_hold_match.group(1)),
+        neutral_wait_ms=neutral[0] if neutral else 300,
+        target_response_min_deg=float(response[0]) if len(response) >= 2 else 8.0,
+        target_response_max_deg=float(response[1]) if len(response) >= 2 else 25.0,
+        notes=(),
+    )
 
 
 def _p_sweep(start: int) -> tuple[int, ...]:

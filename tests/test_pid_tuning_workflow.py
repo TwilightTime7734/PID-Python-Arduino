@@ -6,6 +6,8 @@ from pathlib import Path
 from modbus_app.pid_tuning_workflow import (
     PAVO_PICO_II_PRESET_INPUTS,
     PStartInputs,
+    SEVEN_INCH_PRESET_INPUTS,
+    TEN_INCH_PRESET_INPUTS,
     find_latest_pid_tuning_plan,
     format_pid_tuning_plan,
     generate_pid_tuning_plan_report,
@@ -53,6 +55,8 @@ class PIDTuningWorkflowTests(unittest.TestCase):
         self.assertGreaterEqual(recommendation.start_p["pitch"], 15)
 
     def test_pavo_pico_ii_preset_uses_stock_betafpv_specs(self) -> None:
+        self.assertEqual(PAVO_PICO_II_PRESET_INPUTS.aircraft_name, "BETAFPV Pavo Pico 2")
+        self.assertEqual(PAVO_PICO_II_PRESET_INPUTS.test_axis, "roll")
         self.assertEqual(PAVO_PICO_II_PRESET_INPUTS.all_up_weight_g, 83)
         self.assertEqual(PAVO_PICO_II_PRESET_INPUTS.motor_kv, 14000)
         self.assertEqual(PAVO_PICO_II_PRESET_INPUTS.prop_diameter_in, 1.77)
@@ -60,6 +64,25 @@ class PIDTuningWorkflowTests(unittest.TestCase):
         self.assertEqual(PAVO_PICO_II_PRESET_INPUTS.battery_cells, 2)
         self.assertEqual(PAVO_PICO_II_PRESET_INPUTS.battery_chemistry, "lihv")
         self.assertEqual(PAVO_PICO_II_PRESET_INPUTS.motor_count, 4)
+
+    def test_large_aircraft_presets_have_smaller_pulses_than_pavo(self) -> None:
+        pavo = suggest_starting_p(PAVO_PICO_II_PRESET_INPUTS).test_pulse_profile
+        seven = suggest_starting_p(SEVEN_INCH_PRESET_INPUTS).test_pulse_profile
+        ten = suggest_starting_p(TEN_INCH_PRESET_INPUTS).test_pulse_profile
+
+        self.assertEqual(seven.aircraft_name, "7 inch quad")
+        self.assertEqual(ten.aircraft_name, "10 inch quad")
+        self.assertLess(seven.main_force_us, pavo.main_force_us)
+        self.assertLess(ten.main_force_us, seven.main_force_us)
+        self.assertLessEqual(ten.main_hold_s, seven.main_hold_s)
+
+    def test_selected_test_axis_is_saved_in_pulse_profile(self) -> None:
+        recommendation = suggest_starting_p(PStartInputs(test_axis="pitch"))
+
+        self.assertEqual(recommendation.test_pulse_profile.test_axis, "pitch")
+        plan = format_pid_tuning_plan(recommendation)
+        self.assertIn("- Fly/Log test axis: pitch.", plan)
+        self.assertIn("10 positive and 10 negative pulses", plan)
 
     def test_report_generation_writes_text_and_summary(self) -> None:
         recommendation = suggest_starting_p(PStartInputs())
@@ -74,6 +97,7 @@ class PIDTuningWorkflowTests(unittest.TestCase):
             self.assertEqual(summary["plan"]["format"], "sample")
             self.assertEqual(summary["plan"]["text"], plan_text)
             self.assertIn("Once the 'Fly/Log' button is pressed", summary["plan"]["text"])
+            self.assertEqual(summary["test_pulse_profile"]["main_force_us"], recommendation.test_pulse_profile.main_force_us)
 
     def test_load_generated_pid_tuning_plan_uses_summary_values(self) -> None:
         recommendation = suggest_starting_p(PAVO_PICO_II_PRESET_INPUTS)
@@ -88,6 +112,8 @@ class PIDTuningWorkflowTests(unittest.TestCase):
             self.assertEqual(loaded.d_sweep, (17, 23, 30, 36, 42))
             self.assertIsNone(loaded.optional_d)
             self.assertEqual(loaded.yaw_final_pid_ff, recommendation.yaw_final_pid_ff)
+            self.assertIsNotNone(loaded.test_pulse_profile)
+            self.assertEqual(loaded.test_pulse_profile, recommendation.test_pulse_profile)
 
     def test_find_latest_pid_tuning_plan_returns_newest_text_file(self) -> None:
         recommendation = suggest_starting_p(PStartInputs())

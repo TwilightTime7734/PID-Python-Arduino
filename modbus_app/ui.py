@@ -309,6 +309,10 @@ class MainUi:
     analyze_blackbox_button: tk.Button
     arduino_button: tk.Button
     fly_log_button: tk.Button
+    pulse_force_combo: ttk.Combobox
+    pulse_time_combo: ttk.Combobox
+    pulse_positive_button: tk.Button
+    pulse_negative_button: tk.Button
     simulation_mode_var: tk.BooleanVar
     simulation_mode_checkbutton: tk.Checkbutton
     step_response_button: tk.Button
@@ -484,8 +488,42 @@ def build_main_gui(root: tk.Tk) -> MainUi:
 
     auto_action_frame = tk.Frame(auto_frame)
     auto_action_frame.grid(row=0, column=0, sticky="w", pady=(0, 6))
-    fly_log_button = tk.Button(auto_action_frame, text="Test", width=18)
+    fly_log_button = tk.Button(auto_action_frame, text="Fly / Log", width=18)
     fly_log_button.pack(side="left", padx=(0, 4))
+    tk.Label(auto_action_frame, text="Pulse us").pack(side="left", padx=(4, 2))
+    pulse_force_combo = ttk.Combobox(
+        auto_action_frame,
+        width=5,
+        values=("60", "70", "80", "90", "100", "110", "125", "150"),
+    )
+    pulse_force_combo.pack(side="left", padx=(0, 4))
+    tk.Label(auto_action_frame, text="Time s").pack(side="left", padx=(2, 2))
+    pulse_time_combo = ttk.Combobox(
+        auto_action_frame,
+        width=5,
+        values=("0.20", "0.25", "0.30", "0.35", "0.40", "0.50"),
+    )
+    pulse_time_combo.pack(side="left", padx=(0, 4))
+    pulse_negative_button = tk.Button(
+        auto_action_frame,
+        text="- Pulse",
+        width=8,
+        bg="#dc3545",
+        fg="white",
+        activebackground="#bb2d3b",
+        activeforeground="white",
+    )
+    pulse_negative_button.pack(side="left", padx=(0, 4))
+    pulse_positive_button = tk.Button(
+        auto_action_frame,
+        text="+ Pulse",
+        width=8,
+        bg="#198754",
+        fg="white",
+        activebackground="#157347",
+        activeforeground="white",
+    )
+    pulse_positive_button.pack(side="left", padx=(0, 8))
     step_response_button = tk.Button(auto_action_frame, text="Chart Step Response", width=18)
     step_response_button.pack(side="left", padx=(0, 4))
     pid_tuning_plan_button = tk.Button(auto_action_frame, text="PID Tuning Plan", width=16)
@@ -577,6 +615,10 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         analyze_blackbox_button=analyze_blackbox_button,
         arduino_button=arduino_button,
         fly_log_button=fly_log_button,
+        pulse_force_combo=pulse_force_combo,
+        pulse_time_combo=pulse_time_combo,
+        pulse_positive_button=pulse_positive_button,
+        pulse_negative_button=pulse_negative_button,
         simulation_mode_var=simulation_mode_var,
         simulation_mode_checkbutton=simulation_mode_checkbutton,
         step_response_button=step_response_button,

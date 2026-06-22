@@ -79,6 +79,7 @@ class RuntimeStateController:
         self_.auto_tick_after_id: str | None = None
         self_.auto_hold_after_id: str | None = None
         self_.fly_log_marker_after_id: str | None = None
+        self_.manual_pulse_inflight = False
         self_.auto_pulse_inflight = False
         self_.auto_hold_end_requested = False
         self_.auto_settle_until_s: float | None = None

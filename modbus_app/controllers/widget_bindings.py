@@ -40,6 +40,10 @@ class WidgetBindings:
         app.analyze_blackbox_button = ui.analyze_blackbox_button
         app.arduino_button = ui.arduino_button
         app.fly_log_button = ui.fly_log_button
+        app.pulse_force_combo = ui.pulse_force_combo
+        app.pulse_time_combo = ui.pulse_time_combo
+        app.pulse_positive_button = ui.pulse_positive_button
+        app.pulse_negative_button = ui.pulse_negative_button
         app.simulation_mode_var = ui.simulation_mode_var
         app.simulation_mode_checkbutton = ui.simulation_mode_checkbutton
         app.step_response_button = ui.step_response_button

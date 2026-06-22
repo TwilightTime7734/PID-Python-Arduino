@@ -2,12 +2,13 @@
 
 The current Fly/Log test routine sends repeatable RC pulses:
 
-    pitch + - - + -> optional slow center adjust -> roll + - - +
+    selected axis + - -> optional slow center adjust -> repeat
 
-This module finds those main +/-125us pulses from decoded Blackbox CSV files,
+This module finds the configured main pulses from decoded Blackbox CSV files,
 ignores the smaller center-adjust pulses for PID sample metrics, and writes a
 compact CSV/JSON/text summary that can be used before deeper PIDtoolbox-style
-analysis.
+analysis. The CH8 marker window defines the analysis range; no fixed pulse
+count is required.
 """
 
 from __future__ import annotations
@@ -25,12 +26,10 @@ import numpy as np
 from .blackbox_trace_viewer import _pick_column, detect_time_column, load_blackbox_csv
 
 
-MAIN_PULSE_THRESHOLD_US = 90.0
+MAIN_PULSE_THRESHOLD_US = 60.0
 MIN_MAIN_PULSE_S = 0.18
-EXPECTED_GROUPS = 6
-PULSES_PER_AXIS_SECTION = 4
-PULSES_PER_GROUP = 8
-EXPECTED_SIGNS = (1, -1, -1, 1)
+PULSES_PER_GROUP = 2
+EXPECTED_SIGNS = (1, -1)
 
 # The slow-center routine uses much smaller and shorter nudges than the main
 # test pulses. These are reported, but never counted as PID response samples.
@@ -43,7 +42,7 @@ CENTER_PULSE_MAX_S = 0.18
 # is worth feeding into the response analyzer, not for making PID changes yet.
 MIN_USEFUL_RESPONSE_DEG = 8.0
 MAX_SAFE_RESPONSE_DEG = 42.0
-MIN_EXPECTED_DURATION_S = 0.28
+MIN_EXPECTED_DURATION_S = 0.18
 MAX_EXPECTED_DURATION_S = 0.44
 
 
@@ -307,17 +306,13 @@ def analyze_flylog_csv(
     )
     raw_center_adjusts.sort(key=lambda item: float(item["start_s"]))
 
-    expected_total = EXPECTED_GROUPS * PULSES_PER_GROUP
-    if len(raw_pulses) != expected_total:
-        warnings.append(f"Detected {len(raw_pulses)} main pulses; expected {expected_total} for 6 full groups.")
-
     metrics: list[FlyLogPulseMetric] = []
     for pulse_index, pulse in enumerate(raw_pulses, start=1):
         group_index = ((pulse_index - 1) // PULSES_PER_GROUP) + 1
         pos_in_group = (pulse_index - 1) % PULSES_PER_GROUP
-        axis_pos = pos_in_group % PULSES_PER_AXIS_SECTION
-        expected_axis = "pitch" if pos_in_group < PULSES_PER_AXIS_SECTION else "roll"
-        expected_sign = EXPECTED_SIGNS[axis_pos]
+        group_start = ((group_index - 1) * PULSES_PER_GROUP)
+        group_axis = str(raw_pulses[group_start]["axis"]) if group_start < len(raw_pulses) else str(pulse["axis"])
+        expected_sign = EXPECTED_SIGNS[pos_in_group]
         actual_axis = str(pulse["axis"])
         actual_sign = int(pulse["sign"])
         next_start_s = None
@@ -331,10 +326,10 @@ def analyze_flylog_csv(
                 pulse=pulse,
                 pulse_index=pulse_index,
                 group_index=group_index,
-                pulse_in_axis=axis_pos + 1,
-                expected_axis=expected_axis,
+                pulse_in_axis=pos_in_group + 1,
+                expected_axis=group_axis,
                 expected_sign=expected_sign,
-                sequence_ok=(actual_axis == expected_axis and actual_sign == expected_sign),
+                sequence_ok=(actual_axis == group_axis and actual_sign == expected_sign),
                 next_start_s=next_start_s,
             )
         )
@@ -344,12 +339,14 @@ def analyze_flylog_csv(
 
     pitch_metrics = [m for m in metrics if m.axis == "pitch"]
     roll_metrics = [m for m in metrics if m.axis == "roll"]
-    complete_groups = sum(1 for group in groups if group.pitch_pulses == 4 and group.roll_pulses == 4)
+    complete_groups = sum(1 for group in groups if _group_is_complete(group))
     usable_groups = sum(1 for group in groups if group.quality in {"good", "usable"})
     clean_groups = sum(1 for group in groups if group.quality == "good")
     center_adjusted_groups = len({item.group for item in center_adjusts if item.group > 0})
     if any(not item.sequence_ok for item in metrics):
-        warnings.append("One or more pulses did not match the expected pitch/roll + - - + order.")
+        warnings.append("One or more pulses did not match the expected one-axis + - pair order.")
+    if pitch_metrics and roll_metrics:
+        warnings.append("Detected main pulses on both roll and pitch inside the marker window.")
 
     summary = FlyLogLogSummary(
         log_label=log_label,
@@ -648,24 +645,32 @@ def _build_group_metrics(
     center_adjusts: list[FlyLogCenterAdjustMetric],
 ) -> list[FlyLogGroupMetric]:
     groups: list[FlyLogGroupMetric] = []
-    max_group = max(EXPECTED_GROUPS, max([m.group for m in metrics] + [0]))
+    max_group = max([m.group for m in metrics] + [0])
     for group_index in range(1, max_group + 1):
         group_pulses = [m for m in metrics if m.group == group_index]
         pitch = [m for m in group_pulses if m.axis == "pitch"]
         roll = [m for m in group_pulses if m.axis == "roll"]
         center_count = sum(1 for m in center_adjusts if m.group == group_index)
-        pitch_sequence_ok = _axis_sequence_ok(pitch)
-        roll_sequence_ok = _axis_sequence_ok(roll)
+        pitch_sequence_ok = _axis_sequence_ok(pitch) if pitch else True
+        roll_sequence_ok = _axis_sequence_ok(roll) if roll else True
+        active_axis = _group_active_axis(pitch, roll)
+        group_complete = (
+            active_axis is not None
+            and len(group_pulses) == PULSES_PER_GROUP
+            and ((active_axis == "pitch" and pitch_sequence_ok) or (active_axis == "roll" and roll_sequence_ok))
+        )
         warnings: list[str] = []
-        if len(pitch) != 4:
-            warnings.append(f"pitch pulse count {len(pitch)}/4")
-        if len(roll) != 4:
-            warnings.append(f"roll pulse count {len(roll)}/4")
-        if not pitch_sequence_ok:
-            warnings.append("pitch sequence not + - - +")
-        if not roll_sequence_ok:
-            warnings.append("roll sequence not + - - +")
+        if len(group_pulses) != PULSES_PER_GROUP:
+            warnings.append(f"pulse count {len(group_pulses)}/{PULSES_PER_GROUP}")
+        if pitch and roll:
+            warnings.append("mixed roll/pitch pulses in one pair")
+        if pitch and not pitch_sequence_ok:
+            warnings.append("pitch sequence not + -")
+        if roll and not roll_sequence_ok:
+            warnings.append("roll sequence not + -")
         for axis_name, pulses in (("pitch", pitch), ("roll", roll)):
+            if not pulses:
+                continue
             response = _median_or_none([abs(p.response_deg) for p in pulses if p.response_deg is not None])
             if response is None:
                 warnings.append(f"{axis_name} response unavailable")
@@ -676,7 +681,7 @@ def _build_group_metrics(
         if center_count:
             warnings.append(f"center adjust pulses {center_count}")
 
-        if len(pitch) != 4 or len(roll) != 4 or not pitch_sequence_ok or not roll_sequence_ok:
+        if not group_complete:
             quality = "bad"
         elif any("response large" in item for item in warnings):
             quality = "usable"
@@ -706,10 +711,25 @@ def _build_group_metrics(
 
 
 def _axis_sequence_ok(metrics: list[FlyLogPulseMetric]) -> bool:
-    if len(metrics) != PULSES_PER_AXIS_SECTION:
+    if len(metrics) != PULSES_PER_GROUP:
         return False
     signs = tuple(1 if m.actual_direction == "+" else -1 for m in sorted(metrics, key=lambda item: item.pulse_in_axis))
     return signs == EXPECTED_SIGNS
+
+
+def _group_active_axis(pitch: list[FlyLogPulseMetric], roll: list[FlyLogPulseMetric]) -> str | None:
+    if len(pitch) == PULSES_PER_GROUP and not roll:
+        return "pitch"
+    if len(roll) == PULSES_PER_GROUP and not pitch:
+        return "roll"
+    return None
+
+
+def _group_is_complete(group: FlyLogGroupMetric) -> bool:
+    return (
+        (group.pitch_pulses == PULSES_PER_GROUP and group.roll_pulses == 0 and group.pitch_sequence_ok)
+        or (group.roll_pulses == PULSES_PER_GROUP and group.pitch_pulses == 0 and group.roll_sequence_ok)
+    )
 
 
 def _detect_marker_window(csv_path: Path, time_s: np.ndarray) -> _MarkerWindow:
@@ -854,7 +874,8 @@ def _format_summary_text(
 ) -> str:
     lines: list[str] = [
         "Deterministic Fly/Log sample extraction",
-        "Finds the main +/-125us Pitch/Roll pulses inside the CH8 marker window and ignores smaller center-adjust pulses.",
+        "Finds the main configured one-axis pulses inside the CH8 marker window and ignores smaller center-adjust pulses.",
+        "The CH8 marker window defines the analysis range; no fixed pulse count is required.",
         "Quality terms: good = complete/no warnings, usable = complete with warnings, bad = missing or wrong sequence.",
         "",
     ]
@@ -869,9 +890,10 @@ def _format_summary_text(
             lines.append(
                 f"- marker window: {summary.marker_column}, {summary.marker_start_s:.2f}s to {summary.marker_end_s:.2f}s"
             )
+        log_groups = [group for group in groups if group.log_label == summary.log_label]
         lines.append(
-            f"- groups: {summary.complete_groups}/{EXPECTED_GROUPS} complete, "
-            f"{summary.usable_groups}/{EXPECTED_GROUPS} usable, {summary.clean_groups}/{EXPECTED_GROUPS} clean"
+            f"- pulse pairs: {summary.complete_groups}/{len(log_groups)} complete, "
+            f"{summary.usable_groups} usable, {summary.clean_groups} clean"
         )
         lines.append(
             f"- main pulses: {summary.pulse_count} total, {summary.pitch_pulses} pitch, {summary.roll_pulses} roll"
@@ -892,7 +914,6 @@ def _format_summary_text(
         for warning in summary.warnings:
             lines.append(f"- warning: {warning}")
 
-        log_groups = [group for group in groups if group.log_label == summary.log_label]
         if log_groups:
             lines.append("- group quality:")
             for group in log_groups:
@@ -907,12 +928,12 @@ def _format_summary_text(
 
     bad_sequence = [item for item in metrics if not item.sequence_ok]
     if bad_sequence:
-        lines.append(f"Sequence warnings: {len(bad_sequence)} pulse(s) did not match expected group order.")
+        lines.append(f"Sequence warnings: {len(bad_sequence)} pulse(s) did not match expected one-axis + - order.")
         lines.append("")
 
     lines.append("Files written:")
     lines.append("- flylog_samples.csv: one row per detected main pulse")
-    lines.append("- flylog_groups.csv: one row per 8-pulse Pitch/Roll group")
+    lines.append("- flylog_groups.csv: one row per detected +,- pulse pair")
     lines.append("- flylog_center_adjustments.csv: one row per small center nudge")
     lines.append("- flylog_samples.json: machine-readable version of all Fly/Log sample data")
     lines.append("- flylog_samples_summary.txt: this summary")
