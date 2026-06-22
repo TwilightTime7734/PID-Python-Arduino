@@ -8,8 +8,6 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
-from .constants import PID_PLAN_FLY_LOG_RUNTIME_S
-
 TUNED_AXES = ("roll", "pitch")
 START_P_DEFAULTS = {"roll": 45, "pitch": 47, "yaw": 45}
 START_I_DEFAULTS = {"roll": 30, "pitch": 35}

@@ -10,7 +10,6 @@ import serial
 from .constants import (
     BAUDRATE,
     BOOT_WAIT,
-    EXPECTED_FIRMWARE_VERSION,
     FRAME_US,
     PAUSE_US,
     READ,
@@ -165,20 +164,10 @@ def read_firmware_version_on_serial(ser: serial.Serial, max_count: int) -> str:
     return f"{major}.{minor}.{patch}"
 
 
-def firmware_version_warning_on_serial(ser: serial.Serial, max_count: int) -> str | None:
-    try:
-        device_version = read_firmware_version_on_serial(ser, max_count)
-    except Exception as exc:
-        return f"Firmware version check failed: expected {EXPECTED_FIRMWARE_VERSION}, reason: {exc}"
-    if device_version != EXPECTED_FIRMWARE_VERSION:
-        return f"Firmware version mismatch: expected {EXPECTED_FIRMWARE_VERSION}, device reports {device_version}."
-    return None
-
-
 def run_ppm_on_serial(ser: serial.Serial, channels: list[int], offsets: list[int]) -> tuple[int, int, str | None]:
     quant, max_count = read_regs(ser, REG_QUANT, 2)
     write_ppm_channels_on_serial(ser, quant, max_count, channels, offsets)
-    return quant, max_count, firmware_version_warning_on_serial(ser, max_count)
+    return quant, max_count, None
 
 
 def stop_ppm_on_serial(ser: serial.Serial) -> None:

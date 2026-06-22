@@ -129,11 +129,11 @@ class DeterministicFlyLogWorkflow:
         # hide a tilted startup position.
         sample = None
         try:
-            sample = self.app.fc_service.latest_absolute_attitude()
+            sample = self.app.attitude_service.latest_absolute_attitude()
         except Exception:
             sample = None
         if sample is None:
-            sample = self.app.fc_service.latest_attitude()
+            sample = self.app.attitude_service.latest_attitude()
         if sample is None:
             return False, ""
         roll = float(sample.roll_deg)
@@ -339,7 +339,7 @@ class DeterministicFlyLogWorkflow:
             self.auto_abort(reason, continue_pipeline=False)
             return
 
-        sample = app.fc_service.latest_attitude()
+        sample = app.attitude_service.latest_attitude()
         if sample is None:
             self._trace(f"Center check {context}: no attitude sample available; continuing.")
             next_callback()
@@ -382,7 +382,7 @@ class DeterministicFlyLogWorkflow:
             self.auto_abort(reason, continue_pipeline=False)
             return
 
-        sample = app.fc_service.latest_attitude()
+        sample = app.attitude_service.latest_attitude()
         if sample is None:
             self._trace(f"Center adjust {context}: no attitude sample available; continuing.")
             next_callback()

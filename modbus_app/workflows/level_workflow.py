@@ -57,9 +57,9 @@ class LevelWorkflow:
         self.get_test_throttle_us = get_test_throttle_us
         self.set_error = set_error
 
-    def refresh_button_state(self, fc_connected: bool) -> None:
+    def refresh_button_state(self, attitude_connected: bool) -> None:
         app = self.app
-        level_ready = app.controller.is_connected and fc_connected
+        level_ready = app.controller.is_connected and attitude_connected
         if app.level_active and not level_ready:
             self.stop(update_status=False)
         app.level_button.config(
@@ -122,8 +122,8 @@ class LevelWorkflow:
         if not self.arduino_output_connected():
             self.stop(update_status=True, reason="Auto-level stopped: output is not running.")
             return
-        if not app.fc_service.is_connected:
-            self.stop(update_status=True, reason="Auto-level stopped: FC is disconnected.")
+        if not app.attitude_service.is_connected:
+            self.stop(update_status=True, reason="Auto-level stopped: attitude board is disconnected.")
             return
         if app.level_timeout_deadline_s is not None and time.monotonic() >= app.level_timeout_deadline_s:
             self.stop(
@@ -148,13 +148,13 @@ class LevelWorkflow:
             self.schedule_step()
             return
 
-        sample = app.fc_service.latest_attitude()
+        sample = app.attitude_service.latest_attitude()
         if sample is None:
             self.schedule_step()
             return
         absolute_sample = None
         try:
-            absolute_sample = app.fc_service.latest_absolute_attitude()
+            absolute_sample = app.attitude_service.latest_absolute_attitude()
         except Exception:
             absolute_sample = None
         safety_sample = absolute_sample or sample
@@ -261,7 +261,7 @@ class LevelWorkflow:
                 return
             reference = None
             try:
-                reference = app.fc_service.attitude_reference()
+                reference = app.attitude_service.attitude_reference()
             except Exception:
                 reference = None
             ref_text = ""
@@ -288,16 +288,16 @@ class LevelWorkflow:
                 return
             if not self.arduino_output_connected():
                 raise RuntimeError("Press Connect Arduino before using Level.")
-            if not app.fc_service.is_connected:
-                raise RuntimeError("Connect FC before using Level.")
+            if not app.attitude_service.is_connected:
+                raise RuntimeError("Connect Arduino/attitude board before using Level.")
             reference_ready = True
             try:
-                reference_ready = app.fc_service.attitude_reference_ready()
+                reference_ready = app.attitude_service.attitude_reference_ready()
             except Exception:
-                reference_ready = app.fc_service.latest_attitude() is not None
-            if not reference_ready or app.fc_service.latest_attitude() is None:
+                reference_ready = app.attitude_service.latest_attitude() is not None
+            if not reference_ready or app.attitude_service.latest_attitude() is None:
                 raise RuntimeError(
-                    "No FC level reference yet. Keep the drone still for 3 seconds after FC connect, "
+                    "No attitude-board level reference yet. Keep the drone still for 3 seconds after Arduino connect, "
                     "then press Level again."
                 )
             app.level_active = True

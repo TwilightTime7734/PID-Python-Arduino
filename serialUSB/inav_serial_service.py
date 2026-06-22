@@ -1,11 +1,10 @@
-"""INAV MSP serial transport with background attitude polling."""
+"""INAV MSP serial transport for arm state and PID/FF settings only."""
 
 from __future__ import annotations
 
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime
 
 import serial
 
@@ -13,7 +12,6 @@ MSP_API_VERSION = 1
 MSP_FC_VARIANT = 2
 MSP_FC_VERSION = 3
 MSP_STATUS = 101
-MSP_ATTITUDE = 108
 MSP_EEPROM_WRITE = 250
 MSP2_COMMON_SETTING = 0x1003
 MSP2_COMMON_SET_SETTING = 0x1004
@@ -36,14 +34,6 @@ FF_SETTING_NAME = {
     "pitch": "mc_cd_pitch",
     "yaw": "mc_cd_yaw",
 }
-
-
-@dataclass(frozen=True)
-class AttitudeSample:
-    roll_deg: float
-    pitch_deg: float
-    yaw_deg: float
-    timestamp_local: datetime
 
 
 @dataclass(frozen=True)
@@ -220,20 +210,6 @@ def _build_msp_v2_request(command_id: int, payload: bytes) -> bytes:
     return b"$X<" + header + payload + bytes([checksum])
 
 
-def _parse_attitude_payload(payload: bytes) -> AttitudeSample:
-    if len(payload) < 6:
-        raise RuntimeError(f"Invalid MSP_ATTITUDE payload length: {len(payload)}")
-    roll_raw = int.from_bytes(payload[0:2], byteorder="little", signed=True)
-    pitch_raw = int.from_bytes(payload[2:4], byteorder="little", signed=True)
-    yaw_raw = int.from_bytes(payload[4:6], byteorder="little", signed=True)
-    return AttitudeSample(
-        roll_deg=roll_raw / 10.0,
-        pitch_deg=pitch_raw / 10.0,
-        yaw_deg=float(yaw_raw),
-        timestamp_local=datetime.now(),
-    )
-
-
 def _parse_armed_status_payload(payload: bytes) -> bool:
     if len(payload) < 10:
         raise RuntimeError(f"Invalid MSP_STATUS payload length: {len(payload)}")
@@ -289,12 +265,9 @@ class InavSerialService:
         self._write_lock = threading.Lock()
         self._pending_sync = threading.Condition()
         self._pending: _PendingRequest | None = None
-        self._attitude_sync = threading.Lock()
-        self._latest_attitude: AttitudeSample | None = None
         self._serial: serial.Serial | None = None
         self._stop_event = threading.Event()
         self._reader_thread: threading.Thread | None = None
-        self._poll_thread: threading.Thread | None = None
         self._setting_index_cache: dict[str, int] = {}
         self._port_name = ""
         self._baud_rate = 115200
@@ -333,23 +306,12 @@ class InavSerialService:
                 self.disconnect()
                 raise
 
-        with self._sync:
-            if self._poll_thread is None:
-                self._poll_thread = threading.Thread(
-                    target=self._attitude_poll_loop,
-                    name="INAV-MSP-AttitudePoll",
-                    daemon=True,
-                )
-                self._poll_thread.start()
-
     def disconnect(self) -> None:
         with self._sync:
             ser = self._serial
             reader = self._reader_thread
-            poller = self._poll_thread
             self._serial = None
             self._reader_thread = None
-            self._poll_thread = None
 
         self._stop_event.set()
         if ser is not None:
@@ -359,8 +321,6 @@ class InavSerialService:
             except Exception:
                 pass
 
-        if poller is not None:
-            poller.join(timeout=0.5)
         if reader is not None:
             reader.join(timeout=0.5)
 
@@ -372,25 +332,8 @@ class InavSerialService:
                 pending.done.set()
             self._pending_sync.notify_all()
 
-        with self._attitude_sync:
-            self._latest_attitude = None
         with self._sync:
             self._setting_index_cache.clear()
-
-    def read_attitude(self, timeout_seconds: float = 1.0) -> AttitudeSample:
-        with self._attitude_sync:
-            cached = self._latest_attitude
-            if cached is not None and (datetime.now() - cached.timestamp_local).total_seconds() <= 0.8:
-                return cached
-        payload = self._request(MSP_ATTITUDE, b"", timeout_seconds)
-        sample = _parse_attitude_payload(payload)
-        with self._attitude_sync:
-            self._latest_attitude = sample
-        return sample
-
-    def latest_attitude(self) -> AttitudeSample | None:
-        with self._attitude_sync:
-            return self._latest_attitude
 
     def is_armed(self, timeout_seconds: float = 0.8) -> bool:
         payload = self._request(MSP_STATUS, b"", timeout_seconds)
@@ -521,17 +464,6 @@ class InavSerialService:
         self._request(MSP_API_VERSION, b"", 1.0)
         self._request(MSP_FC_VERSION, b"", 1.0)
 
-    def _attitude_poll_loop(self) -> None:
-        while not self._stop_event.is_set():
-            try:
-                payload = self._request(MSP_ATTITUDE, b"", 0.25)
-                sample = _parse_attitude_payload(payload)
-                with self._attitude_sync:
-                    self._latest_attitude = sample
-            except Exception:
-                pass
-            self._stop_event.wait(0.045)
-
     def _read_loop(self) -> None:
         parser = _MspStreamParser()
         while not self._stop_event.is_set():
@@ -545,13 +477,6 @@ class InavSerialService:
                 frame = parser.push(b[0])
                 if frame is None or not frame.is_valid:
                     continue
-                if frame.command_id == MSP_ATTITUDE and len(frame.payload) >= 6:
-                    try:
-                        sample = _parse_attitude_payload(frame.payload)
-                        with self._attitude_sync:
-                            self._latest_attitude = sample
-                    except Exception:
-                        pass
                 with self._pending_sync:
                     pending = self._pending
                     if pending is not None and pending.command_id == frame.command_id and not pending.done.is_set():

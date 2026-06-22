@@ -1,21 +1,10 @@
 //    Arduino PPM Generator
 //    Copyright (C) 2015-2021  Alexandr Kolodkin <alexandr.kolodkin@gmail.com>
-//
-//    This program is free software: you can redistribute it and/or modify
-//    it under the terms of the GNU General Public License as published by
-//    the Free Software Foundation, either version 3 of the License, or
-//    (at your option) any later version.
-//
-//    This program is distributed in the hope that it will be useful,
-//    but WITHOUT ANY WARRANTY; without even the implied warranty of
-//    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-//    GNU General Public License for more details.
-//
-//    You should have received a copy of the GNU General Public License
-//    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-//    #include "src/SimpleModbusSlave/SimpleModbusSlave.h"
 
 #include "SimpleModbusSlave.h"
+#include "types.h"  // <--- Added your custom types here
+#include <Arduino_Modulino.h>
+#include <math.h>
 
 #if !defined(ARDUINO_ARCH_RENESAS)
 #error "This sketch now supports only Renesas boards (e.g., UNO R4)."
@@ -23,8 +12,6 @@
 
 #include "FspTimer.h"
 
-// Maximum number of channels
-#define MAX_COUNT 16
 #define DEBUG_PIN 9
 #define PPM_PIN 10
 
@@ -32,16 +19,6 @@
 static constexpr timer_source_div_t PPM_TIMER_DIV = TIMER_SOURCE_DIV_4;
 static constexpr uint32_t PPM_TIMER_DIV_VALUE = 4;
 static constexpr uint8_t PPM_TIMER_IRQ_PRIORITY = 8;
-#define FW_VERSION_MAJOR 1
-#define FW_VERSION_MINOR 0
-#define FW_VERSION_PATCH 1
-#define FW_VERSION_STR_1(v) #v
-#define FW_VERSION_STR(v) FW_VERSION_STR_1(v)
-static constexpr char FIRMWARE_VERSION[] = FW_VERSION_STR(FW_VERSION_MAJOR) "." FW_VERSION_STR(FW_VERSION_MINOR) "." FW_VERSION_STR(FW_VERSION_PATCH);
-
-const char * firmware_version_text() {
-	return FIRMWARE_VERSION;
-}
 
 enum State {
 	Pulse,       // N-th channel pulse
@@ -50,39 +27,9 @@ enum State {
 	FinishSync   // Sync pulse end
 };
 
-// little endian
-typedef union {
-	unsigned long raw;
-	struct {
-		word low;
-		word high;
-	};
-} long_t;
-
-typedef union __attribute__ ((packed)) {
-	word raw[16+MAX_COUNT];
-	struct __attribute__ ((packed)) {
-		word quant;               // 1 microsec in timer ticks
-		word max_count;           // Maximum number of channels
-		word state;               // 2 - On (inversion) / 1 - On / 0 - Off
-		word count;               // Number of channels (0 ... MAX_COUNT)
-		word pause;               // Pause duration in timer ticks
-		long_t sync;              // Synchronization pulse duration in timer ticks
-		word channel[MAX_COUNT];  // Pulse duration in timer ticks
-		word pulse_chl;           // Hold override channel index
-		word pulse_val;           // Hold override value in timer ticks
-		long_t pulse_dur;         // Hold override duration in microseconds (0 => end hold)
-		word pulse_seq;           // Incrementing command sequence
-		word pulse_status;        // 0 idle, 1 active, 2 rejected, 3 timeout-restored, 4 hold-ended
-		word fw_version_major;    // Read-only firmware semantic version major
-		word fw_version_minor;    // Read-only firmware semantic version minor
-		word fw_version_patch;    // Read-only firmware semantic version patch
-	};
-} regs_t;
-
 static_assert(sizeof(long_t) == (2U * sizeof(word)),
 	"long_t must stay exactly two Modbus words.");
-static_assert(sizeof(regs_t) == ((16U + MAX_COUNT) * sizeof(word)),
+static_assert(sizeof(regs_t) == sizeof(((regs_t*)0)->raw),
 	"regs_t layout no longer matches raw[] word count.");
 
 regs_t tmp;                   // Active configuration used by the ISR frame handoff
@@ -100,48 +47,77 @@ volatile word restore_channel[MAX_COUNT];
 
 byte const modbus_registers_count = sizeof(regs_t) / sizeof(word);
 
-static inline void refresh_version_registers() {
-	tmp.fw_version_major = FW_VERSION_MAJOR;
-	tmp.fw_version_minor = FW_VERSION_MINOR;
-	tmp.fw_version_patch = FW_VERSION_PATCH;
+// Create a ModulinoMovement object
+ModulinoMovement movement;
+
+static bool movement_ready = false;
+static unsigned long movement_last_poll_ms = 0;
+static constexpr unsigned long MOVEMENT_UPDATE_INTERVAL_MS = 20;  // 50 Hz max poll rate
+
+static inline int16_t scaled_i16(float value, float scale) {
+	if (isnan(value) || isinf(value)) {
+		return 0;
+	}
+	long scaled = lroundf(value * scale);
+	if (scaled > 32767L) {
+		return 32767;
+	}
+	if (scaled < -32768L) {
+		return -32768;
+	}
+	return (int16_t) scaled;
 }
+
+static void update_movement_registers() {
+	if (!movement_ready) {
+		modbus_regs.movement_status = 0;
+		return;
+	}
+
+	unsigned long now = millis();
+	if ((unsigned long)(now - movement_last_poll_ms) < MOVEMENT_UPDATE_INTERVAL_MS) {
+		return;
+	}
+	movement_last_poll_ms = now;
+
+	// available() prevents us from flagging an error just because the IMU has
+	// not produced another sample yet.
+	if (!movement.available()) {
+		if (modbus_regs.movement_status == 0) {
+			modbus_regs.movement_status = 1;
+		}
+		return;
+	}
+
+	if (!movement.update()) {
+		modbus_regs.movement_status = 3;
+		return;
+	}
+
+	float ax = movement.getX();
+	float ay = movement.getY();
+	float az = movement.getZ();
+
+	// Roll/pitch attitude derived from gravity. This is useful for centering on
+	// a test stand. Yaw attitude is not available from this 6-axis IMU alone.
+	int16_t roll_angle  = (int16_t)roundf(atan2f(ay, az) * (180.0f / PI));
+	int16_t pitch_angle = (int16_t)roundf(atan2f(ax, az) * (180.0f / PI));
+
+	modbus_regs.roll_angle = roll_angle;
+	modbus_regs.pitch_angle = pitch_angle;
+	modbus_regs.movement_millis.raw = now;
+	modbus_regs.movement_seq++;
+	if (modbus_regs.movement_seq == 0) {
+		modbus_regs.movement_seq = 1;
+	}
+	modbus_regs.movement_status = 2;
+}
+
 
 static inline void refresh_modbus_readonly_registers() {
 	modbus_regs.quant = tmp.quant;
 	modbus_regs.max_count = tmp.max_count;
 	modbus_regs.pulse_status = tmp.pulse_status;
-	modbus_regs.fw_version_major = tmp.fw_version_major;
-	modbus_regs.fw_version_minor = tmp.fw_version_minor;
-	modbus_regs.fw_version_patch = tmp.fw_version_patch;
-}
-
-static inline void copy_frame_fields(regs_t &dst, const regs_t &src) {
-	dst.state = src.state;
-	dst.count = src.count;
-	dst.pause = src.pause;
-	dst.sync = src.sync;
-	for (byte i = 0; i < MAX_COUNT; i++) {
-		dst.channel[i] = src.channel[i];
-	}
-}
-
-static inline bool frame_fields_differ(const regs_t &a, const regs_t &b) {
-	if (a.state != b.state || a.count != b.count || a.pause != b.pause || a.sync.raw != b.sync.raw) {
-		return true;
-	}
-	for (byte i = 0; i < MAX_COUNT; i++) {
-		if (a.channel[i] != b.channel[i]) {
-			return true;
-		}
-	}
-	return false;
-}
-
-static inline void copy_pulse_command_fields(regs_t &dst, const regs_t &src) {
-	dst.pulse_chl = src.pulse_chl;
-	dst.pulse_val = src.pulse_val;
-	dst.pulse_dur = src.pulse_dur;
-	dst.pulse_seq = src.pulse_seq;
 }
 
 static inline uint32_t duration_us_to_ticks(unsigned long duration_us) {
@@ -167,7 +143,7 @@ static inline void apply_frame_from_modbus() {
 	if (!timed_override_active) {
 		capture_restore_channels_from_tmp();
 	}
-	refresh_version_registers();
+	// refresh_version_registers();
 	interrupts();
 }
 
@@ -306,10 +282,8 @@ static inline void ppm_apply_output_mode() {
 	bool toggle_on_compare = ppm_duty < ppm_top;
 	uint8_t mode = 0;
 	if (ppm.state == 2) {
-		// Inverted: low at cycle start, then high after compare.
 		mode = toggle_on_compare ? 0x0BU : 0x08U;
 	} else {
-		// Non-inverted: high at cycle start, then low after compare.
 		mode = toggle_on_compare ? 0x17U : 0x14U;
 	}
 
@@ -380,7 +354,7 @@ static void ppm_prepare_next_cycle() {
 		break;
 	case FinishSync:
 		ppm_write_cycle_registers(ppm.sync.low, ppm.sync.low - ppm.pause);
-		ppm = tmp;  // Update settings at the end of the frame.
+		ppm = tmp;
 		sanitize_ppm_frame();
 		state = Pulse;
 		current = 0;
@@ -397,13 +371,10 @@ static void ppm_timer_callback(timer_callback_args_t * /*args*/) {
 	ppm_prepare_next_cycle();
 }
 
-// Controller initialization
 void setup() {
-	// Peripheral initialization
 	pinMode(DEBUG_PIN, OUTPUT);
 	ppm_set_idle_gpio_high();
 
-	// Initializing channel values
 	tmp.state = 0;
 	tmp.max_count = MAX_COUNT;
 	tmp.count = 8;
@@ -415,34 +386,28 @@ void setup() {
 	tmp.pulse_dur.raw = 0;
 	tmp.pulse_seq = 0;
 	tmp.pulse_status = 0;
+	tmp.movement_status = 0;
+	tmp.movement_seq = 0;
+	tmp.movement_millis.raw = 0;
+  tmp.roll_angle = 0;
+	tmp.pitch_angle = 0;
 
-	// Channel duration 300 us
+	// Initialize Modulino Movement without printing to Serial. Serial is used by
+	// SimpleModbusSlave, so sensor data is exposed through holding registers.
+	Modulino.begin();
+	movement_ready = movement.begin();
+	tmp.movement_status = movement_ready ? 1 : 0;
+
 	for (byte i = 0; i < MAX_COUNT; i++) {
 		tmp.channel[i] = 300 * (unsigned long) tmp.quant;
 	}
-	refresh_version_registers();
 	modbus_regs = tmp;
 	modbus_applied = modbus_regs;
 	refresh_modbus_readonly_registers();
 
-	// Configure MODBUS
 	slave.setup(115200);
-
-#ifdef DEBUG
-	Serial.println(tmp.state);
-	Serial.println(tmp.count);
-	Serial.println(tmp.pause);
-	Serial.println(tmp.sync.low);
-	Serial.println(tmp.sync.high);
-	Serial.println(tmp.sync.raw);
-
-	for (byte i = 0; i < MAX_COUNT; i++) {
-		Serial.println(tmp.channel[i]);
-	}
-#endif
 }
 
-// Main loop
 void loop() {
 	slave.loop(modbus_regs.raw, sizeof(modbus_regs) / sizeof(modbus_regs.raw[0]));
 
@@ -469,9 +434,9 @@ void loop() {
 	}
 
 	refresh_modbus_readonly_registers();
+	update_movement_registers();
 }
 
-// Run generation
 void Start() {
 	noInterrupts();
 	capture_restore_channels_from_tmp();
@@ -496,7 +461,6 @@ void Start() {
 		}
 		if (ppm_timer_ready) {
 			ppm_timer.set_period_buffer(false);
-			// Disable compare/period buffering so callback writes hit active registers immediately.
 			if (ppm_gpt_regs != nullptr) {
 				ppm_gpt_regs->GTBER_b.BD0 = 1;
 				ppm_gpt_regs->GTBER_b.BD1 = 1;
@@ -524,7 +488,6 @@ void Start() {
 	interrupts();
 }
 
-// Stop generation
 void Stop() {
 	noInterrupts();
 	ppm_running = false;

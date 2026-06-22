@@ -6,11 +6,13 @@ can run safely through SerialWorker and report back through callbacks.
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 import time
 
 from serialUSB.inav_serial_service import InavSerialService, send_cli_msc_command
 
+from ..attitude_service import AttitudeSample
 from ..auto_tune_report import generate_auto_tune_report
 from ..blackbox_import import (
     BlackboxImportResult,
@@ -57,6 +59,34 @@ def end_hold(worker_self: SerialWorker, channel_index: int):
     _, max_count = read_regs(worker_self.ser, REG_QUANT, 2)
     end_hold_on_serial(worker_self.ser, max_count, channel_index)
     return read_pulse_status_on_serial(worker_self.ser, max_count)
+
+
+def _as_signed_i16(value: int) -> int:
+    if value > 0x7FFF:
+        return value - 0x10000
+    return value
+
+
+def read_movement_attitude(worker_self: SerialWorker):
+    """Read attitude-board movement registers from the Modbus firmware."""
+    if worker_self.ser is None:
+        raise RuntimeError("Serial not open")
+    regs = read_regs(worker_self.ser, 29, 6)
+    if len(regs) < 6:
+        return None
+
+    movement_status = int(regs[0])
+    if movement_status != 2:
+        return None
+
+    roll_deg = float(_as_signed_i16(int(regs[4])))
+    pitch_deg = float(_as_signed_i16(int(regs[5])))
+    return AttitudeSample(
+        roll_deg=roll_deg,
+        pitch_deg=pitch_deg,
+        yaw_deg=0.0,
+        timestamp_local=datetime.now(),
+    )
 
 
 def read_fc_pid_ff(_worker_self: SerialWorker, fc_service: InavSerialService):

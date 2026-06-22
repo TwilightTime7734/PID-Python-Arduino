@@ -14,6 +14,7 @@ import serial
 
 from serialUSB.inav_serial_service import InavSerialService
 
+from ..attitude_service import AttitudeService
 from ..adaptive_session import (
     AdaptiveCommand,
     AdaptiveExcitationController,
@@ -56,7 +57,9 @@ class RuntimeStateController:
         self_.live_channel_outputs = self_.base_channel_outputs.copy()
         self_.worker = self_.controller.worker
         self_.fc_service = InavSerialService()
+        self_.attitude_service = AttitudeService()
         self_.fc_poll_after_id: str | None = None
+        self_.attitude_poll_inflight = False
 
         # Centralized `after_cancel()` bookkeeping.
         self_.timer_registry = TimerRegistry(self_.root.after_cancel)

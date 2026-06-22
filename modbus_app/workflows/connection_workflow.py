@@ -163,7 +163,7 @@ class ConnectionWorkflow:
 
         simulation_blocked = app.start_pending or arduino_connected or fc_connected
         app.simulation_mode_checkbutton.config(state="normal" if sim_mode or not simulation_blocked else "disabled")
-        self.refresh_level_button_state(fc_connected)
+        self.refresh_level_button_state(app.attitude_service.is_connected)
         self.refresh_fly_log_button_state()
 
     def connect_fc(self) -> None:
@@ -176,8 +176,6 @@ class ConnectionWorkflow:
             selected_port = self.fc_port()
             selected_baud = self.fc_baud()
             app.fc_service.connect(selected_port, selected_baud)
-            # Mirror Usb2Arduino flow: verify telemetry immediately, then load PID/FF asynchronously.
-            _ = app.fc_service.read_attitude(timeout_seconds=2.0)
             self.update_link_indicators()
             app.status.set(f"FC connected: {selected_port} @ {selected_baud}. Loading PID/FF...")
             self.queue_fc_pid_ff_refresh(selected_port, selected_baud)
@@ -194,9 +192,6 @@ class ConnectionWorkflow:
             if not app.is_closing:
                 self.set_error("FC disconnect error", exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
         finally:
-            app.horizon.set_attitude(0.0, 0.0)
-            app.roll_text.set("Roll: 0.0 deg")
-            app.pitch_text.set("Pitch: 0.0 deg")
             self.clear_pid_ff_displays()
             self.update_link_indicators()
             if update_status and not app.is_closing:
@@ -242,6 +237,7 @@ class ConnectionWorkflow:
             def on_start_done(ok: bool, res: object) -> None:
                 app.start_pending = False
                 if not ok:
+                    app.attitude_service.disconnect()
                     self.update_link_indicators()
                     self.set_error("Start error", res if isinstance(res, Exception) else RuntimeError(res))
                     return
@@ -256,6 +252,7 @@ class ConnectionWorkflow:
                     self.set_error("Start error", RuntimeError("Unexpected worker result from start task"))
                     return
                 app.base_channel_outputs = channels.copy()
+                app.attitude_service.connect()
                 self.set_live_channel_outputs(app.base_channel_outputs)
                 self.update_link_indicators()
                 version_warning = res[2]
@@ -289,6 +286,7 @@ class ConnectionWorkflow:
                 if res is not None:
                     self.set_error("Stop error", RuntimeError("Unexpected worker result from stop task"))
                     return
+                app.attitude_service.disconnect()
                 self.set_live_channel_outputs(self.parse_channel_values_with_defaults())
                 self.update_link_indicators()
                 app.status.set("PPM output stopped.")

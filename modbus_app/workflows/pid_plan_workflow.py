@@ -191,6 +191,24 @@ class PidPlanWorkflow:
                 if isinstance(widget, tk.Entry):
                     self._set_readonly_entry_text(widget, value)
 
+    @staticmethod
+    def starting_roll_pitch_target(plan: LoadedPIDTuningPlan) -> PidValues:
+        first_d = int(plan.d_sweep[0]) if plan.d_sweep else 0
+        return {
+            "roll": {
+                "p": int(plan.start_p.get("roll", 0)),
+                "i": int(plan.start_i.get("roll", 0)),
+                "d": first_d,
+                "ff": 0,
+            },
+            "pitch": {
+                "p": int(plan.start_p.get("pitch", 0)),
+                "i": int(plan.start_i.get("pitch", 0)),
+                "d": first_d,
+                "ff": 0,
+            },
+        }
+
     def generate_plan(self) -> None:
         app = self.app
         try:
@@ -212,6 +230,7 @@ class PidPlanWorkflow:
             self.populate_starting_values_table(loaded_plan)
             self.populate_roll_values_table(loaded_plan)
             self.populate_pitch_values_table(loaded_plan)
+            self.stage_pid_ff_values(self.starting_roll_pitch_target(loaded_plan))
             summary_text = self.format_generated_plan_summary(loaded_plan)
             self.set_test_throttle_us(recommendation.throttle_estimate.level_test_throttle_us, "generated PID plan")
             self.publish_auto_report(summary_text)

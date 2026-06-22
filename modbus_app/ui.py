@@ -477,7 +477,7 @@ def build_main_gui(root: tk.Tk) -> MainUi:
     fc_baud_entry.insert(0, str(FC_BAUD_DEFAULT))
     fc_baud_entry.grid(row=1, column=3, sticky="w", pady=(4, 0))
 
-    auto_frame = tk.LabelFrame(layout_grid, text="Auto Tune Session", padx=8, pady=8)
+    auto_frame = tk.LabelFrame(layout_grid, text="Tune Layout / Progress", padx=8, pady=8)
     auto_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(6, 0))
     auto_frame.grid_columnconfigure(0, weight=1)
     auto_frame.grid_rowconfigure(1, weight=1)

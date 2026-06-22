@@ -58,7 +58,7 @@ class AutoSessionEngine:
         app = self.app
         if app.auto_controller is None or app.auto_active_command is None:
             return
-        sample = app.fc_service.latest_attitude()
+        sample = app.attitude_service.latest_attitude()
         if sample is None:
             return
         recovery_event = app.auto_active_command.recovery
@@ -127,9 +127,9 @@ class AutoSessionEngine:
         if app.auto_controller is None:
             raise RuntimeError("Adaptive controller is not initialized.")
 
-        sample = app.fc_service.latest_attitude()
+        sample = app.attitude_service.latest_attitude()
         if sample is None:
-            raise RuntimeError("No FC attitude sample available.")
+            raise RuntimeError("No attitude-board sample available.")
 
         channel_index = axis_channel_index(command.axis)
         output_sign = 1 if command.calibration else app.auto_axis_output_sign.get(command.axis, 1)
@@ -220,8 +220,8 @@ class AutoSessionEngine:
         if not self.arduino_output_connected():
             self.auto_abort("Arduino output disconnected during auto session.")
             return
-        if not app.fc_service.is_connected:
-            self.auto_abort("FC disconnected during auto session.")
+        if not app.attitude_service.is_connected:
+            self.auto_abort("Attitude board disconnected during auto session.")
             return
 
         now = time.monotonic()
@@ -229,7 +229,7 @@ class AutoSessionEngine:
             self.auto_abort("FC telemetry became stale.", continue_pipeline=False)
             return
 
-        sample = app.fc_service.latest_attitude()
+        sample = app.attitude_service.latest_attitude()
         if sample is None:
             self.schedule_tick()
             return

@@ -10,29 +10,13 @@ import time
 import tkinter as tk
 from tkinter import messagebox
 
-from serialUSB.inav_serial_service import (
-    AxisPidFf,
-    FF_SETTING_NAME,
-    InavSerialService,
-    PID_SETTING_NAME,
-)
+from serialUSB.inav_serial_service import InavSerialService
 
 from .constants import (
     FC_PORT_DEFAULT,
-    LEVEL_CENTER_US,
-    LEVEL_DEADBAND_DEG,
-    LEVEL_FULL_SCALE_DEG,
-    LEVEL_LOOP_INTERVAL_MS,
-    LEVEL_MAX_DELTA_US,
-    LEVEL_MIN_DELTA_US,
-    LEVEL_PULSE_TIMEOUT_S,
-    LEVEL_TIMEOUT_DEFAULT_S,
-    PITCH_CHANNEL_INDEX,
     FLY_LOG_SAFETY_TIMEOUT_S,
     PID_PLAN_FLY_LOG_RUNTIME_S,
     PORT_DEFAULT,
-    PULSE_STATUS_REJECTED,
-    ROLL_CHANNEL_INDEX,
     THROTTLE_CHANNEL_INDEX,
 )
 from .adaptive_session import (
@@ -40,20 +24,14 @@ from .adaptive_session import (
     AdaptiveSessionConfig,
     AdaptiveSessionState,
     ExcitationEvent,
-    axis_channel_index,
 )
 from .ch8_marker import channels_with_pid_test_ch8
-from .auto_tune_report import AutoTuneReport
 from .blackbox_import import BlackboxImportResult
 from .pid_tuning_workflow import (
     LoadedPIDTuningPlan,
     load_pid_tuning_plan,
 )
-from .step_response_report import (
-    MAX_STEP_RESPONSE_LOGS,
-    StepResponseReport,
-    format_step_response_report,
-)
+
 from .ui import (
     build_main_gui,
     parse_entries,
@@ -76,8 +54,7 @@ from .tasks.worker_tasks import (
     analyze_specific_blackbox_log as worker_analyze_specific_blackbox_log,
     enter_msc_and_import_blackbox_logs as worker_enter_msc_and_import_blackbox_logs,
     generate_auto_report as worker_generate_auto_report,
-    generate_step_response_report as worker_generate_step_response_report,
-    read_fc_pid_ff as worker_read_fc_pid_ff,
+    read_movement_attitude as worker_read_movement_attitude,
 )
 
 
@@ -548,13 +525,13 @@ class ModbusApp(HardwareStateMixin):
                 raise RuntimeError("Connect FC before starting auto session.")
             if self.level_active:
                 raise RuntimeError("Stop auto-level before starting auto session.")
-            if self.fc_service.latest_attitude() is None:
-                raise RuntimeError("No FC attitude sample yet. Wait for telemetry then retry.")
+            if self.attitude_service.latest_attitude() is None:
+                raise RuntimeError("No attitude-board sample yet. Wait for movement telemetry then retry.")
             self.auto_config = read_auto_tune_config()
 
             prompt = (
                 "Confirm preflight:\n"
-                "- FC is connected and attitude telemetry is live\n"
+                "- FC is connected and attitude-board telemetry is live\n"
                 "- Drone is disarmed before pressing Save for PID/FF values\n"
                 "- Guided plan steps only stage PID/FF values in the boxes\n"
                 "- You are ready to arm and press Fly/Log for one candidate at a time\n"
@@ -618,8 +595,8 @@ class ModbusApp(HardwareStateMixin):
                 raise RuntimeError("Connect FC before Fly/Log.")
             if self.level_active:
                 raise RuntimeError("Stop auto-level before Fly/Log.")
-            if self.fc_service.latest_attitude() is None:
-                raise RuntimeError("No FC attitude sample yet. Wait for telemetry then retry.")
+            if self.attitude_service.latest_attitude() is None:
+                raise RuntimeError("No attitude-board sample yet. Wait for movement telemetry then retry.")
             if not fc_is_armed_for_fly_log():
                 return
 
@@ -1237,9 +1214,22 @@ class ModbusApp(HardwareStateMixin):
         )
 
 
-        def poll_fc_attitude() -> None:
+        def poll_attitude() -> None:
             try:
-                sample = self.fc_service.latest_attitude()
+                if self.controller.is_connected and not self.attitude_poll_inflight:
+                    self.attitude_poll_inflight = True
+
+                    def on_attitude_sample(ok: bool, res: object) -> None:
+                        self.attitude_poll_inflight = False
+                        if not ok:
+                            return
+                        if res is None:
+                            return
+                        self.attitude_service.ingest_sample(res)
+
+                    self.worker.submit(worker_read_movement_attitude, callback=on_attitude_sample)
+
+                sample = self.attitude_service.latest_attitude()
                 if sample is not None:
                     record_auto_session_sample(sample)
                     if not self.sim_active:
@@ -1248,7 +1238,7 @@ class ModbusApp(HardwareStateMixin):
                         self.pitch_text.set(f"Pitch: {sample.pitch_deg:6.1f} deg")
             except Exception:
                 pass
-            self.fc_poll_after_id = self.root.after(60, poll_fc_attitude)
+            self.fc_poll_after_id = self.root.after(60, poll_attitude)
 
         def poll_results() -> None:
             while True:
@@ -1279,6 +1269,8 @@ class ModbusApp(HardwareStateMixin):
                     pass
                 finally:
                     self.fc_poll_after_id = None
+            self.attitude_service.disconnect()
+            self.attitude_poll_inflight = False
 
             def on_stop_and_close(ok: bool, res: object) -> None:
                 do_fc_disconnect(update_status=False)
@@ -1322,7 +1314,7 @@ class ModbusApp(HardwareStateMixin):
         set_live_channel_outputs(parse_channel_values_with_defaults())
         update_link_indicators()
         self.root.after(50, poll_results)
-        self.fc_poll_after_id = self.root.after(60, poll_fc_attitude)
+        self.fc_poll_after_id = self.root.after(60, poll_attitude)
         self.root.protocol("WM_DELETE_WINDOW", on_close)
 
         self.root.mainloop()
