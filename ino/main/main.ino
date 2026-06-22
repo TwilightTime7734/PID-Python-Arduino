@@ -94,9 +94,9 @@ static void update_movement_registers() {
 		return;
 	}
 
-	float ax = movement.getX();
-	float ay = movement.getY();
-	float az = movement.getZ();
+	float ax = -movement.getX(); // Pitch
+	float ay = movement.getY();  // Roll
+	float az = movement.getZ();  // Gravity
 
 	// Roll/pitch attitude derived from gravity. This is useful for centering on
 	// a test stand. Yaw attitude is not available from this 6-axis IMU alone.
