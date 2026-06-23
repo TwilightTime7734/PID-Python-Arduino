@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import tkinter as tk
 from tkinter import ttk
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from .constants import (
@@ -18,26 +18,47 @@ from .constants import (
 )
 
 
-def parse_entries(entries: list[tk.Entry], cast, label: str) -> list:
-    try:
-        return [cast(e.get().strip()) for e in entries]
-    except ValueError:
-        kind = "integers" if cast is int else "numbers"
-        raise RuntimeError(f"{label} values must be {kind}")
+EntryWidget = tk.Entry | ttk.Combobox
+CHANNEL_VALUE_MIN = 1000
+CHANNEL_VALUE_MAX = 2000
+CHANNEL_VALUE_STEP = 25
+CHANNEL_VALUE_OPTIONS = tuple(str(value) for value in range(CHANNEL_VALUE_MIN, CHANNEL_VALUE_MAX + 1, CHANNEL_VALUE_STEP))
+OFFSET_VALUE_MIN = -20
+OFFSET_VALUE_MAX = 20
+OFFSET_VALUE_OPTIONS = tuple(str(value) for value in range(OFFSET_VALUE_MIN, OFFSET_VALUE_MAX + 1))
+BAUD_OPTIONS = ("9600", "115200")
 
 
-def require_range(values: Sequence[int], label: str, min_value: int, max_value: int) -> None:
-    for idx, value in enumerate(values, 1):
-        if value < min_value or value > max_value:
-            raise RuntimeError(f"{label} CH{idx} must be between {min_value} and {max_value}")
+def normalize_channel_value(value: int | float) -> int:
+    clamped = max(CHANNEL_VALUE_MIN, min(CHANNEL_VALUE_MAX, int(round(float(value)))))
+    stepped = CHANNEL_VALUE_MIN + (
+        ((clamped - CHANNEL_VALUE_MIN) + (CHANNEL_VALUE_STEP // 2)) // CHANNEL_VALUE_STEP
+    ) * CHANNEL_VALUE_STEP
+    return max(CHANNEL_VALUE_MIN, min(CHANNEL_VALUE_MAX, int(stepped)))
 
 
-def make_row(root: tk.Misc, row: int, label: str, defaults: Sequence[int | float]) -> list[tk.Entry]:
+def normalize_offset_value(value: int | float) -> int:
+    return max(OFFSET_VALUE_MIN, min(OFFSET_VALUE_MAX, int(round(float(value)))))
+
+
+def make_row(
+    root: tk.Misc,
+    row: int,
+    label: str,
+    defaults: Sequence[int | float],
+    *,
+    values: Sequence[str] | None = None,
+    normalizer: Callable[[int | float], int] | None = None,
+) -> list[EntryWidget]:
     tk.Label(root, text=label).grid(row=row, column=0, padx=6, pady=(0, 2), sticky="e")
-    out: list[tk.Entry] = []
+    out: list[EntryWidget] = []
     for i, value in enumerate(defaults, 1):
-        entry = tk.Entry(root, width=8)
-        entry.insert(0, str(value))
+        if values is None:
+            entry: EntryWidget = tk.Entry(root, width=8)
+            entry.insert(0, str(value))
+        else:
+            entry = ttk.Combobox(root, width=6, values=values, state="readonly")
+            entry.set(str(normalizer(value) if normalizer is not None else value))
         entry.grid(row=row, column=i, padx=4, pady=(0, 2))
         out.append(entry)
     return out
@@ -152,7 +173,7 @@ def _build_interactive_pid_value_table(
     roll_pidff_vars: list[tk.StringVar],
     pitch_pidff_vars: list[tk.StringVar],
 ) -> tk.LabelFrame:
-    """Build a PID value table with clickable entries that sync to FC/INAV section."""
+    """Build a readonly PID value table with clickable cells that stage values."""
     frame = tk.LabelFrame(parent, text=title, padx=6, pady=5)
     for column in range(len(headings)):
         frame.grid_columnconfigure(column, weight=1)
@@ -163,65 +184,54 @@ def _build_interactive_pid_value_table(
             pady=(0, 2),
             sticky="we",
         )
-    
-    # Store entry widget references and their state for color toggling
+
     entry_states: dict[tk.Entry, dict] = {}
-    
+
     for row_index, (label, values) in enumerate(rows, start=1):
-        # Strip "start" and "rec" from the label
         clean_label = label.replace(" start", "").replace(" rec", "")
         _readonly_table_entry(frame, row_index, 0, clean_label, width=10)
-        
-        # Determine if this is Roll or Pitch row
+
         axis_type = None
         if "Roll" in clean_label:
             axis_type = "roll"
         elif "Pitch" in clean_label:
             axis_type = "pitch"
-        # Yaw rows are ignored
-        
+
         for column_index in range(1, len(headings)):
             value = values[column_index - 1] if column_index - 1 < len(values) else ""
             entry = tk.Entry(frame, width=8, justify="center", relief="sunken")
             entry.insert(0, str(value))
             entry.config(state="readonly", readonlybackground="#FFE4E1", foreground="black")
             entry.grid(row=row_index, column=column_index, padx=2, pady=2, sticky="we")
-            
-            # Initialize state: light red background, not toggled
+
             entry_states[entry] = {
                 "toggled": False,
                 "axis_type": axis_type,
-                "param_index": column_index - 1,  # 0-3 for P, D, I, FF
+                "param_index": column_index - 1,
             }
-            
-            # Add click handler only for Roll and Pitch
+
             if axis_type is not None:
                 def make_click_handler(entry_widget, state_dict):
                     def on_click(event):
-                        # Toggle state
                         state_dict[entry_widget]["toggled"] = not state_dict[entry_widget]["toggled"]
-                        
+
                         if state_dict[entry_widget]["toggled"]:
-                            # Light green
                             entry_widget.config(readonlybackground="#90EE90")
-                            # Update FC/INAV section
                             value_text = entry_widget.get()
                             axis = state_dict[entry_widget]["axis_type"]
                             param_idx = state_dict[entry_widget]["param_index"]
-                            
+
+                            param_names = ["P", "D", "I", "FF"]
                             if axis == "roll" and param_idx < len(roll_pidff_vars):
-                                param_names = ["P", "D", "I", "FF"]
                                 roll_pidff_vars[param_idx].set(f"{param_names[param_idx]}: {value_text}")
                             elif axis == "pitch" and param_idx < len(pitch_pidff_vars):
-                                param_names = ["P", "D", "I", "FF"]
                                 pitch_pidff_vars[param_idx].set(f"{param_names[param_idx]}: {value_text}")
                         else:
-                            # Light red
                             entry_widget.config(readonlybackground="#FFE4E1")
                     return on_click
-                
+
                 entry.bind("<Button-1>", make_click_handler(entry, entry_states))
-    
+
     return frame
 
 
@@ -283,8 +293,8 @@ class ArtificialHorizon(tk.Canvas):
 class MainUi:
     port_entry: tk.Entry | ttk.Combobox
     channel_adjust_canvases: list[tk.Canvas]
-    ch_entries: list[tk.Entry]
-    off_entries: list[tk.Entry]
+    ch_entries: list[EntryWidget]
+    off_entries: list[EntryWidget]
     channel_output_canvases: list[tk.Canvas]
     channel_output_fill_ids: list[int]
     level_button: tk.Button
@@ -301,8 +311,9 @@ class MainUi:
     pid_ff_adjust_canvases: list[tk.Canvas]
     load_pid_ff_button: tk.Button
     save_pid_ff_button: tk.Button
+    port_baud_entry: ttk.Combobox
     fc_port_entry: tk.Entry | ttk.Combobox
-    fc_baud_entry: tk.Entry
+    fc_baud_entry: ttk.Combobox
     scan_fc_button: tk.Button
     connect_fc_button: tk.Button
     import_blackbox_button: tk.Button
@@ -350,8 +361,22 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         canvas.grid(row=2, column=i, padx=4, pady=(0, 2))
         channel_adjust_canvases.append(canvas)
 
-    ch_entries = make_row(main_frame, 3, "Default", CHANNEL_DEFAULTS)
-    off_entries = make_row(main_frame, 4, "Offsets", OFFSET_DEFAULTS)
+    ch_entries = make_row(
+        main_frame,
+        3,
+        "Default",
+        CHANNEL_DEFAULTS,
+        values=CHANNEL_VALUE_OPTIONS,
+        normalizer=normalize_channel_value,
+    )
+    off_entries = make_row(
+        main_frame,
+        4,
+        "Offsets",
+        OFFSET_DEFAULTS,
+        values=OFFSET_VALUE_OPTIONS,
+        normalizer=normalize_offset_value,
+    )
 
     tk.Label(main_frame, text="Idle").grid(row=5, column=0, padx=6, pady=(0, 2), sticky="e")
     channel_output_canvases: list[tk.Canvas] = []
@@ -422,6 +447,9 @@ def build_main_gui(root: tk.Tk) -> MainUi:
             width=8,
             textvariable=roll_var,
             justify="left",
+            state="readonly",
+            readonlybackground="white",
+            foreground="black",
         )
         roll_entry.grid(row=idx, column=0, padx=(0, 2), pady=1, sticky="w")
         roll_adjust = tk.Canvas(left_metrics_frame, width=32, height=16, bg="#F0F0F0", highlightthickness=0)
@@ -436,6 +464,9 @@ def build_main_gui(root: tk.Tk) -> MainUi:
             width=8,
             textvariable=pitch_var,
             justify="left",
+            state="readonly",
+            readonlybackground="white",
+            foreground="black",
         )
         pitch_entry.grid(row=idx, column=3, padx=(0, 2), pady=1, sticky="w")
         pitch_adjust = tk.Canvas(left_metrics_frame, width=32, height=16, bg="#F0F0F0", highlightthickness=0)
@@ -466,9 +497,8 @@ def build_main_gui(root: tk.Tk) -> MainUi:
     port_entry.grid(row=0, column=1, sticky="w")
 
     tk.Label(port_fields_frame, text="Baud").grid(row=0, column=2, sticky="e", padx=(8, 4))
-    port_baud_entry = tk.Entry(port_fields_frame, width=10)
-    port_baud_entry.insert(0, str(BAUDRATE))
-    port_baud_entry.config(state="readonly")
+    port_baud_entry = ttk.Combobox(port_fields_frame, width=8, values=BAUD_OPTIONS, state="readonly")
+    port_baud_entry.set(str(BAUDRATE))
     port_baud_entry.grid(row=0, column=3, sticky="w")
 
     tk.Label(port_fields_frame, text="FC Port").grid(row=1, column=0, sticky="e", padx=(0, 4), pady=(4, 0))
@@ -477,8 +507,8 @@ def build_main_gui(root: tk.Tk) -> MainUi:
     fc_port_entry.grid(row=1, column=1, sticky="w", pady=(4, 0))
 
     tk.Label(port_fields_frame, text="Baud").grid(row=1, column=2, sticky="e", padx=(8, 4), pady=(4, 0))
-    fc_baud_entry = tk.Entry(port_fields_frame, width=10)
-    fc_baud_entry.insert(0, str(FC_BAUD_DEFAULT))
+    fc_baud_entry = ttk.Combobox(port_fields_frame, width=8, values=BAUD_OPTIONS, state="readonly")
+    fc_baud_entry.set(str(FC_BAUD_DEFAULT))
     fc_baud_entry.grid(row=1, column=3, sticky="w", pady=(4, 0))
 
     auto_frame = tk.LabelFrame(layout_grid, text="Tune Layout / Progress", padx=8, pady=8)
@@ -495,6 +525,7 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         auto_action_frame,
         width=5,
         values=("60", "70", "80", "90", "100", "110", "125", "150"),
+        state="readonly",
     )
     pulse_force_combo.pack(side="left", padx=(0, 4))
     tk.Label(auto_action_frame, text="Time s").pack(side="left", padx=(2, 2))
@@ -502,6 +533,7 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         auto_action_frame,
         width=5,
         values=("0.20", "0.25", "0.30", "0.35", "0.40", "0.50"),
+        state="readonly",
     )
     pulse_time_combo.pack(side="left", padx=(0, 4))
     pulse_negative_button = tk.Button(
@@ -607,6 +639,7 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         pid_ff_adjust_canvases=pid_ff_adjust_canvases,
         load_pid_ff_button=load_pid_ff_button,
         save_pid_ff_button=save_pid_ff_button,
+        port_baud_entry=port_baud_entry,
         fc_port_entry=fc_port_entry,
         fc_baud_entry=fc_baud_entry,
         scan_fc_button=scan_fc_button,

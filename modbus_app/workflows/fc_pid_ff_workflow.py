@@ -16,6 +16,12 @@ from serialUSB.inav_serial_service import AxisPidFf, FF_SETTING_NAME, PID_SETTIN
 from ..tasks.worker_tasks import read_fc_pid_ff as worker_read_fc_pid_ff
 
 PidValues = dict[str, dict[str, int]]
+PID_FF_GAIN_LIMITS = {
+    "p": (20, 70),
+    "i": (20, 150),
+    "d": (10, 60),
+    "ff": (20, 180),
+}
 
 
 class FcPidFfWorkflow:
@@ -40,6 +46,15 @@ class FcPidFfWorkflow:
             return str(int(rounded))
         return f"{value:.2f}".rstrip("0").rstrip(".")
 
+    @staticmethod
+    def gain_limits(gain: str) -> tuple[int, int]:
+        return PID_FF_GAIN_LIMITS[gain.lower()]
+
+    @classmethod
+    def clamp_gain_value(cls, gain: str, value: int | float) -> int:
+        low, high = cls.gain_limits(gain)
+        return max(low, min(high, int(round(float(value)))))
+
     def clear_displays(self) -> None:
         app = self.app
         for label, var in zip(app.pid_ff_labels, app.roll_pidff_vars):
@@ -49,12 +64,12 @@ class FcPidFfWorkflow:
 
     def set_displays(self, roll_values: AxisPidFf, pitch_values: AxisPidFf) -> None:
         app = self.app
-        roll_series = (roll_values.p, roll_values.i, roll_values.d, roll_values.ff)
-        pitch_series = (pitch_values.p, pitch_values.i, pitch_values.d, pitch_values.ff)
-        for label, value, var in zip(app.pid_ff_labels, roll_series, app.roll_pidff_vars):
-            var.set(f"{label}: {self.format_value(value)}")
-        for label, value, var in zip(app.pid_ff_labels, pitch_series, app.pitch_pidff_vars):
-            var.set(f"{label}: {self.format_value(value)}")
+        roll_series = {"p": roll_values.p, "i": roll_values.i, "d": roll_values.d, "ff": roll_values.ff}
+        pitch_series = {"p": pitch_values.p, "i": pitch_values.i, "d": pitch_values.d, "ff": pitch_values.ff}
+        for gain, value in roll_series.items():
+            self.set_var("roll", gain, int(round(float(value))))
+        for gain, value in pitch_series.items():
+            self.set_var("pitch", gain, int(round(float(value))))
 
     def var(self, axis: str, gain: str) -> tk.StringVar:
         app = self.app
@@ -71,13 +86,14 @@ class FcPidFfWorkflow:
             value = int(round(float(raw)))
         except ValueError as exc:
             raise RuntimeError(f"{axis.title()} {gain.upper()} must be a number.") from exc
-        if value < 0 or value > 255:
-            raise RuntimeError(f"{axis.title()} {gain.upper()} must be between 0 and 255.")
+        low, high = self.gain_limits(gain)
+        if value < low or value > high:
+            raise RuntimeError(f"{axis.title()} {gain.upper()} must be between {low} and {high}.")
         return value
 
     def set_var(self, axis: str, gain: str, value: int) -> None:
         label = gain.upper()
-        self.var(axis, gain).set(f"{label}: {max(0, min(255, int(value)))}")
+        self.var(axis, gain).set(f"{label}: {self.clamp_gain_value(gain, value)}")
 
     def staged_roll_pitch_values(self) -> PidValues:
         return {
@@ -213,7 +229,7 @@ class FcPidFfWorkflow:
         axis, gain = app.pid_ff_adjust_fields[index]
         try:
             current = self.parse_var(axis, gain)
-            target = max(0, min(255, current + delta))
+            target = self.clamp_gain_value(gain, current + delta)
             if target == current:
                 return
             self.set_var(axis, gain, target)

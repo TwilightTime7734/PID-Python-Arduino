@@ -108,10 +108,10 @@ def write_regs(ser: serial.Serial, start: int, values: list[int]) -> None:
         raise RuntimeError("Write echo mismatch")
 
 
-def open_serial(port: str) -> serial.Serial:
+def open_serial(port: str, baudrate: int = BAUDRATE) -> serial.Serial:
     ser = serial.Serial(
         port=port,
-        baudrate=BAUDRATE,
+        baudrate=baudrate,
         bytesize=serial.EIGHTBITS,
         parity=serial.PARITY_NONE,
         stopbits=serial.STOPBITS_ONE,

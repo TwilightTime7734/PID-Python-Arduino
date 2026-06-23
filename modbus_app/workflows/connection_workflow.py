@@ -15,7 +15,6 @@ from ..constants import (
     FC_DEVICE_VID,
     FC_PORT_DEFAULT,
 )
-from ..ui import parse_entries, require_range
 from ..ch8_marker import channels_with_pid_test_ch8
 
 
@@ -25,6 +24,7 @@ class ConnectionWorkflow:
         *,
         app,
         port: Callable[[], str],
+        arduino_baud: Callable[[], int],
         fc_port: Callable[[], str],
         fc_baud: Callable[[], int],
         simulation_mode_enabled: Callable[[], bool],
@@ -35,11 +35,13 @@ class ConnectionWorkflow:
         queue_fc_pid_ff_refresh: Callable[[str, int], None],
         set_live_channel_outputs: Callable[[list[int]], None],
         parse_channel_values_with_defaults: Callable[[], list[int]],
+        parse_offset_values_with_defaults: Callable[[], list[int]],
         set_error: Callable[[str, Exception], None],
         auto_abort: Callable[..., None],
     ) -> None:
         self.app = app
         self.port = port
+        self.arduino_baud = arduino_baud
         self.fc_port = fc_port
         self.fc_baud = fc_baud
         self.simulation_mode_enabled = simulation_mode_enabled
@@ -50,6 +52,7 @@ class ConnectionWorkflow:
         self.queue_fc_pid_ff_refresh = queue_fc_pid_ff_refresh
         self.set_live_channel_outputs = set_live_channel_outputs
         self.parse_channel_values_with_defaults = parse_channel_values_with_defaults
+        self.parse_offset_values_with_defaults = parse_offset_values_with_defaults
         self.set_error = set_error
         self.auto_abort = auto_abort
 
@@ -88,8 +91,7 @@ class ConnectionWorkflow:
         ports = self.list_scanned_ports(port_infos)
         self.populate_port_dropdowns(ports)
         selected_port = self.select_fc_port(port_infos)
-        app.fc_port_entry.delete(0, tk.END)
-        app.fc_port_entry.insert(0, selected_port)
+        app.fc_port_entry.set(selected_port)
         if update_status:
             if ports:
                 app.status.set(f"Detected ports: {', '.join(ports)}. FC port set to {selected_port}.")
@@ -99,12 +101,19 @@ class ConnectionWorkflow:
     def update_link_indicators(self) -> None:
         app = self.app
         sim_mode = self.simulation_mode_enabled()
+        arduino_connected = app.controller.is_connected
+        fc_connected = app.fc_service.is_connected
+
+        app.port_entry.config(state="disabled" if arduino_connected or app.start_pending else "normal")
+        app.port_baud_entry.config(state="disabled" if arduino_connected or app.start_pending else "readonly")
+        app.fc_port_entry.config(state="disabled" if fc_connected else "normal")
+        app.fc_baud_entry.config(state="disabled" if fc_connected else "readonly")
+
         if app.controller.is_connected:
             app.pc_link_box.config(text="PC-ARD OPEN", bg="#2E7D32", fg="white")
         else:
             app.pc_link_box.config(text="PC-ARD CLOSED", bg="#8B1E1E", fg="white")
 
-        fc_connected = app.fc_service.is_connected
         if fc_connected:
             app.connect_fc_button.config(
                 text="Disconnect FC",
@@ -130,7 +139,6 @@ class ConnectionWorkflow:
         app.load_pid_ff_button.config(state=pid_save_state)
         app.save_pid_ff_button.config(state=pid_save_state)
 
-        arduino_connected = app.controller.is_connected
         if app.start_pending:
             app.arduino_button.config(
                 text="Connecting...",
@@ -226,12 +234,18 @@ class ConnectionWorkflow:
                 raise RuntimeError("Turn off Simulate before connecting Arduino.")
             if app.start_pending:
                 raise RuntimeError("Start is already in progress.")
-            channels = parse_entries(app.ch_entries, int, "Channel")
-            require_range(channels, "Channel", 1000, 2000)
-            offsets = parse_entries(app.off_entries, int, "Offset")
+            channels = self.parse_channel_values_with_defaults()
+            offsets = self.parse_offset_values_with_defaults()
             selected_port = self.port()
-            if app.controller.is_connected and selected_port != app.controller.run_port:
-                raise RuntimeError(f"Output is active on {app.controller.run_port}. Press Disconnect Arduino before switching ports.")
+            selected_baud = self.arduino_baud()
+            if app.controller.is_connected and (
+                selected_port != app.controller.run_port
+                or selected_baud != app.controller.run_baudrate
+            ):
+                raise RuntimeError(
+                    f"Output is active on {app.controller.run_port} @ {app.controller.run_baudrate}. "
+                    "Press Disconnect Arduino before switching ports or baud."
+                )
             channels = channels_with_pid_test_ch8(channels, active=False)
 
             def on_start_done(ok: bool, res: object) -> None:
@@ -260,12 +274,13 @@ class ConnectionWorkflow:
                     app.status.set(version_warning)
                     messagebox.showwarning("Firmware version", version_warning)
                 else:
-                    app.status.set("PPM output configured and started.")
+                    app.status.set(f"PPM output configured and started on {selected_port} @ {selected_baud}.")
 
             app.start_pending = True
             self.update_link_indicators()
             app.controller.start_output(
                 selected_port,
+                selected_baud,
                 channels,
                 offsets,
                 callback=on_start_done,

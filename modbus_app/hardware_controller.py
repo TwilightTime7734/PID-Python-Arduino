@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 import serial
 
-from .constants import PID_TEST_CH8_OFF_US, PPM_OUTPUT_CHANNEL_COUNT, PORT_DEFAULT
+from .constants import BAUDRATE, PID_TEST_CH8_OFF_US, PPM_OUTPUT_CHANNEL_COUNT, PORT_DEFAULT
 from .serial_protocol import (
     open_serial,
     run_ppm_on_serial,
@@ -21,6 +21,7 @@ class HardwareController:
         self.worker = SerialWorker()
         self.run_active = False
         self.run_port = PORT_DEFAULT
+        self.run_baudrate = BAUDRATE
         self.run_ser: serial.Serial | None = None
         self.run_quant: int | None = None
         self.run_max_count: int | None = None
@@ -36,6 +37,7 @@ class HardwareController:
     def start_output(
         self,
         port: str,
+        baudrate: int,
         channels: list[int],
         offsets: list[int],
         callback: ControllerCallback | None = None,
@@ -56,6 +58,7 @@ class HardwareController:
                     callback(False, RuntimeError("Unexpected worker result from start task"))
                 return
             self.run_port = port
+            self.run_baudrate = baudrate
             self.run_quant = res[0]
             self.run_max_count = res[1]
             self.run_ser = self.worker.ser
@@ -71,6 +74,7 @@ class HardwareController:
             self.worker.submit(
                 self._task_open_and_start,
                 port,
+                baudrate,
                 channels,
                 offsets,
                 callback=on_start_done,
@@ -80,6 +84,13 @@ class HardwareController:
         if port != self.run_port:
             if callback is not None:
                 callback(False, RuntimeError(f"Output is active on {self.run_port}. Press Disconnect Arduino before switching ports."))
+            return
+        if baudrate != self.run_baudrate:
+            if callback is not None:
+                callback(False, RuntimeError(
+                    f"Output is active on {self.run_port} @ {self.run_baudrate}. "
+                    "Press Disconnect Arduino before changing baud."
+                ))
             return
 
         self.worker.submit(
@@ -96,6 +107,7 @@ class HardwareController:
                     callback(False, res)
                 return
             self.run_ser = None
+            self.run_baudrate = BAUDRATE
             self.run_quant = None
             self.run_max_count = None
             self.run_active = False
@@ -111,6 +123,7 @@ class HardwareController:
     def shutdown(self, callback: ControllerCallback | None = None) -> None:
         def on_shutdown_done(ok: bool, res: object) -> None:
             self.run_ser = None
+            self.run_baudrate = BAUDRATE
             self.run_quant = None
             self.run_max_count = None
             self.run_active = False
@@ -182,10 +195,11 @@ class HardwareController:
         self,
         worker_self: SerialWorker,
         port: str,
+        baudrate: int,
         channels: list[int],
         offsets: list[int],
     ):
-        ser = open_serial(port)
+        ser = open_serial(port, baudrate)
         worker_self.ser = ser
         try:
             ppm_channels = self._ppm_channels_for_firmware(channels)

@@ -32,6 +32,7 @@ class WidgetBindings:
         app.pid_ff_adjust_canvases = ui.pid_ff_adjust_canvases
         app.load_pid_ff_button = ui.load_pid_ff_button
         app.save_pid_ff_button = ui.save_pid_ff_button
+        app.port_baud_entry = ui.port_baud_entry
         app.fc_port_entry = ui.fc_port_entry
         app.fc_baud_entry = ui.fc_baud_entry
         app.scan_fc_button = ui.scan_fc_button

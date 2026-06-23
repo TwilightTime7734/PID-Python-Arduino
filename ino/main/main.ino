@@ -93,9 +93,9 @@ static void update_movement_registers() {
 	}
 
   // for testing the I2C bus speed, you can measure the time taken for the update() call
-	uint32_t start_time = micros();
+	// uint32_t start_time = micros();
 	bool success = movement.update();
-	uint32_t elapsed_time = micros() - start_time;
+	// uint32_t elapsed_time = micros() - start_time;
 
 	if (!success) {
 		modbus_regs.movement_status = 3;
@@ -113,7 +113,7 @@ static void update_movement_registers() {
 
 	modbus_regs.roll_angle = roll_angle;
 	modbus_regs.pitch_angle = pitch_angle;
-	modbus_regs.movement_millis.raw = elapsed_time; // now;
+	modbus_regs.movement_millis.raw = now; // elapsed_time; // 
 	modbus_regs.movement_seq++;
 	if (modbus_regs.movement_seq == 0) {
 		modbus_regs.movement_seq = 1;

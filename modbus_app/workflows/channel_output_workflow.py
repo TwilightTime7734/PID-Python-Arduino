@@ -8,12 +8,10 @@ from collections.abc import Callable
 from ..constants import (
     ADJUST_REPEAT_INITIAL_MS,
     ADJUST_REPEAT_INTERVAL_MS,
-    CHANNEL_DEFAULTS,
-    OFFSET_DEFAULTS,
     THROTTLE_CHANNEL_INDEX,
 )
 from ..ch8_marker import channels_with_pid_test_ch8
-from ..ui import parse_entries, require_range
+from ..ui import normalize_channel_value, normalize_offset_value
 
 
 class ChannelOutputWorkflow:
@@ -49,33 +47,17 @@ class ChannelOutputWorkflow:
 
     def parse_channel_values_with_defaults(self) -> list[int]:
         app = self.app
-        values: list[int] = []
-        for i, entry in enumerate(app.ch_entries):
-            try:
-                values.append(int(entry.get().strip()))
-            except ValueError:
-                values.append(CHANNEL_DEFAULTS[i])
-        return values
+        return [normalize_channel_value(int(entry.get().strip())) for entry in app.ch_entries]
 
     def parse_offset_values_with_defaults(self) -> list[int]:
         app = self.app
-        values: list[int] = []
-        for i, entry in enumerate(app.off_entries):
-            try:
-                values.append(int(entry.get().strip()))
-            except ValueError:
-                values.append(OFFSET_DEFAULTS[i])
-        return values
+        return [normalize_offset_value(int(entry.get().strip())) for entry in app.off_entries]
 
     def adjust_channel_value(self, index: int, delta: int) -> None:
         app = self.app
-        try:
-            current = int(app.ch_entries[index].get().strip())
-        except ValueError:
-            current = CHANNEL_DEFAULTS[index]
-        updated = max(1000, min(2000, current + delta))
-        app.ch_entries[index].delete(0, tk.END)
-        app.ch_entries[index].insert(0, str(updated))
+        current = int(app.ch_entries[index].get().strip())
+        updated = normalize_channel_value(current + delta)
+        self.set_channel_entry_value(index, updated)
         self.on_output_inputs_changed()
 
     def get_adjust_delta(self, event: tk.Event, step: int = 5) -> int:
@@ -189,12 +171,12 @@ class ChannelOutputWorkflow:
 
     def set_channel_entry_value(self, index: int, value: int) -> None:
         app = self.app
-        app.ch_entries[index].delete(0, tk.END)
-        app.ch_entries[index].insert(0, str(value))
+        normalized = normalize_channel_value(value)
+        app.ch_entries[index].set(str(normalized))
 
     def apply_auto_base_outputs(self, channels: list[int], safety_text: str = "", send_update: bool = True) -> None:
         app = self.app
-        clamped = [max(1000, min(2000, int(value))) for value in channels[: len(app.ch_entries)]]
+        clamped = [normalize_channel_value(value) for value in channels[: len(app.ch_entries)]]
         app.base_channel_outputs = clamped.copy()
         if app.auto_original_base_outputs is not None:
             app.auto_current_throttle_us = clamped[THROTTLE_CHANNEL_INDEX]
@@ -234,13 +216,8 @@ class ChannelOutputWorkflow:
             self.set_live_channel_outputs(self.parse_channel_values_with_defaults())
             return
 
-        try:
-            channels = parse_entries(app.ch_entries, int, "Channel")
-            require_range(channels, "Channel", 1000, 2000)
-            offsets = parse_entries(app.off_entries, int, "Offset")
-        except Exception:
-            return
-
+        channels = self.parse_channel_values_with_defaults()
+        offsets = self.parse_offset_values_with_defaults()
         self.set_live_channel_outputs(channels)
         app.base_channel_outputs = channels.copy()
         self.queue_live_channel_update(channels, offsets)

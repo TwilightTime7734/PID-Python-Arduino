@@ -72,7 +72,7 @@ class AttitudeService:
             pitch_deg=float(sample.pitch_deg - reference.pitch_deg),
             yaw_deg=float(sample.yaw_deg - reference.yaw_deg),
             timestamp_local=sample.timestamp_local,
-            movement_millis=sample.movement_millis,   # For testing, we can keep the movement_millis from the absolute sample in the relative sample. In a real application, you might want to handle this differently.
+            movement_millis=sample.movement_millis,
         )
         
 

@@ -40,7 +40,7 @@ from .pid_tuning_workflow import (
 
 from .ui import (
     build_main_gui,
-    parse_entries,
+    normalize_channel_value,
 )
 from .controllers import HardwareStateMixin, RuntimeStateController, WidgetBindings
 from .workflows.fly_log_workflow import FlyLogWorkflow
@@ -81,17 +81,17 @@ class ModbusApp(HardwareStateMixin):
         def port() -> str:
             return self.port_entry.get().strip() or PORT_DEFAULT
 
+        def parse_baud_entry(entry) -> int:
+            return int(entry.get().strip())
+
+        def arduino_baud() -> int:
+            return parse_baud_entry(self.port_baud_entry)
+
         def fc_port() -> str:
             return self.fc_port_entry.get().strip() or FC_PORT_DEFAULT
 
         def fc_baud() -> int:
-            try:
-                value = int(self.fc_baud_entry.get().strip())
-            except ValueError as exc:
-                raise RuntimeError("FC baud must be an integer.") from exc
-            if value <= 0:
-                raise RuntimeError("FC baud must be > 0.")
-            return value
+            return parse_baud_entry(self.fc_baud_entry)
 
         def pulse_axis_value(sample, axis: str) -> float:
             return auto_session_helpers.pulse_axis_value(sample, axis)
@@ -99,7 +99,7 @@ class ModbusApp(HardwareStateMixin):
         def clamp_test_throttle_us(value: int | None) -> int:
             if value is None:
                 value = DEFAULT_TEST_THROTTLE_US
-            return max(1000, min(2000, int(value)))
+            return normalize_channel_value(value)
 
         if not hasattr(self, "test_throttle_us"):
             self.test_throttle_us = DEFAULT_TEST_THROTTLE_US
@@ -115,8 +115,7 @@ class ModbusApp(HardwareStateMixin):
             # This only updates the GUI/internal base value; it does not immediately send
             # a live throttle command to the Arduino/FC just because a plan was generated.
             if len(self.ch_entries) > THROTTLE_CHANNEL_INDEX:
-                self.ch_entries[THROTTLE_CHANNEL_INDEX].delete(0, tk.END)
-                self.ch_entries[THROTTLE_CHANNEL_INDEX].insert(0, str(throttle))
+                self.ch_entries[THROTTLE_CHANNEL_INDEX].set(str(throttle))
             if len(getattr(self, "base_channel_outputs", [])) > THROTTLE_CHANNEL_INDEX:
                 self.base_channel_outputs[THROTTLE_CHANNEL_INDEX] = throttle
             if len(getattr(self, "live_channel_outputs", [])) > THROTTLE_CHANNEL_INDEX:
@@ -163,13 +162,7 @@ class ModbusApp(HardwareStateMixin):
             return profile
 
         def read_pulse_force_us() -> int:
-            raw = self.pulse_force_combo.get().strip()
-            try:
-                force_us = int(round(float(raw)))
-            except ValueError as exc:
-                raise RuntimeError("Pulse force must be a number of microseconds.") from exc
-            if force_us < 1 or force_us > 500:
-                raise RuntimeError("Pulse force must be between 1 and 500us.")
+            force_us = int(round(float(self.pulse_force_combo.get().strip())))
             _set_combo_value(
                 self.pulse_force_combo,
                 _format_pulse_force_us(force_us),
@@ -178,13 +171,7 @@ class ModbusApp(HardwareStateMixin):
             return force_us
 
         def read_pulse_hold_s() -> float:
-            raw = self.pulse_time_combo.get().strip()
-            try:
-                hold_s = float(raw)
-            except ValueError as exc:
-                raise RuntimeError("Pulse time must be a number of seconds.") from exc
-            if hold_s < 0.01 or hold_s > 2.0:
-                raise RuntimeError("Pulse time must be between 0.01 and 2.00 seconds.")
+            hold_s = float(self.pulse_time_combo.get().strip())
             _set_combo_value(
                 self.pulse_time_combo,
                 _format_pulse_hold_s(hold_s),
@@ -193,12 +180,8 @@ class ModbusApp(HardwareStateMixin):
             return hold_s
 
         def sync_pulse_dropdowns_from_user(event=None) -> None:
-            try:
-                force_us = read_pulse_force_us()
-                hold_s = read_pulse_hold_s()
-            except RuntimeError as exc:
-                self.status.set(str(exc))
-                return
+            force_us = read_pulse_force_us()
+            hold_s = read_pulse_hold_s()
             self.status.set(f"Fly/Log main pulse set to +/-{force_us}us for {hold_s:.2f}s.")
 
         def current_plan_test_pulse_profile() -> TestPulseProfile | None:
@@ -1339,7 +1322,7 @@ class ModbusApp(HardwareStateMixin):
             queue_live_channel_update=queue_live_channel_update,
             update_link_indicators=lambda: update_link_indicators(),
             arduino_output_connected=arduino_output_connected,
-            parse_offsets=lambda: parse_entries(self.off_entries, int, "Offset"),
+            parse_offsets=parse_offset_values_with_defaults,
             get_test_throttle_us=get_test_throttle_us,
             set_error=lambda title, exc: set_error(title, exc),
         )
@@ -1361,6 +1344,7 @@ class ModbusApp(HardwareStateMixin):
         connection_workflow = ConnectionWorkflow(
             app=self,
             port=port,
+            arduino_baud=arduino_baud,
             fc_port=fc_port,
             fc_baud=fc_baud,
             simulation_mode_enabled=simulation_mode_enabled,
@@ -1371,6 +1355,7 @@ class ModbusApp(HardwareStateMixin):
             queue_fc_pid_ff_refresh=queue_fc_pid_ff_refresh,
             set_live_channel_outputs=set_live_channel_outputs,
             parse_channel_values_with_defaults=parse_channel_values_with_defaults,
+            parse_offset_values_with_defaults=parse_offset_values_with_defaults,
             set_error=lambda title, exc: set_error(title, exc),
             auto_abort=lambda *args, **kwargs: auto_abort(*args, **kwargs),
         )
@@ -1453,8 +1438,6 @@ class ModbusApp(HardwareStateMixin):
                         self.horizon.set_attitude(sample.roll_deg, sample.pitch_deg)
                         self.roll_text.set(f"Roll: {sample.roll_deg:6.1f} deg")
                         self.pitch_text.set(f"Pitch: {sample.pitch_deg:6.1f} deg")
-                        if sample.movement_millis is not None:
-                            self.status.set(f"movement_millis={sample.movement_millis} us")                       
             except Exception:
                 pass
             self.fc_poll_after_id = self.root.after(60, poll_attitude)
@@ -1508,8 +1491,6 @@ class ModbusApp(HardwareStateMixin):
 
         for pulse_combo in (self.pulse_force_combo, self.pulse_time_combo):
             pulse_combo.bind("<<ComboboxSelected>>", sync_pulse_dropdowns_from_user)
-            pulse_combo.bind("<FocusOut>", sync_pulse_dropdowns_from_user)
-            pulse_combo.bind("<Return>", sync_pulse_dropdowns_from_user)
 
         self.scan_fc_button.config(command=scan_fc_ports)
         self.connect_fc_button.config(command=do_fc_toggle)
@@ -1526,7 +1507,7 @@ class ModbusApp(HardwareStateMixin):
         self.arduino_button.config(command=do_arduino_toggle)
         self.level_button.config(command=do_level)
         for i, canvas in enumerate(self.channel_adjust_canvases):
-            canvas.bind("<ButtonPress-1>", lambda event, i=i: on_adjust_press(adjust_channel_value, i, event))
+            canvas.bind("<ButtonPress-1>", lambda event, i=i: on_adjust_press(adjust_channel_value, i, event, 25))
             canvas.bind("<ButtonRelease-1>", on_adjust_release)
             canvas.bind("<Leave>", on_adjust_release)
         for i, canvas in enumerate(self.pid_ff_adjust_canvases):
@@ -1536,6 +1517,7 @@ class ModbusApp(HardwareStateMixin):
         for entry in self.ch_entries:
             entry.bind("<KeyRelease>", lambda _event: on_output_inputs_changed())
             entry.bind("<FocusOut>", lambda _event: on_output_inputs_changed())
+            entry.bind("<<ComboboxSelected>>", lambda _event: on_output_inputs_changed())
         set_auto_state(AdaptiveSessionState.idle)
         set_live_channel_outputs(parse_channel_values_with_defaults())
         update_link_indicators()
