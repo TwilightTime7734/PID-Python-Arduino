@@ -45,6 +45,7 @@ volatile byte timed_override_channel = 0;
 volatile uint32_t timed_override_remaining_ticks = 0;
 volatile word restore_channel[MAX_COUNT];
 
+
 byte const modbus_registers_count = sizeof(regs_t) / sizeof(word);
 
 // Create a ModulinoMovement object
@@ -69,6 +70,7 @@ static inline int16_t scaled_i16(float value, float scale) {
 }
 
 static void update_movement_registers() {
+
 	if (!movement_ready) {
 		modbus_regs.movement_status = 0;
 		return;
@@ -82,6 +84,7 @@ static void update_movement_registers() {
 
 	// available() prevents us from flagging an error just because the IMU has
 	// not produced another sample yet.
+
 	if (!movement.available()) {
 		if (modbus_regs.movement_status == 0) {
 			modbus_regs.movement_status = 1;
@@ -89,7 +92,12 @@ static void update_movement_registers() {
 		return;
 	}
 
-	if (!movement.update()) {
+  // for testing the I2C bus speed, you can measure the time taken for the update() call
+	uint32_t start_time = micros();
+	bool success = movement.update();
+	uint32_t elapsed_time = micros() - start_time;
+
+	if (!success) {
 		modbus_regs.movement_status = 3;
 		return;
 	}
@@ -100,12 +108,12 @@ static void update_movement_registers() {
 
 	// Roll/pitch attitude derived from gravity. This is useful for centering on
 	// a test stand. Yaw attitude is not available from this 6-axis IMU alone.
-	int16_t roll_angle  = (int16_t)roundf(atan2f(ay, az) * (180.0f / PI));
-	int16_t pitch_angle = (int16_t)roundf(atan2f(ax, az) * (180.0f / PI));
+	int16_t roll_angle  = (int16_t)roundf(atan2f(ay, az) * RAD_TO_DEG);
+	int16_t pitch_angle = (int16_t)roundf(atan2f(ax, az) * RAD_TO_DEG);
 
 	modbus_regs.roll_angle = roll_angle;
 	modbus_regs.pitch_angle = pitch_angle;
-	modbus_regs.movement_millis.raw = now;
+	modbus_regs.movement_millis.raw = elapsed_time; // now;
 	modbus_regs.movement_seq++;
 	if (modbus_regs.movement_seq == 0) {
 		modbus_regs.movement_seq = 1;

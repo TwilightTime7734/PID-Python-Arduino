@@ -13,6 +13,7 @@ class AttitudeSample:
     pitch_deg: float
     yaw_deg: float
     timestamp_local: datetime
+    movement_millis: int | None = None
 
 
 class AttitudeService:
@@ -29,6 +30,7 @@ class AttitudeService:
         self._reference_count = 0
         self._reference_roll_sum = 0.0
         self._reference_pitch_sum = 0.0
+        self._movement_millis: int | None = None
 
     @property
     def is_connected(self) -> bool:
@@ -43,6 +45,7 @@ class AttitudeService:
         self._reference_count = 0
         self._reference_roll_sum = 0.0
         self._reference_pitch_sum = 0.0
+        self._movement_millis = None
 
     def disconnect(self) -> None:
         self._connected = False
@@ -53,6 +56,7 @@ class AttitudeService:
         self._reference_count = 0
         self._reference_roll_sum = 0.0
         self._reference_pitch_sum = 0.0
+        self._movement_millis = None
 
     def ingest_sample(self, sample: AttitudeSample) -> None:
         if not self._connected:
@@ -68,7 +72,9 @@ class AttitudeService:
             pitch_deg=float(sample.pitch_deg - reference.pitch_deg),
             yaw_deg=float(sample.yaw_deg - reference.yaw_deg),
             timestamp_local=sample.timestamp_local,
+            movement_millis=sample.movement_millis,   # For testing, we can keep the movement_millis from the absolute sample in the relative sample. In a real application, you might want to handle this differently.
         )
+        
 
     def latest_attitude(self) -> AttitudeSample | None:
         return self._latest_relative

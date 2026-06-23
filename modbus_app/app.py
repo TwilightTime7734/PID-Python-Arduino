@@ -1453,6 +1453,8 @@ class ModbusApp(HardwareStateMixin):
                         self.horizon.set_attitude(sample.roll_deg, sample.pitch_deg)
                         self.roll_text.set(f"Roll: {sample.roll_deg:6.1f} deg")
                         self.pitch_text.set(f"Pitch: {sample.pitch_deg:6.1f} deg")
+                        if sample.movement_millis is not None:
+                            self.status.set(f"movement_millis={sample.movement_millis} us")                       
             except Exception:
                 pass
             self.fc_poll_after_id = self.root.after(60, poll_attitude)

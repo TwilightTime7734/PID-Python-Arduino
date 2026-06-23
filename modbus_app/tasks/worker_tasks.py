@@ -81,11 +81,13 @@ def read_movement_attitude(worker_self: SerialWorker):
 
     roll_deg = float(_as_signed_i16(int(regs[4])))
     pitch_deg = float(_as_signed_i16(int(regs[5])))
+    movement_millis = (int(regs[2]) & 0xFFFF) | ((int(regs[3]) & 0xFFFF) << 16)
     return AttitudeSample(
         roll_deg=roll_deg,
         pitch_deg=pitch_deg,
         yaw_deg=0.0,
         timestamp_local=datetime.now(),
+        movement_millis=movement_millis,
     )
 
 
