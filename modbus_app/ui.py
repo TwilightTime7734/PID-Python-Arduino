@@ -27,6 +27,10 @@ OFFSET_VALUE_MIN = -20
 OFFSET_VALUE_MAX = 20
 OFFSET_VALUE_OPTIONS = tuple(str(value) for value in range(OFFSET_VALUE_MIN, OFFSET_VALUE_MAX + 1))
 BAUD_OPTIONS = ("9600", "115200")
+STARTING_VALUES_PENDING_BACKGROUND = "#FFE4E1"
+STARTING_VALUES_SELECTED_BACKGROUND = "#90EE90"
+STARTING_VALUES_NEUTRAL_BACKGROUND = "#F0F0F0"
+STARTING_VALUES_NEUTRAL_FOREGROUND = "#555555"
 
 
 def normalize_channel_value(value: int | float) -> int:
@@ -72,30 +76,6 @@ def _readonly_table_entry(parent: tk.Misc, row: int, column: int, value: str, wi
     return entry
 
 
-def _build_pid_value_table(
-    parent: tk.Misc,
-    title: str,
-    rows: Sequence[tuple[str, Sequence[int | str]]],
-    headings: Sequence[str],
-) -> tk.LabelFrame:
-    frame = tk.LabelFrame(parent, text=title, padx=6, pady=5)
-    for column in range(len(headings)):
-        frame.grid_columnconfigure(column, weight=1)
-        tk.Label(frame, text=headings[column], anchor="center").grid(
-            row=0,
-            column=column,
-            padx=2,
-            pady=(0, 2),
-            sticky="we",
-        )
-    for row_index, (label, values) in enumerate(rows, start=1):
-        _readonly_table_entry(frame, row_index, 0, label, width=10)
-        for column_index in range(1, len(headings)):
-            value = values[column_index - 1] if column_index - 1 < len(values) else ""
-            _readonly_table_entry(frame, row_index, column_index, str(value))
-    return frame
-
-
 def _build_interactive_roll_pitch_table(
     parent: tk.Misc,
     title: str,
@@ -103,24 +83,17 @@ def _build_interactive_roll_pitch_table(
     headings: Sequence[str],
     pidff_vars: list[tk.StringVar],
 ) -> tk.LabelFrame:
-    """Build a Roll/Pitch table with clickable entries that sync to FC/INAV section."""
+    """Build a Roll/Pitch table with row-exclusive clickable entries syncing to FC."""
     frame = tk.LabelFrame(parent, text=title, padx=6, pady=5)
     for column in range(len(headings)):
         frame.grid_columnconfigure(column, weight=1)
         tk.Label(frame, text=headings[column], anchor="center").grid(
-            row=0,
-            column=column,
-            padx=2,
-            pady=(0, 2),
-            sticky="we",
+            row=0, column=column, padx=2, pady=(0, 2), sticky="we"
         )
     
-    # Store entry widget references and their state for color toggling
-    entry_states: dict[tk.Entry, dict] = {}
-    
-    # Map parameter names to their index in pidff_vars
-    # pidff_vars is indexed as: P=0, I=1, D=2, FF=3
     param_to_index = {"P": 0, "I": 1, "D": 2, "FF": 3}
+    # Tracks the currently active green entry widget per row parameter index
+    active_selections: dict[int, tk.Entry] = {}
     
     for row_index, (param_name, values) in enumerate(rows, start=1):
         _readonly_table_entry(frame, row_index, 0, param_name, width=10)
@@ -130,40 +103,39 @@ def _build_interactive_roll_pitch_table(
             value = values[column_index - 1] if column_index - 1 < len(values) else ""
             entry = tk.Entry(frame, width=8, justify="center", relief="sunken")
             entry.insert(0, str(value))
-            entry.config(state="readonly", readonlybackground="#FFE4E1", foreground="black")
+            entry.config(
+                state="readonly",
+                readonlybackground=STARTING_VALUES_PENDING_BACKGROUND,
+                foreground="black"
+            )
             entry.grid(row=row_index, column=column_index, padx=2, pady=2, sticky="we")
-            
-            # Initialize state: light red background, not toggled
-            entry_states[entry] = {
-                "toggled": False,
-                "param_idx": param_idx,
-                "param_name": param_name,
-            }
-            
-            def make_click_handler(entry_widget, state_dict):
+
+            def make_click_handler(current_entry, p_idx, p_name):
                 def on_click(event):
-                    # Toggle state
-                    state_dict[entry_widget]["toggled"] = not state_dict[entry_widget]["toggled"]
-                    
-                    if state_dict[entry_widget]["toggled"]:
-                        # Light green
-                        entry_widget.config(readonlybackground="#90EE90")
-                        # Update FC/INAV section
-                        value_text = entry_widget.get()
-                        param_idx = state_dict[entry_widget]["param_idx"]
-                        param_name = state_dict[entry_widget]["param_name"]
-                        
-                        if param_idx >= 0 and param_idx < len(pidff_vars):
-                            pidff_vars[param_idx].set(f"{param_name}: {value_text}")
-                    else:
-                        # Light red
-                        entry_widget.config(readonlybackground="#FFE4E1")
+                    # If this cell is already selected, unselect it and clear variable
+                    if active_selections.get(p_idx) == current_entry:
+                        current_entry.config(readonlybackground=STARTING_VALUES_PENDING_BACKGROUND)
+                        active_selections.pop(p_idx, None)
+                        if 0 <= p_idx < len(pidff_vars):
+                            pidff_vars[p_idx].set(f"{p_name}: --")
+                        return
+
+                    # Clear previous selection in this specific row if it exists
+                    if p_idx in active_selections:
+                        active_selections[p_idx].config(readonlybackground=STARTING_VALUES_PENDING_BACKGROUND)
+
+                    # Select new cell
+                    current_entry.config(readonlybackground=STARTING_VALUES_SELECTED_BACKGROUND)
+                    active_selections[p_idx] = current_entry
+
+                    if 0 <= p_idx < len(pidff_vars):
+                        pidff_vars[p_idx].set(f"{p_name}: {current_entry.get()}")
                 return on_click
             
-            entry.bind("<Button-1>", make_click_handler(entry, entry_states))
+            if param_idx >= 0:
+                entry.bind("<Button-1>", make_click_handler(entry, param_idx, param_name))
     
     return frame
-
 
 def _build_interactive_pid_value_table(
     parent: tk.Misc,
@@ -173,23 +145,20 @@ def _build_interactive_pid_value_table(
     roll_pidff_vars: list[tk.StringVar],
     pitch_pidff_vars: list[tk.StringVar],
 ) -> tk.LabelFrame:
-    """Build a readonly PID value table with clickable cells that stage values."""
+    """Build a readonly PID value table with axis-exclusive clickable cells."""
     frame = tk.LabelFrame(parent, text=title, padx=6, pady=5)
     for column in range(len(headings)):
         frame.grid_columnconfigure(column, weight=1)
         tk.Label(frame, text=headings[column], anchor="center").grid(
-            row=0,
-            column=column,
-            padx=2,
-            pady=(0, 2),
-            sticky="we",
+            row=0, column=column, padx=2, pady=(0, 2), sticky="we"
         )
 
-    entry_states: dict[tk.Entry, dict] = {}
+    # Track active selection per (axis, parameter) tuple to avoid global desync
+    active_selections: dict[tuple[str, str], tk.Entry] = {}
+    param_to_index = {"P": 0, "I": 1, "D": 2, "FF": 3}
 
     for row_index, (label, values) in enumerate(rows, start=1):
         clean_label = label.replace(" start", "").replace(" rec", "")
-        _readonly_table_entry(frame, row_index, 0, clean_label, width=10)
 
         axis_type = None
         if "Roll" in clean_label:
@@ -197,43 +166,68 @@ def _build_interactive_pid_value_table(
         elif "Pitch" in clean_label:
             axis_type = "pitch"
 
+        label_entry = _readonly_table_entry(frame, row_index, 0, clean_label, width=10)
+        if axis_type is None:
+            label_entry.config(
+                state="disabled",
+                disabledbackground=STARTING_VALUES_NEUTRAL_BACKGROUND,
+                disabledforeground=STARTING_VALUES_NEUTRAL_FOREGROUND,
+                takefocus=0,
+            )
+
         for column_index in range(1, len(headings)):
             value = values[column_index - 1] if column_index - 1 < len(values) else ""
             entry = tk.Entry(frame, width=8, justify="center", relief="sunken")
             entry.insert(0, str(value))
-            entry.config(state="readonly", readonlybackground="#FFE4E1", foreground="black")
+
+            if axis_type is None:
+                entry.config(
+                    state="disabled",
+                    disabledbackground=STARTING_VALUES_NEUTRAL_BACKGROUND,
+                    disabledforeground=STARTING_VALUES_NEUTRAL_FOREGROUND,
+                    takefocus=0,
+                )
+                entry.grid(row=row_index, column=column_index, padx=2, pady=2, sticky="we")
+                continue
+
+            entry.config(
+                state="readonly",
+                readonlybackground=STARTING_VALUES_PENDING_BACKGROUND,
+                foreground="black",
+            )
             entry.grid(row=row_index, column=column_index, padx=2, pady=2, sticky="we")
 
-            entry_states[entry] = {
-                "toggled": False,
-                "axis_type": axis_type,
-                "param_index": column_index - 1,
-            }
+            param_name = str(headings[column_index]).upper()
+            param_idx = param_to_index[param_name]
+            key = (axis_type, param_name)
 
-            if axis_type is not None:
-                def make_click_handler(entry_widget, state_dict):
-                    def on_click(event):
-                        state_dict[entry_widget]["toggled"] = not state_dict[entry_widget]["toggled"]
+            def make_click_handler(current_entry, axis, p_name, p_idx, select_key):
+                def on_click(event):
+                    vars_list = roll_pidff_vars if axis == "roll" else pitch_pidff_vars
 
-                        if state_dict[entry_widget]["toggled"]:
-                            entry_widget.config(readonlybackground="#90EE90")
-                            value_text = entry_widget.get()
-                            axis = state_dict[entry_widget]["axis_type"]
-                            param_idx = state_dict[entry_widget]["param_index"]
+                    # If clicking the already selected cell, turn it off
+                    if active_selections.get(select_key) == current_entry:
+                        current_entry.config(readonlybackground=STARTING_VALUES_PENDING_BACKGROUND)
+                        active_selections.pop(select_key, None)
+                        if p_idx < len(vars_list):
+                            vars_list[p_idx].set(f"{p_name}: --")
+                        return
 
-                            param_names = ["P", "D", "I", "FF"]
-                            if axis == "roll" and param_idx < len(roll_pidff_vars):
-                                roll_pidff_vars[param_idx].set(f"{param_names[param_idx]}: {value_text}")
-                            elif axis == "pitch" and param_idx < len(pitch_pidff_vars):
-                                pitch_pidff_vars[param_idx].set(f"{param_names[param_idx]}: {value_text}")
-                        else:
-                            entry_widget.config(readonlybackground="#FFE4E1")
-                    return on_click
+                    # Un-green the old selection for this parameter/axis variant
+                    if select_key in active_selections:
+                        active_selections[select_key].config(readonlybackground=STARTING_VALUES_PENDING_BACKGROUND)
 
-                entry.bind("<Button-1>", make_click_handler(entry, entry_states))
+                    # Stage the new choice
+                    current_entry.config(readonlybackground=STARTING_VALUES_SELECTED_BACKGROUND)
+                    active_selections[select_key] = current_entry
+
+                    if p_idx < len(vars_list):
+                        vars_list[p_idx].set(f"{p_name}: {current_entry.get()}")
+                return on_click
+
+            entry.bind("<Button-1>", make_click_handler(entry, axis_type, param_name, param_idx, key))
 
     return frame
-
 
 class ArtificialHorizon(tk.Canvas):
     def __init__(self, parent: tk.Misc, size: int = 180) -> None:
@@ -299,7 +293,6 @@ class MainUi:
     channel_output_fill_ids: list[int]
     level_button: tk.Button
     status: tk.StringVar
-    pc_link_box: tk.Label
     horizon: ArtificialHorizon
     roll_text: tk.StringVar
     pitch_text: tk.StringVar
@@ -320,14 +313,14 @@ class MainUi:
     analyze_blackbox_button: tk.Button
     arduino_button: tk.Button
     fly_log_button: tk.Button
+    pulse_axis_combo: ttk.Combobox
     pulse_force_combo: ttk.Combobox
     pulse_time_combo: ttk.Combobox
     pulse_positive_button: tk.Button
     pulse_negative_button: tk.Button
-    simulation_mode_var: tk.BooleanVar
-    simulation_mode_checkbutton: tk.Checkbutton
     step_response_button: tk.Button
     pid_tuning_plan_button: tk.Button
+    mixer_debug_button: tk.Button
 
 def build_main_gui(root: tk.Tk) -> MainUi:
     root.title("PPM Modbus")
@@ -402,15 +395,6 @@ def build_main_gui(root: tk.Tk) -> MainUi:
     connect_fc_button.grid(row=0, column=1, padx=2, pady=2, sticky="we")
     scan_fc_button = tk.Button(main_button_grid, text="Scan Ports", width=main_button_width)
     scan_fc_button.grid(row=0, column=2, padx=2, pady=2, sticky="we")
-    simulation_mode_var = tk.BooleanVar(value=False)
-    simulation_mode_checkbutton = tk.Checkbutton(
-        main_button_grid,
-        text="Simulate",
-        variable=simulation_mode_var,
-        width=main_button_width,
-        anchor="w",
-    )
-    simulation_mode_checkbutton.grid(row=0, column=3, padx=2, pady=2, sticky="we")
 
     import_blackbox_button = tk.Button(main_button_grid, text="Pull MSC Logs", width=main_button_width)
     import_blackbox_button.grid(row=1, column=0, padx=2, pady=2, sticky="we")
@@ -420,7 +404,6 @@ def build_main_gui(root: tk.Tk) -> MainUi:
     level_button.grid(row=1, column=2, padx=2, pady=2, sticky="we")
 
     status = tk.StringVar(value="Idle")
-    pc_link_box = tk.Label(main_frame, width=18, relief="groove", bd=2)
 
     fc_frame = tk.LabelFrame(layout_grid, text="FC / INAV", padx=8, pady=8)
     fc_frame.grid(row=0, column=1, padx=(4, 0), pady=(0, 6), sticky="nsew")
@@ -520,6 +503,15 @@ def build_main_gui(root: tk.Tk) -> MainUi:
     auto_action_frame.grid(row=0, column=0, sticky="w", pady=(0, 6))
     fly_log_button = tk.Button(auto_action_frame, text="Fly / Log", width=18)
     fly_log_button.pack(side="left", padx=(0, 4))
+    tk.Label(auto_action_frame, text="Axis").pack(side="left", padx=(4, 2))
+    pulse_axis_combo = ttk.Combobox(
+        auto_action_frame,
+        width=7,
+        values=("Roll", "Pitch"),
+        state="readonly",
+    )
+    pulse_axis_combo.set("Roll")
+    pulse_axis_combo.pack(side="left", padx=(0, 4))
     tk.Label(auto_action_frame, text="Pulse us").pack(side="left", padx=(4, 2))
     pulse_force_combo = ttk.Combobox(
         auto_action_frame,
@@ -528,13 +520,14 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         state="readonly",
     )
     pulse_force_combo.pack(side="left", padx=(0, 4))
-    tk.Label(auto_action_frame, text="Time s").pack(side="left", padx=(2, 2))
+    tk.Label(auto_action_frame, text="Board s").pack(side="left", padx=(2, 2))
     pulse_time_combo = ttk.Combobox(
         auto_action_frame,
         width=5,
-        values=("0.20", "0.25", "0.30", "0.35", "0.40", "0.50"),
+        values=("0.10",),
         state="readonly",
     )
+    pulse_time_combo.set("0.10")
     pulse_time_combo.pack(side="left", padx=(0, 4))
     pulse_negative_button = tk.Button(
         auto_action_frame,
@@ -559,7 +552,9 @@ def build_main_gui(root: tk.Tk) -> MainUi:
     step_response_button = tk.Button(auto_action_frame, text="Chart Step Response", width=18)
     step_response_button.pack(side="left", padx=(0, 4))
     pid_tuning_plan_button = tk.Button(auto_action_frame, text="PID Tuning Plan", width=16)
-    pid_tuning_plan_button.pack(side="left")
+    pid_tuning_plan_button.pack(side="left", padx=(0, 4))
+    mixer_debug_button = tk.Button(auto_action_frame, text="Mixer Debug", width=13)
+    mixer_debug_button.pack(side="left")
 
     pid_table_frame = tk.Frame(auto_frame)
     pid_table_frame.grid(row=1, column=0, sticky="we", pady=(8, 0))
@@ -575,7 +570,7 @@ def build_main_gui(root: tk.Tk) -> MainUi:
             ("Yaw start", ("00", "00", "00", "00")),
             ("Yaw rec", ("00", "00", "00", "00")),
         ),
-        ("Axis", "P", "D", "I", "FF"),
+        ("Axis", "P", "I", "D", "FF"),
         roll_pidff_vars,
         pitch_pidff_vars,
     )
@@ -586,8 +581,8 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         "Roll",
         (
             ("P", ("00", "00", "00", "00", "00")),
-            ("D", ("00", "00", "00", "00", "00")),
             ("I", ("00", "00", "00", "00", "00")),
+            ("D", ("00", "00", "00", "00", "00")),
             ("FF", ("00", "00", "00", "00", "00")),
         ),
         ("Gain", "1", "2", "3", "4", "5"),
@@ -600,8 +595,8 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         "Pitch",
         (
             ("P", ("00", "00", "00", "00", "00")),
-            ("D", ("00", "00", "00", "00", "00")),
             ("I", ("00", "00", "00", "00", "00")),
+            ("D", ("00", "00", "00", "00", "00")),
             ("FF", ("00", "00", "00", "00", "00")),
         ),
         ("Gain", "1", "2", "3", "4", "5"),
@@ -627,7 +622,6 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         channel_output_fill_ids=channel_output_fill_ids,
         level_button=level_button,
         status=status,
-        pc_link_box=pc_link_box,
         horizon=horizon,
         roll_text=roll_text,
         pitch_text=pitch_text,
@@ -648,12 +642,12 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         analyze_blackbox_button=analyze_blackbox_button,
         arduino_button=arduino_button,
         fly_log_button=fly_log_button,
+        pulse_axis_combo=pulse_axis_combo,
         pulse_force_combo=pulse_force_combo,
         pulse_time_combo=pulse_time_combo,
         pulse_positive_button=pulse_positive_button,
         pulse_negative_button=pulse_negative_button,
-        simulation_mode_var=simulation_mode_var,
-        simulation_mode_checkbutton=simulation_mode_checkbutton,
         step_response_button=step_response_button,
         pid_tuning_plan_button=pid_tuning_plan_button,
+        mixer_debug_button=mixer_debug_button,
     )

@@ -6,6 +6,7 @@ import time
 from collections.abc import Callable
 
 from ..constants import (
+    ARDUINO_FIXED_PULSE_HOLD_S,
     LEVEL_CENTER_US,
     LEVEL_DEADBAND_DEG,
     PITCH_CHANNEL_INDEX,
@@ -13,7 +14,7 @@ from ..constants import (
     ROLL_CHANNEL_INDEX,
     THROTTLE_CHANNEL_INDEX,
 )
-from ..tasks.worker_tasks import hold_channel_until_stop as worker_hold_channel_until_stop
+from ..tasks.worker_tasks import pulse_channel_force as worker_pulse_channel_force
 
 
 class LevelWorkflow:
@@ -24,9 +25,7 @@ class LevelWorkflow:
     # It is never used to scale into a big pulse, which avoids the overshoot
     # seen with the older angle-chasing level logic.
     COARSE_FORCE_US = 70
-    COARSE_HOLD_S = 0.07
     FINE_FORCE_US = 27
-    FINE_HOLD_S = 0.03
     FINE_TUNE_ENTER_DEG = 4.0
     CORRECTION_SETTLE_MS = 250
     EMERGENCY_ATTITUDE_DEG = 70.0
@@ -95,15 +94,13 @@ class LevelWorkflow:
             return None
         if abs_angle <= self.FINE_TUNE_ENTER_DEG:
             delta = self.FINE_FORCE_US
-            hold_s = self.FINE_HOLD_S
             mode = "fine"
         else:
             delta = self.COARSE_FORCE_US
-            hold_s = self.COARSE_HOLD_S
             mode = "coarse"
         if angle_deg > 0:
-            return LEVEL_CENTER_US - delta, delta, hold_s, mode
-        return LEVEL_CENTER_US + delta, delta, hold_s, mode
+            return LEVEL_CENTER_US - delta, delta, ARDUINO_FIXED_PULSE_HOLD_S, mode
+        return LEVEL_CENTER_US + delta, delta, ARDUINO_FIXED_PULSE_HOLD_S, mode
 
     def attitude_is_settled(self, roll_deg: float, pitch_deg: float) -> bool:
         return abs(roll_deg) <= LEVEL_DEADBAND_DEG and abs(pitch_deg) <= LEVEL_DEADBAND_DEG
@@ -191,12 +188,12 @@ class LevelWorkflow:
             axis_targets, key=lambda item: item[2]
         )
 
-        try:
-            offsets = self.parse_offsets()
-        except Exception as exc:
+        if len(app.base_channel_outputs) <= channel_index:
             self.stop(update_status=False)
-            self.set_error("Level error", exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
+            self.set_error("Level error", RuntimeError("Base channel output list is too short for auto-level pulse"))
             return
+        base_value = int(app.base_channel_outputs[channel_index])
+        signed_force_us = target_us - base_value
 
         active_outputs = app.base_channel_outputs.copy()
         active_outputs[channel_index] = target_us
@@ -209,7 +206,7 @@ class LevelWorkflow:
         app.status.set(
             f"Auto-level {correction_mode} nudge {pulse_count}/{self.MAX_CORRECTION_PULSES}: "
             f"{axis_name} CH{channel_index + 1} {LEVEL_CENTER_US}->{target_us} "
-            f"({direction_text}{direction}us) for {hold_s:.3g}s; "
+            f"({direction_text}{direction}us) for board-fixed {ARDUINO_FIXED_PULSE_HOLD_S:.2f}s; "
             f"error {angle_error_deg:.1f} deg; waiting {self.CORRECTION_SETTLE_MS}ms."
         )
         app.level_pulse_inflight = True
@@ -233,11 +230,9 @@ class LevelWorkflow:
             self.schedule_step()
 
         app.worker.submit(
-            worker_hold_channel_until_stop,
+            worker_pulse_channel_force,
             channel_index,
-            target_us,
-            offsets[channel_index],
-            hold_s,
+            signed_force_us,
             callback=on_level_pulse_done,
         )
 
@@ -269,9 +264,10 @@ class LevelWorkflow:
                 ref_text = f" Level reference roll={reference.roll_deg:+.1f}, pitch={reference.pitch_deg:+.1f}."
             app.status.set(
                 f"Auto-level active at shared test throttle {test_throttle_us}us. "
-                f"Coarse +/-{self.COARSE_FORCE_US}us for {self.COARSE_HOLD_S:.3g}s above "
-                f"{self.FINE_TUNE_ENTER_DEG:.1f} deg; fine +/-{self.FINE_FORCE_US}us for "
-                f"{self.FINE_HOLD_S:.3g}s near center; settle {self.CORRECTION_SETTLE_MS}ms. "
+                f"Coarse +/-{self.COARSE_FORCE_US}us above "
+                f"{self.FINE_TUNE_ENTER_DEG:.1f} deg; fine +/-{self.FINE_FORCE_US}us "
+                f"near center; board pulse duration {ARDUINO_FIXED_PULSE_HOLD_S:.2f}s; "
+                f"settle {self.CORRECTION_SETTLE_MS}ms. "
                 f"Leveling is relative to the captured quiet reference.{ref_text} "
                 f"One press continues until centered, safety stop, {self.MAX_CORRECTION_PULSES} nudges, "
                 f"or {self.MAX_LEVEL_RUN_S:.0f}s. Press Level again to stop."

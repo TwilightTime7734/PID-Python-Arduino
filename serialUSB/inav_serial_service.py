@@ -354,16 +354,25 @@ class InavSerialService:
         )
         return roll, pitch
 
-    def get_setting_int(self, name: str, timeout_seconds: float = 0.8) -> int:
+    def request_msp_v2(self, command_id: int, payload: bytes = b"", timeout_seconds: float = 0.8) -> bytes:
+        """Issue a raw MSPv2 request and return the payload bytes."""
+        return self._request(command_id, payload, timeout_seconds=max(0.1, timeout_seconds))
+
+    def get_setting_bytes(self, name: str, timeout_seconds: float = 0.8) -> bytes:
+        """Read the raw bytes for an INAV setting."""
         index = self._setting_index(name, timeout_seconds=max(0.1, timeout_seconds))
-        payload = self._request(MSP2_COMMON_SETTING, self._setting_key_payload(index), timeout_seconds=max(0.1, timeout_seconds))
+        return self._request(MSP2_COMMON_SETTING, self._setting_key_payload(index), timeout_seconds=max(0.1, timeout_seconds))
+
+    def get_setting_int(self, name: str, timeout_seconds: float = 0.8) -> int:
+        payload = self.get_setting_bytes(name, timeout_seconds=max(0.1, timeout_seconds))
         if not payload:
             raise RuntimeError(f"INAV setting '{name}' returned empty payload.")
         return int.from_bytes(payload, byteorder="little", signed=False)
 
-    def set_setting_int(self, name: str, value: int, timeout_seconds: float = 0.8) -> int:
+    def set_setting_bytes(self, name: str, raw_value: bytes, timeout_seconds: float = 0.8) -> bytes:
+        """Write raw bytes to an INAV setting and confirm the stored bytes."""
         setting = name.strip().lower()
-        target = int(value)
+        value = bytes(raw_value)
         timeout_s = max(0.1, timeout_seconds)
         index = self._setting_index(setting, timeout_seconds=timeout_s)
         info = bytearray(self._request(MSP2_COMMON_SETTING_INFO, self._setting_key_payload(index), timeout_s))
@@ -375,10 +384,45 @@ class InavSerialService:
         value_size = len(current_payload)
         if value_size not in (1, 2, 4):
             raise RuntimeError(f"Unsupported setting byte width for '{setting}': {value_size}")
-        encoded = target.to_bytes(value_size, byteorder="little", signed=False)
-        info[name_end + 1 : name_end + 1 + value_size] = encoded
+        if len(value) != value_size:
+            raise RuntimeError(
+                f"Setting '{setting}' expects {value_size} bytes, but {len(value)} were provided."
+            )
+        info[name_end + 1 : name_end + 1 + value_size] = value
         self._request(MSP2_COMMON_SET_SETTING, bytes(info), timeout_s)
-        return self.get_setting_int(setting, timeout_seconds=timeout_s)
+        confirmed = self.get_setting_bytes(setting, timeout_seconds=timeout_s)
+        if confirmed != value:
+            raise RuntimeError(f"INAV setting '{setting}' did not read back with the expected raw bytes.")
+        return confirmed
+
+    def set_setting_int(self, name: str, value: int, timeout_seconds: float = 0.8) -> int:
+        setting = name.strip().lower()
+        target = int(value)
+        current_payload = self.get_setting_bytes(setting, timeout_seconds=max(0.1, timeout_seconds))
+        encoded = target.to_bytes(len(current_payload), byteorder="little", signed=False)
+        confirmed = self.set_setting_bytes(setting, encoded, timeout_seconds=timeout_seconds)
+        return int.from_bytes(confirmed, byteorder="little", signed=False)
+
+    def list_setting_names(self, timeout_seconds: float = 0.8, max_index: int = 4096) -> list[str]:
+        """Return every setting name discoverable through MSP2_COMMON_SETTING_INFO."""
+        names: list[str] = []
+        timeout_s = max(0.1, timeout_seconds)
+        for index in range(max(0, int(max_index))):
+            try:
+                payload = self._request(
+                    MSP2_COMMON_SETTING_INFO,
+                    self._setting_key_payload(index),
+                    timeout_seconds=timeout_s,
+                )
+            except Exception:
+                continue
+            nul = payload.find(b"\x00")
+            if nul <= 0:
+                continue
+            found = payload[:nul].decode("ascii", errors="ignore").strip().lower()
+            if found:
+                names.append(found)
+        return names
 
     def save_settings(self, timeout_seconds: float = 1.2) -> None:
         self._request(MSP_EEPROM_WRITE, b"", timeout_seconds=max(0.1, timeout_seconds))

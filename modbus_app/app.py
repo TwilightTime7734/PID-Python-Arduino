@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import replace
 from pathlib import Path
 import queue
-import time
 import tkinter as tk
 from tkinter import messagebox
 
 from serialUSB.inav_serial_service import InavSerialService
 
 from .constants import (
+    ARDUINO_FIXED_PULSE_HOLD_S,
+    ARDUINO_FIXED_PULSE_HOLD_MS,
     FC_PORT_DEFAULT,
     FLY_LOG_SAFETY_TIMEOUT_S,
     PITCH_CHANNEL_INDEX,
@@ -55,12 +55,14 @@ from .workflows.auto_session_workflow import AutoSessionWorkflow
 from .workflows.auto_session_completion_workflow import AutoSessionCompletionWorkflow
 from .workflows.auto_session_engine import AutoSessionEngine
 from .workflows.deterministic_fly_log_workflow import DeterministicFlyLogWorkflow
+from .workflows.fly_log_mixer_workflow import FlyLogMixerWorkflow
+from .workflows.mixer_debug_workflow import MixerDebugWorkflow
 from .tasks.worker_tasks import (
     analyze_blackbox_logs as worker_analyze_blackbox_logs,
     analyze_specific_blackbox_log as worker_analyze_specific_blackbox_log,
     enter_msc_and_import_blackbox_logs as worker_enter_msc_and_import_blackbox_logs,
     generate_auto_report as worker_generate_auto_report,
-    hold_channel_until_stop as worker_hold_channel_until_stop,
+    pulse_channel_force as worker_pulse_channel_force,
     read_movement_attitude as worker_read_movement_attitude,
 )
 
@@ -139,6 +141,13 @@ class ModbusApp(HardwareStateMixin):
                 combo.configure(values=tuple(values))
             combo.set(value_text)
 
+        def _set_axis_combo_value(combo, value_text: str) -> None:
+            values = _combo_values(combo)
+            if value_text not in values:
+                values.append(value_text)
+                combo.configure(values=tuple(values))
+            combo.set(value_text)
+
         def _format_pulse_force_us(value: int | float) -> str:
             return str(int(round(float(value))))
 
@@ -149,6 +158,7 @@ class ModbusApp(HardwareStateMixin):
             if profile is None:
                 profile = estimate_test_pulse_profile(PStartInputs())
             self.test_pulse_profile_base = profile
+            _set_axis_combo_value(self.pulse_axis_combo, profile.test_axis.title())
             _set_combo_value(
                 self.pulse_force_combo,
                 _format_pulse_force_us(profile.main_force_us),
@@ -156,7 +166,7 @@ class ModbusApp(HardwareStateMixin):
             )
             _set_combo_value(
                 self.pulse_time_combo,
-                _format_pulse_hold_s(profile.main_hold_s),
+                _format_pulse_hold_s(ARDUINO_FIXED_PULSE_HOLD_S),
                 numeric_key=lambda item: float(item),
             )
             return profile
@@ -171,18 +181,29 @@ class ModbusApp(HardwareStateMixin):
             return force_us
 
         def read_pulse_hold_s() -> float:
-            hold_s = float(self.pulse_time_combo.get().strip())
             _set_combo_value(
                 self.pulse_time_combo,
-                _format_pulse_hold_s(hold_s),
+                _format_pulse_hold_s(ARDUINO_FIXED_PULSE_HOLD_S),
                 numeric_key=lambda item: float(item),
             )
-            return hold_s
+            return ARDUINO_FIXED_PULSE_HOLD_S
+
+        def read_pulse_axis() -> str:
+            axis = self.pulse_axis_combo.get().strip().lower()
+            if axis == "pitch":
+                _set_axis_combo_value(self.pulse_axis_combo, "Pitch")
+                return "pitch"
+            _set_axis_combo_value(self.pulse_axis_combo, "Roll")
+            return "roll"
 
         def sync_pulse_dropdowns_from_user(event=None) -> None:
+            axis = read_pulse_axis()
             force_us = read_pulse_force_us()
             hold_s = read_pulse_hold_s()
-            self.status.set(f"Fly/Log main pulse set to +/-{force_us}us for {hold_s:.2f}s.")
+            self.status.set(
+                f"Fly/Log main pulse set to {axis.title()} +/-{force_us}us; "
+                f"board duration is fixed at {hold_s:.2f}s."
+            )
 
         def current_plan_test_pulse_profile() -> TestPulseProfile | None:
             plan = getattr(self, "pid_plan", None)
@@ -197,7 +218,8 @@ class ModbusApp(HardwareStateMixin):
             return replace(
                 profile,
                 main_force_us=read_pulse_force_us(),
-                main_hold_s=read_pulse_hold_s(),
+                main_hold_s=ARDUINO_FIXED_PULSE_HOLD_S,
+                probe_hold_s=ARDUINO_FIXED_PULSE_HOLD_S,
             )
 
         set_test_pulse_profile(current_plan_test_pulse_profile())
@@ -210,21 +232,18 @@ class ModbusApp(HardwareStateMixin):
                 force_max_us=max(config.force_max_us, int(pulse.main_force_us)),
                 roll_force_us=int(pulse.main_force_us),
                 pitch_force_us=int(pulse.main_force_us),
-                roll_hold_s=float(pulse.main_hold_s),
-                pitch_hold_s=float(pulse.main_hold_s),
-                hold_max_s=max(config.hold_max_s, float(pulse.main_hold_s)),
+                roll_hold_s=ARDUINO_FIXED_PULSE_HOLD_S,
+                pitch_hold_s=ARDUINO_FIXED_PULSE_HOLD_S,
+                hold_min_s=ARDUINO_FIXED_PULSE_HOLD_S,
+                hold_max_s=ARDUINO_FIXED_PULSE_HOLD_S,
                 probe_force_us=int(pulse.probe_force_us),
-                probe_hold_s=float(pulse.probe_hold_s),
+                probe_hold_s=ARDUINO_FIXED_PULSE_HOLD_S,
+                recovery_hold_s=ARDUINO_FIXED_PULSE_HOLD_S,
             )
-
-        def simulation_mode_enabled() -> bool:
-            return bool(self.simulation_mode_var.get())
 
         fly_log_workflow = FlyLogWorkflow(
             app=self,
-            simulation_mode_enabled=simulation_mode_enabled,
             start_pid_plan_fly_log=lambda: start_pid_plan_fly_log(),
-            start_simulated_fly_log=lambda: start_simulated_fly_log(),
             set_error=lambda title, exc: set_error(title, exc),
         )
 
@@ -390,7 +409,6 @@ class ModbusApp(HardwareStateMixin):
             app=self,
             fc_port=fc_port,
             fc_baud=fc_baud,
-            simulation_mode_enabled=simulation_mode_enabled,
             auto_is_running=lambda: auto_is_running(),
             publish_auto_report=publish_auto_report,
             set_error=lambda title, exc: set_error(title, exc),
@@ -410,7 +428,6 @@ class ModbusApp(HardwareStateMixin):
             open_progress_window=lambda: open_pid_progress_window(),
             ensure_disarmed_before_pid_write=lambda: ensure_disarmed_before_pid_write(),
             stage_pid_ff_var=set_pid_ff_var,
-            stop_simulated_auto_session=lambda *args, **kwargs: stop_simulated_auto_session(*args, **kwargs),
             set_test_throttle_us=set_test_throttle_us,
             set_test_pulse_profile=set_test_pulse_profile,
         )
@@ -534,12 +551,6 @@ class ModbusApp(HardwareStateMixin):
         def auto_is_running() -> bool:
             return auto_session_workflow.is_running()
 
-        def test_pulse_axis_channel(profile: TestPulseProfile) -> tuple[str, int]:
-            axis = str(profile.test_axis).strip().lower()
-            if axis == "pitch":
-                return "pitch", PITCH_CHANNEL_INDEX
-            return "roll", ROLL_CHANNEL_INDEX
-
         def set_test_pulse_buttons_state(state: str) -> None:
             self.pulse_positive_button.config(state=state)
             self.pulse_negative_button.config(state=state)
@@ -555,21 +566,16 @@ class ModbusApp(HardwareStateMixin):
                 if self.level_active:
                     self.status.set("Stop auto-level before testing the pulse.")
                     return
-                if self.sim_active or self.sim_fly_log_active:
-                    self.status.set("Stop simulation before testing the pulse.")
-                    return
                 if not arduino_output_connected():
                     raise RuntimeError("Connect Arduino output before testing the pulse.")
 
                 profile = current_test_pulse_profile()
-                axis, channel_index = test_pulse_axis_channel(profile)
+                axis = read_pulse_axis()
+                channel_index = PITCH_CHANNEL_INDEX if axis == "pitch" else ROLL_CHANNEL_INDEX
                 signed_force_us = int(profile.main_force_us) * (1 if direction >= 0 else -1)
                 hold_s = float(profile.main_hold_s)
                 if len(self.base_channel_outputs) <= channel_index:
                     raise RuntimeError("Base channel output list is too short for a test pulse.")
-                offsets = parse_offset_values_with_defaults()
-                if len(offsets) <= channel_index:
-                    raise RuntimeError("Offset list is too short for a test pulse.")
 
                 base_value = int(self.base_channel_outputs[channel_index])
                 target = max(1000, min(2000, base_value + signed_force_us))
@@ -578,11 +584,11 @@ class ModbusApp(HardwareStateMixin):
                 set_live_channel_outputs(active_outputs)
                 self.manual_pulse_inflight = True
                 set_test_pulse_buttons_state("disabled")
-                hold_ms = max(1, round(hold_s * 1000))
+                hold_ms = ARDUINO_FIXED_PULSE_HOLD_MS
                 direction_text = "+" if signed_force_us >= 0 else ""
                 self.status.set(
                     f"Testing {axis} pulse: CH{channel_index + 1} {base_value}->{target} "
-                    f"({direction_text}{signed_force_us}us) for {hold_s:.2f}s."
+                    f"({direction_text}{signed_force_us}us) for board-fixed {hold_s:.2f}s."
                 )
 
                 def finish_test_pulse(status_text: str) -> None:
@@ -593,7 +599,7 @@ class ModbusApp(HardwareStateMixin):
 
                 def complete_test_pulse() -> None:
                     finish_test_pulse(
-                        f"Test pulse complete: {axis} {direction_text}{signed_force_us}us for {hold_s:.2f}s."
+                        f"Test pulse complete: {axis} {direction_text}{signed_force_us}us for board-fixed {hold_s:.2f}s."
                     )
 
                 def on_test_pulse_done(ok: bool, res: object) -> None:
@@ -615,11 +621,9 @@ class ModbusApp(HardwareStateMixin):
                     self.root.after(hold_ms, complete_test_pulse)
 
                 self.worker.submit(
-                    worker_hold_channel_until_stop,
+                    worker_pulse_channel_force,
                     channel_index,
-                    target,
-                    offsets[channel_index],
-                    hold_s,
+                    signed_force_us,
                     callback=on_test_pulse_done,
                 )
             except Exception as exc:
@@ -643,12 +647,30 @@ class ModbusApp(HardwareStateMixin):
             auto_session_completion.complete(next_state, reason, warning, lower_throttle)
 
         def auto_abort(reason: str, warning: str = "", continue_pipeline: bool = False) -> None:
+            if fly_log_mixer_workflow.is_active():
+                try:
+                    fly_log_mixer_workflow.restore_after_test()
+                    self.fly_log_mixer_snapshot_path = fly_log_mixer_workflow.snapshot_path
+                except Exception as restore_exc:
+                    merged_warning = warning.strip()
+                    restore_warning = f"Motor mixer restore also failed: {restore_exc}"
+                    warning = f"{merged_warning}\n{restore_warning}".strip() if merged_warning else restore_warning
             auto_session_workflow.abort(reason, warning, continue_pipeline)
 
         def finish_pid_plan_fly_log(reason: str = "Fly/Log calibration complete.") -> None:
             if not self.pid_plan_fly_log_active:
                 return
             self.fly_log_finishing = False
+            if fly_log_mixer_workflow.is_active():
+                try:
+                    fly_log_mixer_workflow.restore_after_test()
+                    self.fly_log_mixer_snapshot_path = fly_log_mixer_workflow.snapshot_path
+                except Exception as exc:
+                    auto_abort(
+                        "Unable to restore the INAV motor mixer after Fly/Log.",
+                        warning=str(exc),
+                    )
+                    return
             complete_auto_session(AdaptiveSessionState.report_ready, reason)
             self.pid_plan_fly_log_active = False
             self.pid_plan_waiting_for_fly_log = False
@@ -700,7 +722,6 @@ class ModbusApp(HardwareStateMixin):
             auto_elapsed_s=auto_elapsed_s,
             pulse_axis_value=pulse_axis_value,
             arduino_output_connected=arduino_output_connected,
-            parse_offset_values_with_defaults=parse_offset_values_with_defaults,
             set_live_channel_outputs=set_live_channel_outputs,
             begin_auto_observe_window=begin_auto_observe_window,
             begin_fly_log_marker_off_and_complete=begin_fly_log_marker_off_and_complete,
@@ -751,6 +772,9 @@ class ModbusApp(HardwareStateMixin):
         def begin_auto_pipeline() -> None:
             auto_session_completion.begin_pipeline()
 
+        fly_log_mixer_workflow = FlyLogMixerWorkflow(self)
+        mixer_debug_workflow = MixerDebugWorkflow(self)
+
         def fc_is_armed_for_fly_log() -> bool:
             try:
                 if self.fc_service.is_armed(timeout_seconds=0.8):
@@ -776,9 +800,6 @@ class ModbusApp(HardwareStateMixin):
             if auto_is_running():
                 self.status.set("Auto/FlyLog task already running.")
                 return
-            if self.sim_active:
-                self.status.set("Stop simulation before Fly/Log.")
-                return
             if not arduino_output_connected():
                 raise RuntimeError("Connect Arduino output before Fly/Log.")
             if not self.fc_service.is_connected:
@@ -793,23 +814,27 @@ class ModbusApp(HardwareStateMixin):
             self.auto_config = replace(read_auto_tune_config(), max_runtime_s=FLY_LOG_SAFETY_TIMEOUT_S)
             pulse = current_test_pulse_profile()
             pulse_text = (
-                f"{pulse.aircraft_name}: {pulse.test_axis} start probe +/-{pulse.probe_force_us}us for "
-                f"{pulse.probe_hold_s:.2f}s; main sequence 10 positive and 10 negative "
-                f"{pulse.test_axis} pulses at dropdown-selected +/-{pulse.main_force_us}us for "
-                f"{pulse.main_hold_s:.2f}s each; neutral wait {pulse.neutral_wait_ms}ms."
+                f"{pulse.aircraft_name}: {pulse.test_axis} start probe +/-{pulse.probe_force_us}us; "
+                f"main sequence 10 positive and 10 negative {pulse.test_axis} pulses at "
+                f"dropdown-selected +/-{pulse.main_force_us}us; board pulse duration fixed at "
+                f"{ARDUINO_FIXED_PULSE_HOLD_S:.2f}s; neutral wait {pulse.neutral_wait_ms}ms."
             )
             prompt = (
                 f"Fly/Log candidate: {self.pid_plan_current_candidate_title or 'current PID plan step'}\n\n"
                 "The FC reports ARMED.\n\n"
                 "Pressing OK will run this sequence:\n"
-                "1. Brief spin-up on the current outputs\n"
-                "2. Small pre-marker start probes\n"
-                "3. CH8 PID test marker ON (BEEPERON in Blackbox)\n"
-                "4. Marked deterministic one-axis pulse pairs\n"
-                "5. CH8 PID test marker OFF (BEEPEROFF in Blackbox)\n\n"
+                "0. Snapshot the current INAV motor mixer to a permanent file\n"
+                "1. Zero the unused axis and yaw in INAV, then save and confirm\n"
+                "2. Brief spin-up on the current outputs\n"
+                "3. Small pre-marker start probes\n"
+                "4. CH8 PID test marker ON (BEEPERON in Blackbox)\n"
+                "5. Marked deterministic one-axis pulse pairs\n"
+                "6. CH8 PID test marker OFF (BEEPEROFF in Blackbox)\n"
+                "7. Restore the original mixer and confirm it in INAV\n\n"
                 f"Pulse profile: {pulse_text}\n\n"
                 "Chart Step Response analyzes the marker bracket, not a fixed time window. "
                 "You can also bracket your own logs of any length with CH8 markers.\n\n"
+                "The snapshot file is never deleted automatically.\n"
                 "No PID/FF values will be written while armed.\n\n"
                 "Keep the drone secured, keep the area clear, and be ready to disarm."
             )
@@ -817,476 +842,27 @@ class ModbusApp(HardwareStateMixin):
                 self.status.set("Fly/Log canceled.")
                 return
 
+            snapshot_path = fly_log_mixer_workflow.prepare_for_test(pulse.test_axis)
+            self.fly_log_mixer_snapshot_path = snapshot_path
             deterministic_fly_log_workflow.start()
 
-        def set_sim_attitude_display() -> None:
-            self.horizon.set_attitude(self.sim_roll_deg, self.sim_pitch_deg)
-            self.roll_text.set(f"Roll: {self.sim_roll_deg:6.1f} deg")
-            self.pitch_text.set(f"Pitch: {self.sim_pitch_deg:6.1f} deg")
-
-        def restore_neutral_sim_display() -> None:
-            self.horizon.set_attitude(0.0, 0.0)
-            self.roll_text.set("Roll: 0.0 deg")
-            self.pitch_text.set("Pitch: 0.0 deg")
-            clear_pid_ff_displays()
-
-        def set_sim_pid_ff_display(target: dict[str, dict[str, int]]) -> None:
-            for label, gain, var in zip(self.pid_ff_labels, ("p", "i", "d", "ff"), self.roll_pidff_vars):
-                value = target.get("roll", {}).get(gain)
-                var.set(f"{label}: --" if value is None else f"{label}: {value}")
-            for label, gain, var in zip(self.pid_ff_labels, ("p", "i", "d", "ff"), self.pitch_pidff_vars):
-                value = target.get("pitch", {}).get(gain)
-                var.set(f"{label}: --" if value is None else f"{label}: {value}")
-
-        def simulation_hardware_is_disconnected() -> bool:
-            if self.start_pending or self.controller.is_connected:
-                messagebox.showwarning(
-                    "Simulation Requires No Hardware",
-                    "Disconnect Arduino output before using the simulator.",
-                    parent=self.root,
-                )
-                return False
-            if self.fc_service.is_connected:
-                messagebox.showwarning(
-                    "Simulation Requires No Hardware",
-                    "Disconnect the FC before using the simulator. Simulation uses synthetic attitude and PID boxes only.",
-                    parent=self.root,
-                )
-                return False
-            return True
-
-        def _sim_preview_d(plan: LoadedPIDTuningPlan) -> int:
-            if len(plan.d_sweep) >= 2:
-                return int(plan.d_sweep[1])
-            if plan.d_sweep:
-                return int(plan.d_sweep[0])
-            return 17
-
-        def _sim_preview_pair(rows: tuple[dict[str, int], ...], fallback: dict[str, int]) -> dict[str, int]:
-            if not rows:
-                return dict(fallback)
-            return dict(rows[min(1, len(rows) - 1)])
-
-        def build_simulated_pid_plan_steps(plan: LoadedPIDTuningPlan) -> list[dict[str, object]]:
-            start_d = int(plan.d_sweep[0]) if plan.d_sweep else 17
-            preview_d = _sim_preview_d(plan)
-            preview_p = _sim_preview_pair(tuple({"roll": r["roll"], "pitch": r["pitch"]} for r in pid_plan_p_candidates_for(plan)), plan.start_p)
-            preview_i = _sim_preview_pair(plan.i_sweep, {"roll": 60, "pitch": 65})
-            preview_ff = _sim_preview_pair(plan.ff_sweep, {"roll": 86, "pitch": 89})
-            steps: list[dict[str, object]] = []
-
-            def add(title: str, instruction: str, stage: str, target: dict[str, dict[str, int]], note: str = "") -> None:
-                steps.append({"title": title, "instruction": instruction, "stage": stage, "target": target, "note": note})
-
-            add(
-                "Safe start / first D log",
-                f"Start P with Roll I {plan.start_i['roll']}, Pitch I {plan.start_i['pitch']}, FF = 0, and the first D value.",
-                "d",
-                roll_pitch_target(
-                    plan.start_p["roll"],
-                    plan.start_p["pitch"],
-                    start_d,
-                    start_d,
-                    plan.start_i["roll"],
-                    plan.start_i["pitch"],
-                    0,
-                    0,
-                ),
+        def do_mixer_debug() -> None:
+            if self.blackbox_import_inflight:
+                self.status.set("Blackbox/report task already in progress.")
+                return
+            if auto_is_running():
+                self.status.set("Wait for the active Auto/FlyLog task to finish first.")
+                return
+            if not self.fc_service.is_connected:
+                raise RuntimeError("Connect FC before running mixer debug.")
+            out_path = mixer_debug_workflow.capture_reference()
+            messagebox.showinfo(
+                "Mixer Debug",
+                f"Recorded mixer debug capture:\n\n{out_path}",
+                parent=self.root,
             )
-            for index, d_value in enumerate(plan.d_sweep[1:], start=2):
-                add(
-                    f"D sweep {index}/{len(plan.d_sweep)}",
-                    f"Compare damping with Roll/Pitch D {d_value}.",
-                    "d",
-                    roll_pitch_target(
-                        plan.start_p["roll"],
-                        plan.start_p["pitch"],
-                        int(d_value),
-                        int(d_value),
-                        plan.start_i["roll"],
-                        plan.start_i["pitch"],
-                        0,
-                        0,
-                    ),
-                )
-            if plan.optional_d is not None and plan.optional_d not in plan.d_sweep:
-                add(
-                    "Optional D sweep",
-                    f"Optional comparison at Roll/Pitch D {plan.optional_d}.",
-                    "d",
-                    roll_pitch_target(
-                        plan.start_p["roll"],
-                        plan.start_p["pitch"],
-                        int(plan.optional_d),
-                        int(plan.optional_d),
-                        plan.start_i["roll"],
-                        plan.start_i["pitch"],
-                        0,
-                        0,
-                    ),
-                    "Real tuning should only run this if needed and motors stay cool.",
-                )
-            for index, row in enumerate(pid_plan_p_candidates_for(plan), start=1):
-                add(
-                    f"P sweep {index}/{len(pid_plan_p_candidates_for(plan))}",
-                    f"Compare tracking with Roll P {row['roll']} and Pitch P {row['pitch']}.",
-                    "p",
-                    roll_pitch_target(
-                        row["roll"],
-                        row["pitch"],
-                        preview_d,
-                        preview_d,
-                        plan.start_i["roll"],
-                        plan.start_i["pitch"],
-                        0,
-                        0,
-                    ),
-                    f"Simulation uses preview D {preview_d}; real tuning uses the D you choose from logs.",
-                )
-            for index, d_value in enumerate(simulated_d_recheck_values(preview_d), start=1):
-                add(
-                    f"D re-check {index}/3",
-                    f"Re-check damping with chosen P and Roll/Pitch D {d_value}.",
-                    "d",
-                    roll_pitch_target(
-                        preview_p["roll"],
-                        preview_p["pitch"],
-                        d_value,
-                        d_value,
-                        plan.start_i["roll"],
-                        plan.start_i["pitch"],
-                        0,
-                        0,
-                    ),
-                    f"Simulation uses preview P {preview_p['roll']}/{preview_p['pitch']}.",
-                )
-            for index, row in enumerate(plan.i_sweep, start=1):
-                add(
-                    f"I sweep {index}/{len(plan.i_sweep)}",
-                    f"Compare hold/recenter with Roll I {row['roll']} and Pitch I {row['pitch']}.",
-                    "i",
-                    roll_pitch_target(preview_p["roll"], preview_p["pitch"], preview_d, preview_d, row["roll"], row["pitch"], 0, 0),
-                    "I is subtle in this short visual preview; real logs still decide the winner.",
-                )
-            for index, row in enumerate(plan.ff_sweep, start=1):
-                add(
-                    f"FF sweep {index}/{len(plan.ff_sweep)}",
-                    f"Compare initial response with Roll FF {row['roll']} and Pitch FF {row['pitch']}.",
-                    "ff",
-                    roll_pitch_target(
-                        preview_p["roll"],
-                        preview_p["pitch"],
-                        preview_d,
-                        preview_d,
-                        preview_i["roll"],
-                        preview_i["pitch"],
-                        row["roll"],
-                        row["pitch"],
-                    ),
-                    f"Simulation uses preview P/D/I {preview_p['roll']}/{preview_p['pitch']} / {preview_d} / {preview_i['roll']}/{preview_i['pitch']}.",
-                )
-            final_target = roll_pitch_target(
-                preview_p["roll"],
-                preview_p["pitch"],
-                preview_d,
-                preview_d,
-                preview_i["roll"],
-                preview_i["pitch"],
-                preview_ff["roll"],
-                preview_ff["pitch"],
-            )
-            add(
-                "Final preview",
-                "Preview the conservative final roll/pitch set. Yaw is listed in the plan but not shown in these boxes.",
-                "final",
-                final_target,
-                f"Yaw recommendation remains P {plan.yaw_final_pid_ff['p']}, I {plan.yaw_final_pid_ff['i']}, D {plan.yaw_final_pid_ff['d']}, FF {plan.yaw_final_pid_ff['ff']}.",
-            )
-            return steps
-
-        def pid_plan_p_candidates_for(plan: LoadedPIDTuningPlan) -> tuple[dict[str, int], ...]:
-            return tuple(
-                {"roll": int(roll), "pitch": int(pitch)}
-                for roll, pitch in zip(plan.p_sweep.get("roll", ()), plan.p_sweep.get("pitch", ()))
-            )
-
-        def simulated_d_recheck_values(selected_d: int) -> tuple[int, ...]:
-            return tuple(dict.fromkeys(max(0, min(255, int(value))) for value in (selected_d - 5, selected_d, selected_d + 5)))
-
-        def current_sim_step() -> dict[str, object] | None:
-            if self.sim_plan_step_index < 0 or self.sim_plan_step_index >= len(self.sim_plan_steps):
-                return None
-            return self.sim_plan_steps[self.sim_plan_step_index]
-
-        def _sim_axis_wave(elapsed_s: float, start_s: float, direction: int, gains: dict[str, int], stage: str) -> float:
-            local_s = elapsed_s - start_s
-            if local_s < 0.0:
-                return 0.0
-            p_value = float(gains.get("p", 0))
-            d_value = float(gains.get("d", 0))
-            i_value = float(gains.get("i", 0))
-            ff_value = float(gains.get("ff", 0))
-            damping = max(0.0, min(1.0, (d_value - 15.0) / 27.0))
-            tracking = max(0.62, min(1.18, 0.78 + ((p_value - 35.0) * 0.012) + (ff_value * 0.0008)))
-            target_deg = 18.0 * tracking
-            rise_rate = 1.65 + (p_value / 45.0) + min(1.2, ff_value / 120.0)
-            overshoot = max(0.02, 0.36 - (damping * 0.27) + max(0.0, p_value - 50.0) * 0.012)
-            if stage == "ff":
-                overshoot += max(0.0, ff_value - 129.0) * 0.0016
-            if stage == "i":
-                overshoot += max(0.0, 60.0 - i_value) * 0.002
-
-            if local_s <= 2.35:
-                rise = 1.0 - math.exp(-rise_rate * local_s)
-                ring = target_deg * overshoot * math.exp(-(1.0 + damping * 2.2) * local_s) * math.sin(local_s * 7.0)
-                return float(direction) * (target_deg * rise + ring)
-
-            release_s = local_s - 2.35
-            release_rate = 1.15 + (damping * 2.8) + min(0.65, i_value / 180.0)
-            residual = target_deg * math.exp(-release_rate * release_s)
-            bounce = target_deg * overshoot * 0.55 * math.exp(-(0.8 + damping * 2.0) * release_s) * math.sin(release_s * 8.5)
-            return float(direction) * (residual + bounce)
-
-        def _sim_repeating_axis_wave(elapsed_s: float, start_s: float, direction: int, gains: dict[str, int], stage: str) -> float:
-            cycle_s = max(1.0, PID_PLAN_FLY_LOG_RUNTIME_S / 4.0)
-            if elapsed_s < start_s:
-                return 0.0
-            cycle_index = int((elapsed_s - start_s) // cycle_s)
-            cycle_start_s = start_s + (cycle_index * cycle_s)
-            cycle_direction = direction if cycle_index % 2 == 0 else -direction
-            return _sim_axis_wave(elapsed_s, cycle_start_s, cycle_direction, gains, stage)
-
-        def update_simulated_plan_attitude(elapsed_s: float, step: dict[str, object]) -> None:
-            target = step["target"]
-            if not isinstance(target, dict):
-                self.sim_roll_deg = 0.0
-                self.sim_pitch_deg = 0.0
-                return
-            stage = str(step.get("stage", ""))
-            roll_gains = target.get("roll", {}) if isinstance(target.get("roll", {}), dict) else {}
-            pitch_gains = target.get("pitch", {}) if isinstance(target.get("pitch", {}), dict) else {}
-            self.sim_roll_deg = _sim_repeating_axis_wave(elapsed_s, 0.25, 1, roll_gains, stage)
-            self.sim_pitch_deg = _sim_repeating_axis_wave(elapsed_s, 3.85, -1, pitch_gains, stage)
-            limit = 35.0
-            self.sim_roll_deg = max(-limit, min(limit, self.sim_roll_deg))
-            self.sim_pitch_deg = max(-limit, min(limit, self.sim_pitch_deg))
-
-        def refresh_sim_report(
-            elapsed_s: float,
-            step: dict[str, object],
-            fly_log_running: bool = False,
-            step_number: int | None = None,
-        ) -> None:
-            target = step["target"]
-            target_text = format_pid_values(target) if isinstance(target, dict) else ""
-            note = str(step.get("note", "") or "")
-            mode_text = "Simulated Fly/Log movement running" if fly_log_running else "Simulated values staged"
-            display_step_number = self.sim_plan_step_index + 1 if step_number is None else step_number
-            lines = [
-                "Simulated PID tuning plan step",
-                f"Step {display_step_number} of {len(self.sim_plan_steps)}: {step['title']}",
-                f"Plan file: {self.sim_plan.text_path if self.sim_plan is not None else '--'}",
-                f"State: {mode_text}",
-                "",
-                str(step["instruction"]),
-                "",
-                "Hardware is intentionally disconnected for simulation. These values are staged only in the UI PID boxes.",
-                "",
-                "Real-world sequence for this step:",
-                "1. Disarm before saving these PID/FF values.",
-                "2. Press Save in the FC / INAV section only while disarmed.",
-                "3. Arm, then press Fly/Log for the candidate.",
-                "4. Land and disarm before moving to the next plan step.",
-                "",
-                "Simulated PID/FF boxes",
-                target_text,
-                "",
-                f"Elapsed: {elapsed_s:4.1f}s / {PID_PLAN_FLY_LOG_RUNTIME_S:.1f}s",
-                f"Roll:  {self.sim_roll_deg:+5.1f} deg",
-                f"Pitch: {self.sim_pitch_deg:+5.1f} deg",
-            ]
-            if note:
-                lines.extend(["", note])
-            if fly_log_running:
-                lines.extend(["", "When simulated Fly/Log finishes, press Next Sim Step to preview the next tuning candidate."])
-            else:
-                lines.extend(["", "Press Fly/Log to stimulate the simulated drone for this candidate."])
-            publish_auto_report("\n".join(lines))
-
-        def stop_simulated_auto_session(message: str = "", restore_display: bool = True, clear_walkthrough: bool = False) -> None:
-            if self.sim_after_id is not None:
-                try:
-                    self.root.after_cancel(self.sim_after_id)
-                except Exception:
-                    pass
-            self.sim_active = False
-            self.sim_fly_log_active = False
-            self.sim_after_id = None
-            self.sim_step_started_s = None
-            self.sim_last_report_second = -1
-            if clear_walkthrough:
-                self.sim_plan = None
-                self.sim_plan_steps = []
-                self.sim_plan_step_index = 0
-                self.sim_waiting_for_fly_log = False
-            update_link_indicators()
-            if restore_display:
-                restore_neutral_sim_display()
-            if message and not self.is_closing:
-                self.status.set(message)
-
-        def finish_simulated_plan_step(step: dict[str, object]) -> None:
-            completed_step_number = self.sim_plan_step_index + 1
-            self.sim_active = False
-            self.sim_fly_log_active = False
-            self.sim_waiting_for_fly_log = False
-            self.sim_after_id = None
-            self.sim_step_started_s = None
-            self.sim_plan_step_index += 1
-            if self.sim_plan_step_index >= len(self.sim_plan_steps):
-                update_link_indicators()
-                self.status.set("PID plan simulation complete.")
-                refresh_sim_report(PID_PLAN_FLY_LOG_RUNTIME_S, step, fly_log_running=False, step_number=completed_step_number)
-                return
-            update_link_indicators()
-            self.status.set(f"Simulation step complete. Next: {self.sim_plan_steps[self.sim_plan_step_index]['title']}")
-            refresh_sim_report(PID_PLAN_FLY_LOG_RUNTIME_S, step, fly_log_running=False, step_number=completed_step_number)
-
-        def run_simulated_auto_tick() -> None:
-            self.sim_after_id = None
-            if not self.sim_active:
-                return
-            step = current_sim_step()
-            if step is None or self.sim_step_started_s is None:
-                stop_simulated_auto_session("Simulation stopped: no plan step is loaded.", clear_walkthrough=True)
-                return
-
-            elapsed_s = max(0.0, time.monotonic() - self.sim_step_started_s)
-            update_simulated_plan_attitude(elapsed_s, step)
-            set_sim_attitude_display()
-            report_second = int(elapsed_s)
-            if report_second != self.sim_last_report_second:
-                self.sim_last_report_second = report_second
-                refresh_sim_report(elapsed_s, step, fly_log_running=True)
-            if elapsed_s >= PID_PLAN_FLY_LOG_RUNTIME_S:
-                finish_simulated_plan_step(step)
-                return
-            self.sim_after_id = self.root.after(40, run_simulated_auto_tick)
-
-        def start_simulated_plan_step() -> None:
-            if not simulation_hardware_is_disconnected():
-                return
-            if auto_is_running() or self.pid_plan_active or self.blackbox_import_inflight:
-                self.status.set("Wait for the active auto/PID/log task to finish before simulating.")
-                return
-            step = current_sim_step()
-            if step is None:
-                stop_simulated_auto_session("PID plan simulation complete.", restore_display=True, clear_walkthrough=True)
-                return
-            target = step["target"]
-            if isinstance(target, dict):
-                set_sim_pid_ff_display(target)
-            self.sim_active = False
-            self.sim_fly_log_active = False
-            self.sim_waiting_for_fly_log = True
-            self.sim_step_started_s = None
-            self.sim_roll_deg = 0.0
-            self.sim_pitch_deg = 0.0
-            self.sim_last_report_second = -1
-            update_link_indicators()
-            self.status.set(f"Simulated values staged: {step['title']}. Press Fly/Log.")
-            refresh_sim_report(0.0, step, fly_log_running=False)
-            set_sim_attitude_display()
-
-        def start_simulated_fly_log() -> None:
-            if not simulation_hardware_is_disconnected():
-                return
-            step = current_sim_step()
-            if step is None or not self.sim_waiting_for_fly_log:
-                self.status.set("No simulated candidate is staged for Fly/Log.")
-                return
-            self.sim_active = True
-            self.sim_fly_log_active = True
-            self.sim_step_started_s = time.monotonic()
-            self.sim_roll_deg = 0.0
-            self.sim_pitch_deg = 0.0
-            self.sim_last_report_second = -1
-            update_link_indicators()
-            self.status.set(f"Simulated Fly/Log running: {step['title']}")
-            refresh_sim_report(0.0, step, fly_log_running=True)
-            set_sim_attitude_display()
-            run_simulated_auto_tick()
-
-        def start_simulated_auto_session() -> None:
-            if not simulation_hardware_is_disconnected():
-                return
-            if self.pid_plan_active:
-                raise RuntimeError("Cancel the active guided PID tuning plan before starting simulation.")
-            plan_path = locate_pid_tuning_plan_file()
-            self.sim_plan = load_pid_tuning_plan(plan_path)
-            self.sim_plan_steps = build_simulated_pid_plan_steps(self.sim_plan)
-            self.sim_plan_step_index = 0
-            if not self.sim_plan_steps:
-                raise RuntimeError("PID tuning plan has no steps to simulate.")
-            start_simulated_plan_step()
-
-        def do_simulated_auto_session_toggle() -> None:
-            try:
-                if self.sim_active or self.sim_fly_log_active:
-                    self.status.set("Use Cancel Auto Session to stop the simulation.")
-                    return
-                if self.sim_waiting_for_fly_log:
-                    messagebox.showinfo(
-                        "Simulated Fly/Log Needed",
-                        "The simulated PID/FF values are staged.\n\nPress Fly/Log to stimulate the simulated drone before moving to the next step.",
-                        parent=self.root,
-                    )
-                    self.status.set("Press Fly/Log before the next simulated step.")
-                    return
-                if self.sim_plan is not None and self.sim_plan_step_index < len(self.sim_plan_steps):
-                    start_simulated_plan_step()
-                    return
-                start_simulated_auto_session()
-            except Exception as exc:
-                stop_simulated_auto_session("", restore_display=True, clear_walkthrough=True)
-                set_error("Simulation error", exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
-
         def do_auto_session_toggle() -> None:
             auto_session_workflow.toggle()
-
-        def on_simulation_mode_changed() -> None:
-            try:
-                if simulation_mode_enabled():
-                    if self.pid_plan_active:
-                        self.simulation_mode_var.set(False)
-                        messagebox.showwarning(
-                            "Simulation Blocked",
-                            "Cancel or complete the active guided PID tuning plan before enabling simulation.",
-                            parent=self.root,
-                        )
-                        self.status.set("Simulation requires no active guided PID plan.")
-                        update_link_indicators()
-                        return
-                    if self.start_pending or self.controller.is_connected or self.fc_service.is_connected:
-                        self.simulation_mode_var.set(False)
-                        messagebox.showwarning(
-                            "Simulation Requires No Hardware",
-                            "Disconnect Arduino output and FC before enabling simulation mode.",
-                            parent=self.root,
-                        )
-                        self.status.set("Simulation mode requires Arduino and FC disconnected.")
-                        update_link_indicators()
-                        return
-                    self.status.set("Simulation mode enabled. Press Start Auto Session to run the simulator.")
-                else:
-                    if self.sim_active or self.sim_fly_log_active or self.sim_waiting_for_fly_log or self.sim_plan is not None:
-                        stop_simulated_auto_session("Simulation mode disabled.", restore_display=True, clear_walkthrough=True)
-                        return
-                    self.status.set("Simulation mode disabled.")
-                update_link_indicators()
-            except Exception as exc:
-                self.simulation_mode_var.set(False)
-                set_error("Simulation mode error", exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
 
         def set_error(title: str, exc: Exception) -> None:
             if self.is_closing:
@@ -1301,15 +877,12 @@ class ModbusApp(HardwareStateMixin):
         # they receive. Use lambdas for callbacks that reference workflow objects created later.
         auto_session_workflow = AutoSessionWorkflow(
             app=self,
-            simulation_mode_enabled=simulation_mode_enabled,
-            do_simulated_auto_session_toggle=do_simulated_auto_session_toggle,
             start_auto_session=start_auto_session,
             open_pid_progress_window=open_pid_progress_window,
             continue_pid_tuning_plan=continue_pid_tuning_plan,
             complete_auto_session=complete_auto_session,
             refresh_fly_log_button_state=refresh_fly_log_button_state,
             complete_pid_tuning_plan=complete_pid_tuning_plan,
-            stop_simulated_auto_session=stop_simulated_auto_session,
             update_link_indicators=lambda: update_link_indicators(),
             update_pid_progress_window=update_pid_progress_window,
             begin_auto_pipeline=begin_auto_pipeline,
@@ -1347,7 +920,6 @@ class ModbusApp(HardwareStateMixin):
             arduino_baud=arduino_baud,
             fc_port=fc_port,
             fc_baud=fc_baud,
-            simulation_mode_enabled=simulation_mode_enabled,
             auto_is_running=lambda: auto_is_running(),
             refresh_level_button_state=refresh_level_button_state,
             refresh_fly_log_button_state=refresh_fly_log_button_state,
@@ -1376,7 +948,6 @@ class ModbusApp(HardwareStateMixin):
         # this point raises UnboundLocalError because run() has not bound the wrapper yet.
         auto_session_completion = AutoSessionCompletionWorkflow(
             app=self,
-            simulation_mode_enabled=simulation_mode_enabled,
             fc_port=fc_port,
             fc_baud=fc_baud,
             ensure_disarmed_before_blackbox_import=ensure_disarmed_before_blackbox_import,
@@ -1415,7 +986,6 @@ class ModbusApp(HardwareStateMixin):
             publish_auto_report=publish_auto_report,
         )
 
-
         def poll_attitude() -> None:
             try:
                 if self.controller.is_connected and not self.attitude_poll_inflight:
@@ -1434,10 +1004,9 @@ class ModbusApp(HardwareStateMixin):
                 sample = self.attitude_service.latest_attitude()
                 if sample is not None:
                     record_auto_session_sample(sample)
-                    if not self.sim_active:
-                        self.horizon.set_attitude(sample.roll_deg, sample.pitch_deg)
-                        self.roll_text.set(f"Roll: {sample.roll_deg:6.1f} deg")
-                        self.pitch_text.set(f"Pitch: {sample.pitch_deg:6.1f} deg")
+                    self.horizon.set_attitude(sample.roll_deg, sample.pitch_deg)
+                    self.roll_text.set(f"Roll: {sample.roll_deg:6.1f} deg")
+                    self.pitch_text.set(f"Pitch: {sample.pitch_deg:6.1f} deg")
             except Exception:
                 pass
             self.fc_poll_after_id = self.root.after(60, poll_attitude)
@@ -1463,7 +1032,12 @@ class ModbusApp(HardwareStateMixin):
                 stop_auto_session_runtime(restore_outputs=False)
             else:
                 stop_auto_session_runtime()
-            stop_simulated_auto_session("", restore_display=False)
+            if fly_log_mixer_workflow.is_active():
+                try:
+                    fly_log_mixer_workflow.restore_after_test()
+                    self.fly_log_mixer_snapshot_path = fly_log_mixer_workflow.snapshot_path
+                except Exception:
+                    pass
             if self.fc_poll_after_id is not None:
                 try:
                     self.root.after_cancel(self.fc_poll_after_id)
@@ -1491,6 +1065,7 @@ class ModbusApp(HardwareStateMixin):
 
         for pulse_combo in (self.pulse_force_combo, self.pulse_time_combo):
             pulse_combo.bind("<<ComboboxSelected>>", sync_pulse_dropdowns_from_user)
+        self.pulse_axis_combo.bind("<<ComboboxSelected>>", sync_pulse_dropdowns_from_user)
 
         self.scan_fc_button.config(command=scan_fc_ports)
         self.connect_fc_button.config(command=do_fc_toggle)
@@ -1499,7 +1074,7 @@ class ModbusApp(HardwareStateMixin):
         self.fly_log_button.config(command=fly_log_workflow.toggle)
         self.pulse_positive_button.config(command=lambda: do_test_pulse(1))
         self.pulse_negative_button.config(command=lambda: do_test_pulse(-1))
-        self.simulation_mode_checkbutton.config(command=on_simulation_mode_changed)
+        self.mixer_debug_button.config(command=do_mixer_debug)
         self.load_pid_ff_button.config(command=do_load_pid_ff_from_fc)
         self.save_pid_ff_button.config(command=do_save_pid_ff_to_fc)
         self.step_response_button.config(command=do_step_response_report)

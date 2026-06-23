@@ -7,7 +7,7 @@ from collections.abc import Callable
 
 from ..adaptive_session import AdaptiveCommand, AdaptiveSessionState, ExcitationEvent, axis_channel_index
 from ..constants import PULSE_STATUS_REJECTED
-from ..tasks.worker_tasks import hold_channel_until_stop as worker_hold_channel_until_stop
+from ..tasks.worker_tasks import pulse_channel_force as worker_pulse_channel_force
 
 
 class AutoSessionEngine:
@@ -21,7 +21,6 @@ class AutoSessionEngine:
         auto_elapsed_s: Callable[..., float],
         pulse_axis_value: Callable[[object, str], float],
         arduino_output_connected: Callable[[], bool],
-        parse_offset_values_with_defaults: Callable[[], list[int]],
         set_live_channel_outputs: Callable[[list[int]], None],
         begin_auto_observe_window: Callable[[AdaptiveCommand], None],
         begin_fly_log_marker_off_and_complete: Callable[[], None],
@@ -35,7 +34,6 @@ class AutoSessionEngine:
         self.auto_elapsed_s = auto_elapsed_s
         self.pulse_axis_value = pulse_axis_value
         self.arduino_output_connected = arduino_output_connected
-        self.parse_offset_values_with_defaults = parse_offset_values_with_defaults
         self.set_live_channel_outputs = set_live_channel_outputs
         self.begin_auto_observe_window = begin_auto_observe_window
         self.begin_fly_log_marker_off_and_complete = begin_fly_log_marker_off_and_complete
@@ -134,9 +132,9 @@ class AutoSessionEngine:
         channel_index = axis_channel_index(command.axis)
         output_sign = 1 if command.calibration else app.auto_axis_output_sign.get(command.axis, 1)
         pwm_direction = command.direction * output_sign
-        target = app.base_channel_outputs[channel_index] + (pwm_direction * command.force_us)
+        signed_force_us = pwm_direction * command.force_us
+        target = app.base_channel_outputs[channel_index] + signed_force_us
         target = max(1000, min(2000, target))
-        offsets = self.parse_offset_values_with_defaults()
 
         active_outputs = app.base_channel_outputs.copy()
         active_outputs[channel_index] = target
@@ -181,11 +179,9 @@ class AutoSessionEngine:
             app.auto_hold_after_id = app.root.after(round(command.hold_s * 1000.0), on_auto_hold_elapsed)
 
         app.worker.submit(
-            worker_hold_channel_until_stop,
+            worker_pulse_channel_force,
             channel_index,
-            target,
-            offsets[channel_index],
-            command.hold_s,
+            signed_force_us,
             callback=on_auto_hold_done,
         )
 

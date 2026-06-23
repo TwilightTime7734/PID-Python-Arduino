@@ -6,9 +6,9 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from ..adaptive_session import AdaptiveCommand, AdaptiveSessionState, ExcitationEvent, axis_channel_index
+from ..adaptive_session import AdaptiveCommand, AdaptiveSessionState, ExcitationEvent
 from ..constants import PULSE_STATUS_REJECTED, THROTTLE_CHANNEL_INDEX
-from ..tasks.worker_tasks import end_hold as worker_end_hold
+from ..tasks.worker_tasks import cancel_active_pulse as worker_cancel_active_pulse
 
 
 class AutoSessionHelpers:
@@ -164,10 +164,6 @@ class AutoSessionHelpers:
         self.cancel_hold_timer()
         self.set_live_channel_outputs(app.base_channel_outputs)
         self.begin_observe_window(command)
-        channel_index = axis_channel_index(command.axis)
-        target_angle = command.target_peak_deg
-        if target_angle <= 0 and app.auto_controller is not None:
-            target_angle = app.auto_controller.config.axis_target_peak_max_deg(command.axis)
 
         def on_auto_hold_end_done(ok: bool, res: object) -> None:
             if not self.auto_is_running():
@@ -190,7 +186,7 @@ class AutoSessionHelpers:
                     self.parse_offset_values_with_defaults(),
                 )
 
-        app.worker.submit(worker_end_hold, channel_index, callback=on_auto_hold_end_done)
+        app.worker.submit(worker_cancel_active_pulse, callback=on_auto_hold_end_done)
 
     def adjust_throttle_after_event(self, event: ExcitationEvent, recovery_event: bool) -> None:
         app = self.app

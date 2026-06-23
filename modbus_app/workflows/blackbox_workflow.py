@@ -35,7 +35,6 @@ class BlackboxWorkflow:
         app: Any,
         fc_port: Callable[[], str],
         fc_baud: Callable[[], int],
-        simulation_mode_enabled: Callable[[], bool],
         auto_is_running: Callable[[], bool],
         publish_auto_report: Callable[[str], None],
         set_error: Callable[[str, Exception], None],
@@ -44,7 +43,6 @@ class BlackboxWorkflow:
         self.app = app
         self.fc_port = fc_port
         self.fc_baud = fc_baud
-        self.simulation_mode_enabled = simulation_mode_enabled
         self.auto_is_running = auto_is_running
         self.publish_auto_report = publish_auto_report
         self.set_error = set_error
@@ -120,9 +118,6 @@ class BlackboxWorkflow:
     def pull_blackbox_logs(self) -> None:
         app = self.app
         try:
-            if self.simulation_mode_enabled():
-                app.status.set("Turn off Simulate before pulling Blackbox logs.")
-                return
             if app.blackbox_import_inflight:
                 app.status.set("Blackbox import already in progress.")
                 return

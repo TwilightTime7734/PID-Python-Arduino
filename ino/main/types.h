@@ -24,11 +24,12 @@ typedef union __attribute__ ((packed)) {
         word pause;                    //[4] 1  - Pause duration in timer ticks
         long_t sync;                   //[5] 2  - Synchronization pulse duration in timer ticks
         word channel[MAX_COUNT];       //[7] 16 - Pulse duration in timer ticks
-        word pulse_chl;                //[23] 1  - Hold override channel index
-        word pulse_val;                //[24] 1  - Hold override value in timer ticks
-        long_t pulse_dur;              //[25] 2  - Hold override duration in microseconds (0 => end hold)
+        word pulse_chl;                //[23] 1  - Fixed pulse channel index
+        word pulse_cmd;                //[24] 1  - 1 start fixed pulse, 2 cancel active pulse
+        int16_t pulse_force;           //[25] 1  - Signed pulse force in microseconds
+        word pulse_reserved;           //[26] 1  - Reserved, keep pulse_seq/status offsets stable
         word pulse_seq;                //[27] 1  - Incrementing command sequence
-        word pulse_status;             //[28] 1  - / 0 idle, 1 active, 2 rejected, 3 timeout-restored, 4 hold-ended
+        word pulse_status;             //[28] 1  - / 0 idle, 1 active, 2 rejected, 3 timeout-restored, 4 canceled
 		word movement_status;          //[29] 1  - / 0 - No sensor / 1 - Sensor OK / 2 - Sample Ready / 3 - Sample Failed
 		word movement_seq;             //[30] 1  - Increments each time a new sensor sample is stored
 		long_t movement_millis;        //[31] 2  - Arduino millis() timestamp for the stored sample
@@ -63,8 +64,9 @@ static inline bool frame_fields_differ(const regs_t &a, const regs_t &b) {
 
 static inline void copy_pulse_command_fields(regs_t &dst, const regs_t &src) {
     dst.pulse_chl = src.pulse_chl;
-    dst.pulse_val = src.pulse_val;
-    dst.pulse_dur = src.pulse_dur;
+    dst.pulse_cmd = src.pulse_cmd;
+    dst.pulse_force = src.pulse_force;
+    dst.pulse_reserved = src.pulse_reserved;
     dst.pulse_seq = src.pulse_seq;
 }
 

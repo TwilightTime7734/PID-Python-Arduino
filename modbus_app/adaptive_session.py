@@ -34,13 +34,13 @@ class AdaptiveSessionConfig:
     force_min_us: int = 5
     force_max_us: int = 45
     recovery_force_us: int = 45
-    hold_min_s: float = 0.06
-    hold_max_s: float = 0.12
-    recovery_hold_s: float = 0.08
+    hold_min_s: float = 0.10
+    hold_max_s: float = 0.10
+    recovery_hold_s: float = 0.10
     roll_force_us: int = 45
     pitch_force_us: int = 45
-    roll_hold_s: float = 0.08
-    pitch_hold_s: float = 0.08
+    roll_hold_s: float = 0.10
+    pitch_hold_s: float = 0.10
     roll_target_peak_deg: float = 3.0
     pitch_target_peak_deg: float = 3.0
     settle_max_s: float = 0.25
@@ -56,7 +56,7 @@ class AdaptiveSessionConfig:
     throttle_boost_peak_deg: float = 4.0
     throttle_trim_peak_deg: float = 28.0
     probe_force_us: int = 12
-    probe_hold_s: float = 0.05
+    probe_hold_s: float = 0.10
     probe_settle_s: float = 0.12
     probe_target_peak_deg: float = 1.0
     probe_min_response_deg: float = 0.15
@@ -344,7 +344,7 @@ class AdaptiveExcitationController:
         us_per_deg = self._response_us_per_deg(axis)
         axis_force_max = min(self.config.force_max_us, int(self.config.axis_force_us(axis)))
         for _ in range(80):
-            hold_s = self._rng.uniform(self.config.hold_min_s, self.config.hold_max_s)
+            hold_s = max(0.01, self.config.axis_hold_s(axis))
             force_scale = us_per_deg / self._hold_scale(axis, hold_s)
             min_force = math.ceil(min_delta_deg * force_scale)
             max_force = math.floor(max_delta_deg * force_scale)

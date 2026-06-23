@@ -12,6 +12,8 @@ from .constants import (
     BOOT_WAIT,
     FRAME_US,
     PAUSE_US,
+    PULSE_COMMAND_CANCEL,
+    PULSE_COMMAND_START_FIXED,
     READ,
     REG_CHANNEL0,
     REG_QUANT,
@@ -174,7 +176,13 @@ def stop_ppm_on_serial(ser: serial.Serial) -> None:
     write_regs(ser, REG_STATE, [0])
 
 
-def send_pulse_command_on_serial(ser: serial.Serial, max_count: int, chl: int, value_ticks: int, duration_us: int) -> None:
+def _signed_i16_word(value: int) -> int:
+    if value < -0x8000 or value > 0x7FFF:
+        raise RuntimeError("Pulse force must fit in signed 16-bit microseconds")
+    return int(value) & 0xFFFF
+
+
+def send_pulse_command_on_serial(ser: serial.Serial, max_count: int, chl: int, command: int, force_us: int) -> None:
     pulse_base = REG_CHANNEL0 + max_count
     pulse_seq_reg = pulse_base + 4
     current_seq = read_regs(ser, pulse_seq_reg, 1)[0]
@@ -184,9 +192,9 @@ def send_pulse_command_on_serial(ser: serial.Serial, max_count: int, chl: int, v
         pulse_base,
         [
             chl,
-            value_ticks,
-            duration_us & 0xFFFF,
-            (duration_us >> 16) & 0xFFFF,
+            int(command) & 0xFFFF,
+            _signed_i16_word(force_us),
+            0,
             next_seq,
         ],
     )
@@ -198,44 +206,19 @@ def read_pulse_status_on_serial(ser: serial.Serial, max_count: int) -> int:
     return read_regs(ser, pulse_status_reg, 1)[0]
 
 
-def set_channel_until_stop_on_serial(
+def start_fixed_pulse_on_serial(
     ser: serial.Serial,
-    quant: int,
     max_count: int,
     chl: int,
-    val_us: int,
-    offset_us: int,
-    timeout_s: float,
+    force_us: int,
 ) -> None:
     if chl < 0:
         raise RuntimeError("Channel index must be >= 0")
-    if quant <= 0:
-        raise RuntimeError("Invalid quant from device")
     if chl >= max_count:
         raise RuntimeError(f"Channel index {chl} out of range (max {max_count - 1})")
 
-    adjusted = val_us - offset_us
-    if adjusted <= PAUSE_US:
-        raise RuntimeError("Target minus offset must be > pause_us")
-
-    value_ticks = us_to_ticks(adjusted, quant)
-    if value_ticks > 0xFFFF:
-        raise RuntimeError(f"Target must be <= {0xFFFF / quant:.2f} us for quant={quant}")
-
-    if timeout_s <= 0:
-        raise RuntimeError("Duration must be > 0 for hold timeout")
-    timeout_us = round(timeout_s * 1_000_000)
-    if timeout_us <= 0 or timeout_us > 0xFFFFFFFF:
-        raise RuntimeError("Duration is out of supported range")
-
-    # Hold mode uses duration as a default timeout safety for automatic restore.
-    send_pulse_command_on_serial(ser, max_count, chl, value_ticks, timeout_us)
+    send_pulse_command_on_serial(ser, max_count, chl, PULSE_COMMAND_START_FIXED, int(force_us))
 
 
-def end_hold_on_serial(ser: serial.Serial, max_count: int, chl: int) -> None:
-    if chl < 0:
-        raise RuntimeError("Channel index must be >= 0")
-    if chl >= max_count:
-        raise RuntimeError(f"Channel index {chl} out of range (max {max_count - 1})")
-    # Duration=0 is a firmware "end hold now" command.
-    send_pulse_command_on_serial(ser, max_count, chl, 0, 0)
+def cancel_active_pulse_on_serial(ser: serial.Serial, max_count: int) -> None:
+    send_pulse_command_on_serial(ser, max_count, 0, PULSE_COMMAND_CANCEL, 0)

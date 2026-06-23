@@ -25,7 +25,6 @@ from ..auto_tune_report import AutoTuneReport
 from ..blackbox_import import BlackboxImportResult
 from ..constants import CHANNEL_DEFAULTS, PORT_DEFAULT, THROTTLE_CHANNEL_INDEX
 from ..hardware_controller import HardwareController
-from ..pid_tuning_workflow import LoadedPIDTuningPlan
 from .timer_registry import TimerRegistry
 
 
@@ -101,17 +100,6 @@ class RuntimeStateController:
         self_.auto_latest_report: AutoTuneReport | None = None
         self_.auto_import_result: BlackboxImportResult | None = None
         self_.auto_latest_imported_log: str = ""
-        self_.sim_active = False
-        self_.sim_after_id: str | None = None
-        self_.sim_plan: LoadedPIDTuningPlan | None = None
-        self_.sim_plan_steps: list[dict[str, object]] = []
-        self_.sim_plan_step_index = 0
-        self_.sim_waiting_for_fly_log = False
-        self_.sim_fly_log_active = False
-        self_.sim_step_started_s: float | None = None
-        self_.sim_roll_deg = 0.0
-        self_.sim_pitch_deg = 0.0
-        self_.sim_last_report_second = -1
         self_.blackbox_import_inflight = False
         self_.blackbox_import_dir = (Path(__file__).resolve().parents[2] / "blackbox_imports").resolve()
         self_.blackbox_msc_mount_timeout_s = 12.0
@@ -130,6 +118,7 @@ class RuntimeStateController:
         self_.pid_plan_current_candidate_target: dict[str, dict[str, int]] | None = None
         self_.pid_plan_fly_log_active = False
         self_.fly_log_finishing = False
+        self_.fly_log_mixer_snapshot_path: Path | None = None
         self_.pid_progress_window: tk.Toplevel | None = None
         self_.pid_progress_phase_labels: dict[str, tk.Label] = {}
         self_.pid_progress_current_var = tk.StringVar(value="No PID tuning plan is active.")

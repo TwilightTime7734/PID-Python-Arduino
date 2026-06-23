@@ -1,0 +1,94 @@
+{
+  "created_at_utc": "2026-06-23T20:36:34.547822+00:00",
+  "decoded_mixer_payload": {
+    "nonzero_indexes": [
+      5,
+      7,
+      8
+    ],
+    "payload_length": 9,
+    "signed_i8_values": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      3,
+      0,
+      12,
+      18
+    ],
+    "u16_le_values": [
+      0,
+      0,
+      768,
+      3072
+    ],
+    "u32_le_values": [
+      0,
+      201327360
+    ],
+    "u8_values": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      3,
+      0,
+      12,
+      18
+    ]
+  },
+  "expected_motor_mixer_rows": [
+    {
+      "motor": 1,
+      "pitch": -1,
+      "roll": -1,
+      "throttle": 1,
+      "yaw": 1
+    },
+    {
+      "motor": 2,
+      "pitch": 1,
+      "roll": 1,
+      "throttle": 1,
+      "yaw": 1
+    },
+    {
+      "motor": 3,
+      "pitch": -1,
+      "roll": 1,
+      "throttle": 1,
+      "yaw": -1
+    },
+    {
+      "motor": 4,
+      "pitch": 1,
+      "roll": -1,
+      "throttle": 1,
+      "yaw": -1
+    }
+  ],
+  "fc_mixer_settings": {
+    "fpv_mix_degrees": 0,
+    "mixer_automated_switch": 0,
+    "mixer_control_profile_linking": 0,
+    "mixer_switch_trans_timer": 0,
+    "transition_pid_mmix_multiplier_pitch": 1000,
+    "transition_pid_mmix_multiplier_roll": 1000,
+    "transition_pid_mmix_multiplier_yaw": 1000
+  },
+  "mixer_payload_bytes": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    3,
+    0,
+    12,
+    18
+  ],
+  "mixer_payload_hex": "000000000003000c12"
+}

@@ -8,6 +8,8 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
+from .constants import ARDUINO_FIXED_PULSE_HOLD_S
+
 TUNED_AXES = ("roll", "pitch")
 START_P_DEFAULTS = {"roll": 45, "pitch": 47, "yaw": 45}
 START_I_DEFAULTS = {"roll": 30, "pitch": 35}
@@ -348,36 +350,36 @@ def estimate_test_pulse_profile(inputs: PStartInputs) -> TestPulseProfile:
 
     if prop_diameter >= 9.0:
         probe_force = 8
-        probe_hold = 0.05
+        probe_hold = ARDUINO_FIXED_PULSE_HOLD_S
         main_force = 80
-        main_hold = 0.25
+        main_hold = ARDUINO_FIXED_PULSE_HOLD_S
         neutral_wait = 400
         target_min = 8.0
         target_max = 22.0
-        notes.append("10 inch class props carry high inertia; use a smaller, shorter main pulse first.")
+        notes.append("10 inch class props carry high inertia; use a smaller main pulse first.")
     elif prop_diameter >= 6.5:
         probe_force = 10
-        probe_hold = 0.05
+        probe_hold = ARDUINO_FIXED_PULSE_HOLD_S
         main_force = 100
-        main_hold = 0.30
+        main_hold = ARDUINO_FIXED_PULSE_HOLD_S
         neutral_wait = 350
         target_min = 8.0
         target_max = 25.0
         notes.append("7 inch class props get a reduced pulse compared with the micro baseline.")
     elif prop_diameter <= 2.5:
         probe_force = 12
-        probe_hold = 0.05
+        probe_hold = ARDUINO_FIXED_PULSE_HOLD_S
         main_force = 125
-        main_hold = 0.35
+        main_hold = ARDUINO_FIXED_PULSE_HOLD_S
         neutral_wait = 300
         target_min = 10.0
         target_max = 25.0
         notes.append("Micro prop class keeps the current proven Pavo Pico II Fly/Log pulse.")
     else:
         probe_force = 10
-        probe_hold = 0.05
+        probe_hold = ARDUINO_FIXED_PULSE_HOLD_S
         main_force = 110
-        main_hold = 0.32
+        main_hold = ARDUINO_FIXED_PULSE_HOLD_S
         neutral_wait = 325
         target_min = 8.0
         target_max = 25.0
@@ -391,8 +393,8 @@ def estimate_test_pulse_profile(inputs: PStartInputs) -> TestPulseProfile:
             main_force = max(70, main_force - 10)
             notes.append("Motor/cell speed is strong for this prop class, so the main pulse was reduced another 10us.")
 
-    notes.append("Use the smallest pulse that produces a clean 8-25 degree one-axis response.")
-    notes.append("If the rig rebounds, clips, or nears a mechanical stop, reduce force before increasing hold time.")
+    notes.append("Use the smallest force that produces a clean 8-25 degree one-axis response.")
+    notes.append("If the rig rebounds, clips, or nears a mechanical stop, reduce force; board pulse duration is fixed.")
 
     return TestPulseProfile(
         aircraft_name=aircraft_name,
@@ -427,10 +429,10 @@ def format_pid_tuning_plan(recommendation: PStartRecommendation) -> str:
     fly_log_action = (
         "-   Once the 'Fly/Log' button is pressed, wait for spin-up, run the pre-marker "
         f"{pulse.test_axis} +/-{pulse.probe_force_us}us start probes, set CH8 to 2000us, "
-        f"run the marked {pulse.test_axis} step routine using +/-{pulse.main_force_us}us "
-        f"for {pulse.main_hold_s:.2f}s, "
+        f"run 10 positive and 10 negative {pulse.test_axis} pulses at "
+        f"+/-{pulse.main_force_us}us with board-fixed {pulse.main_hold_s:.2f}s pulses, "
         "then set CH8 back to 1000us. "
-        "Extract/Analyze reads the marked routine and ignores center-adjust pulses."
+        "Extract/Analyze reads the marker-bracketed one-axis pulse train."
     )
     lines: list[str] = [
         "Supervised PID tuning plan",
@@ -450,11 +452,11 @@ def format_pid_tuning_plan(recommendation: PStartRecommendation) -> str:
         f"- Active Level/FlyLog test throttle: {throttle.level_test_throttle_us} us. This is the value the program will use.",
         f"- Hover throttle estimate only: {throttle.hover_throttle_us} us. This is a reference number, not an automatic throttle change.",
         "- Do not raise the test throttle toward hover until the stand test has been verified safe.",
-        "- For a one-axis rig, zero the inactive axis in the INAV mixer before logging that axis.",
+        "- For a one-axis rig, keep the unused axis neutral in INAV before logging that axis.",
         "",
         "Test pulse profile",
-        f"- Start probe: +/-{pulse.probe_force_us} us for {pulse.probe_hold_s:.2f} s.",
-        f"- Main Fly/Log pulse: +/-{pulse.main_force_us} us for {pulse.main_hold_s:.2f} s on {pulse.test_axis}.",
+        f"- Start probe: +/-{pulse.probe_force_us} us, board-fixed {pulse.probe_hold_s:.2f} s.",
+        f"- Main Fly/Log pulse: +/-{pulse.main_force_us} us, board-fixed {pulse.main_hold_s:.2f} s on {pulse.test_axis}.",
         f"- Neutral wait after each main pulse: {pulse.neutral_wait_ms} ms.",
         "- Main Fly/Log sample count: 10 positive and 10 negative pulses.",
         f"- Target one-axis peak response: {pulse.target_response_min_deg:.0f}-{pulse.target_response_max_deg:.0f} deg.",
@@ -741,9 +743,9 @@ def _test_pulse_profile_from_payload(payload: object) -> TestPulseProfile | None
             aircraft_name=str(payload.get("aircraft_name", "Custom")),
             test_axis=_choice(str(payload.get("test_axis", "roll")), TEST_AXIS_VALUES, "roll"),
             probe_force_us=int(payload["probe_force_us"]),
-            probe_hold_s=float(payload["probe_hold_s"]),
+            probe_hold_s=ARDUINO_FIXED_PULSE_HOLD_S,
             main_force_us=int(payload["main_force_us"]),
-            main_hold_s=float(payload["main_hold_s"]),
+            main_hold_s=ARDUINO_FIXED_PULSE_HOLD_S,
             neutral_wait_ms=int(payload["neutral_wait_ms"]),
             target_response_min_deg=float(payload["target_response_min_deg"]),
             target_response_max_deg=float(payload["target_response_max_deg"]),
@@ -760,17 +762,17 @@ def _test_pulse_profile_from_text(text: str) -> TestPulseProfile | None:
     main = _line_ints(text, r"-\s*Main Fly/Log pulse:\s*\+/-\s*(\d+)\s*us")
     neutral = _line_ints(text, r"-\s*Neutral wait after each main pulse:\s*(\d+)\s*ms")
     response = _line_ints(text, r"-\s*Target one-axis peak response:\s*(\d+)\s*-\s*(\d+)\s*deg")
-    probe_hold_match = re.search(r"-\s*Start probe:.*?for\s*([0-9.]+)\s*s", text, flags=re.IGNORECASE)
-    main_hold_match = re.search(r"-\s*Main Fly/Log pulse:.*?for\s*([0-9.]+)\s*s", text, flags=re.IGNORECASE)
+    probe_hold_match = re.search(r"-\s*Start probe:.*?(?:for|board-fixed)\s*([0-9.]+)\s*s", text, flags=re.IGNORECASE)
+    main_hold_match = re.search(r"-\s*Main Fly/Log pulse:.*?(?:for|board-fixed)\s*([0-9.]+)\s*s", text, flags=re.IGNORECASE)
     if not probe or not main or probe_hold_match is None or main_hold_match is None:
         return None
     return TestPulseProfile(
         aircraft_name=aircraft_match.group(1).strip() if aircraft_match else "Custom",
         test_axis=_choice(axis_match.group(1) if axis_match else "roll", TEST_AXIS_VALUES, "roll"),
         probe_force_us=probe[0],
-        probe_hold_s=float(probe_hold_match.group(1)),
+        probe_hold_s=ARDUINO_FIXED_PULSE_HOLD_S,
         main_force_us=main[0],
-        main_hold_s=float(main_hold_match.group(1)),
+        main_hold_s=ARDUINO_FIXED_PULSE_HOLD_S,
         neutral_wait_ms=neutral[0] if neutral else 300,
         target_response_min_deg=float(response[0]) if len(response) >= 2 else 8.0,
         target_response_max_deg=float(response[1]) if len(response) >= 2 else 25.0,

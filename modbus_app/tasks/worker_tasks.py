@@ -22,42 +22,32 @@ from ..blackbox_import import (
 )
 from ..constants import REG_QUANT
 from ..serial_protocol import (
-    end_hold_on_serial,
+    cancel_active_pulse_on_serial,
     read_pulse_status_on_serial,
     read_regs,
-    set_channel_until_stop_on_serial,
+    start_fixed_pulse_on_serial,
 )
 from ..step_response_report import generate_step_response_report as generate_step_response_report_impl
 from ..worker import SerialWorker
 
 
-def hold_channel_until_stop(
+def pulse_channel_force(
     worker_self: SerialWorker,
     channel_index: int,
-    target: int,
-    offset: int,
-    timeout_s: float,
+    force_us: int,
 ):
     if worker_self.ser is None:
         raise RuntimeError("Serial not open")
-    quant, max_count = read_regs(worker_self.ser, REG_QUANT, 2)
-    set_channel_until_stop_on_serial(
-        worker_self.ser,
-        quant,
-        max_count,
-        channel_index,
-        target,
-        offset,
-        timeout_s,
-    )
+    _, max_count = read_regs(worker_self.ser, REG_QUANT, 2)
+    start_fixed_pulse_on_serial(worker_self.ser, max_count, channel_index, force_us)
     return read_pulse_status_on_serial(worker_self.ser, max_count)
 
 
-def end_hold(worker_self: SerialWorker, channel_index: int):
+def cancel_active_pulse(worker_self: SerialWorker):
     if worker_self.ser is None:
         raise RuntimeError("Serial not open")
     _, max_count = read_regs(worker_self.ser, REG_QUANT, 2)
-    end_hold_on_serial(worker_self.ser, max_count, channel_index)
+    cancel_active_pulse_on_serial(worker_self.ser, max_count)
     return read_pulse_status_on_serial(worker_self.ser, max_count)
 
 

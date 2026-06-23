@@ -18,30 +18,24 @@ class AutoSessionWorkflow:
         self,
         *,
         app,
-        simulation_mode_enabled: Callable[[], bool],
-        do_simulated_auto_session_toggle: Callable[[], None],
         start_auto_session: Callable[[], None],
         open_pid_progress_window: Callable[[], None],
         continue_pid_tuning_plan: Callable[[], None],
         complete_auto_session: Callable[..., None],
         refresh_fly_log_button_state: Callable[[], None],
         complete_pid_tuning_plan: Callable[[str], None],
-        stop_simulated_auto_session: Callable[..., None],
         update_link_indicators: Callable[[], None],
         update_pid_progress_window: Callable[[], None],
         begin_auto_pipeline: Callable[[], None],
         set_error: Callable[[str, Exception], None],
     ) -> None:
         self.app = app
-        self.simulation_mode_enabled = simulation_mode_enabled
-        self.do_simulated_auto_session_toggle = do_simulated_auto_session_toggle
         self.start_auto_session = start_auto_session
         self.open_pid_progress_window = open_pid_progress_window
         self.continue_pid_tuning_plan = continue_pid_tuning_plan
         self.complete_auto_session = complete_auto_session
         self.refresh_fly_log_button_state = refresh_fly_log_button_state
         self.complete_pid_tuning_plan = complete_pid_tuning_plan
-        self.stop_simulated_auto_session = stop_simulated_auto_session
         self.update_link_indicators = update_link_indicators
         self.update_pid_progress_window = update_pid_progress_window
         self.begin_auto_pipeline = begin_auto_pipeline
@@ -67,15 +61,6 @@ class AutoSessionWorkflow:
     def toggle(self) -> None:
         app = self.app
         try:
-            if self.simulation_mode_enabled():
-                if self.is_running():
-                    app.status.set("Use Cancel Auto Session to stop the active run.")
-                    return
-                self.do_simulated_auto_session_toggle()
-                return
-            if app.sim_active:
-                app.status.set("Use Cancel Auto Session to stop the simulation.")
-                return
             if self.is_running():
                 app.status.set("Use Cancel Auto Session to stop the active run.")
                 return
@@ -96,10 +81,6 @@ class AutoSessionWorkflow:
         return (
             runtime_cancelable
             or app.pid_plan_active
-            or app.sim_active
-            or app.sim_fly_log_active
-            or app.sim_waiting_for_fly_log
-            or app.sim_plan is not None
         )
 
     def cancel(self) -> None:
@@ -115,9 +96,6 @@ class AutoSessionWorkflow:
             if app.pid_plan_active:
                 app.pid_plan_fly_log_active = False
                 self.complete_pid_tuning_plan("PID tuning plan canceled by user.")
-                canceled = True
-            if app.sim_active or app.sim_fly_log_active or app.sim_waiting_for_fly_log or app.sim_plan is not None:
-                self.stop_simulated_auto_session("Simulation canceled.", restore_display=True, clear_walkthrough=True)
                 canceled = True
             if not canceled:
                 app.status.set("No auto session is active.")

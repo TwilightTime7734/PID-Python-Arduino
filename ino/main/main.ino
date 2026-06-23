@@ -19,6 +19,9 @@
 static constexpr timer_source_div_t PPM_TIMER_DIV = TIMER_SOURCE_DIV_4;
 static constexpr uint32_t PPM_TIMER_DIV_VALUE = 4;
 static constexpr uint8_t PPM_TIMER_IRQ_PRIORITY = 8;
+static constexpr unsigned long FIXED_PULSE_DURATION_US = 100000UL;
+static constexpr word PULSE_CMD_START_FIXED = 1;
+static constexpr word PULSE_CMD_CANCEL = 2;
 
 enum State {
 	Pulse,       // N-th channel pulse
@@ -171,42 +174,47 @@ static inline void update_timed_override(uint32_t elapsed_ticks) {
 	timed_override_remaining_ticks -= elapsed_ticks;
 }
 
-// Set channel `chl` to `val` for `dur` microseconds, then restore.
-// If `dur` is 0, end the current hold immediately.
-bool SetChannelForDuration(byte chl, word val, unsigned long dur) {
+bool CancelActivePulse() {
+	noInterrupts();
+	if (timed_override_active) {
+		tmp.channel[timed_override_channel] = restore_channel[timed_override_channel];
+		timed_override_remaining_ticks = 0;
+		timed_override_active = false;
+	}
+	tmp.pulse_status = 4;
+	interrupts();
+	return true;
+}
+
+// Start one fixed-duration channel override. Python sends only channel + force;
+// the board owns the 0.1s pulse duration.
+bool StartFixedPulse(byte chl, int16_t force_us) {
 	if (chl >= MAX_COUNT || tmp.quant == 0) {
 		return false;
 	}
 
-	if (dur == 0) {
-		noInterrupts();
-		if (timed_override_active) {
-			tmp.channel[timed_override_channel] = restore_channel[timed_override_channel];
-			timed_override_remaining_ticks = 0;
-			timed_override_active = false;
-		}
-		tmp.pulse_status = 4;
-		interrupts();
-		return true;
-	}
-
-	uint32_t duration_ticks = duration_us_to_ticks(dur);
+	uint32_t duration_ticks = duration_us_to_ticks(FIXED_PULSE_DURATION_US);
 	if (duration_ticks == 0) {
-		return false;
-	}
-
-	if (val <= tmp.pause || val > 0xFFFF) {
 		return false;
 	}
 
 	noInterrupts();
 
+	word base_ticks = timed_override_active ? restore_channel[chl] : tmp.channel[chl];
+	int32_t target_ticks = (int32_t)base_ticks + ((int32_t)force_us * (int32_t)tmp.quant);
+	if (target_ticks <= (int32_t)tmp.pause || target_ticks > 0xFFFFL) {
+		interrupts();
+		return false;
+	}
+
 	if (timed_override_active) {
 		tmp.channel[timed_override_channel] = restore_channel[timed_override_channel];
+	} else {
+		capture_restore_channels_from_tmp();
 	}
 
 	timed_override_channel = chl;
-	tmp.channel[chl] = val;
+	tmp.channel[chl] = (word)target_ticks;
 	timed_override_remaining_ticks = duration_ticks;
 	timed_override_active = true;
 	tmp.pulse_status = 1;
@@ -390,8 +398,9 @@ void setup() {
 	tmp.pause = tmp.quant * 200;
 	tmp.sync.raw = tmp.quant * 22500UL - tmp.quant * 300UL * 8UL;
 	tmp.pulse_chl = 0;
-	tmp.pulse_val = 0;
-	tmp.pulse_dur.raw = 0;
+	tmp.pulse_cmd = 0;
+	tmp.pulse_force = 0;
+	tmp.pulse_reserved = 0;
 	tmp.pulse_seq = 0;
 	tmp.pulse_status = 0;
 	tmp.movement_status = 0;
@@ -433,7 +442,13 @@ void loop() {
 	}
 
 	if (pulseChanged) {
-		if (!SetChannelForDuration((byte) modbus_regs.pulse_chl, modbus_regs.pulse_val, modbus_regs.pulse_dur.raw)) {
+		bool pulseAccepted = false;
+		if (modbus_regs.pulse_cmd == PULSE_CMD_START_FIXED) {
+			pulseAccepted = StartFixedPulse((byte) modbus_regs.pulse_chl, modbus_regs.pulse_force);
+		} else if (modbus_regs.pulse_cmd == PULSE_CMD_CANCEL) {
+			pulseAccepted = CancelActivePulse();
+		}
+		if (!pulseAccepted) {
 			noInterrupts();
 			tmp.pulse_status = 2;
 			interrupts();

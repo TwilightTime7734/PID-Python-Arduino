@@ -22,7 +22,6 @@ class AutoSessionCompletionWorkflow:
         self,
         *,
         app,
-        simulation_mode_enabled: Callable[[], bool],
         fc_port: Callable[[], str],
         fc_baud: Callable[[], int],
         ensure_disarmed_before_blackbox_import: Callable[[str, int], bool],
@@ -44,7 +43,6 @@ class AutoSessionCompletionWorkflow:
         worker_generate_auto_report: Callable[..., object],
     ) -> None:
         self.app = app
-        self.simulation_mode_enabled = simulation_mode_enabled
         self.fc_port = fc_port
         self.fc_baud = fc_baud
         self.ensure_disarmed_before_blackbox_import = ensure_disarmed_before_blackbox_import
@@ -113,9 +111,6 @@ class AutoSessionCompletionWorkflow:
 
     def begin_pipeline(self) -> None:
         app = self.app
-        if self.simulation_mode_enabled():
-            app.status.set("Auto blackbox pipeline skipped: simulation mode is enabled.")
-            return
         if app.blackbox_import_inflight:
             app.status.set("Blackbox pipeline already in progress.")
             return

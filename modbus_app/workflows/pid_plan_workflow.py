@@ -46,7 +46,6 @@ class PidPlanWorkflow:
         open_progress_window: Callable[[], None],
         ensure_disarmed_before_pid_write: Callable[[], bool],
         stage_pid_ff_var: Callable[[str, str, int], None],
-        stop_simulated_auto_session: Callable[..., None],
         set_test_throttle_us: Callable[[int | None, str], int],
         set_test_pulse_profile: Callable[[TestPulseProfile | None, str], TestPulseProfile],
     ) -> None:
@@ -59,7 +58,6 @@ class PidPlanWorkflow:
         self.open_progress_window = open_progress_window
         self.ensure_disarmed_before_pid_write = ensure_disarmed_before_pid_write
         self.stage_pid_ff_var = stage_pid_ff_var
-        self.stop_simulated_auto_session = stop_simulated_auto_session
         self.set_test_throttle_us = set_test_throttle_us
         self.set_test_pulse_profile = set_test_pulse_profile
 
@@ -118,8 +116,8 @@ class PidPlanWorkflow:
                     "Test pulse profile",
                     f"Aircraft: {pulse.aircraft_name}",
                     f"Test axis: {pulse.test_axis}",
-                    f"Start probe: +/-{pulse.probe_force_us}us for {pulse.probe_hold_s:.2f}s",
-                    f"Fly/Log pulse: 10 positive and 10 negative at +/-{pulse.main_force_us}us for {pulse.main_hold_s:.2f}s",
+                    f"Start probe: +/-{pulse.probe_force_us}us, board-fixed {pulse.probe_hold_s:.2f}s",
+                    f"Fly/Log pulse: 10 positive and 10 negative at +/-{pulse.main_force_us}us, board-fixed {pulse.main_hold_s:.2f}s",
                     f"Neutral wait: {pulse.neutral_wait_ms}ms",
                 ]
             )
@@ -127,11 +125,12 @@ class PidPlanWorkflow:
 
     @staticmethod
     def _set_readonly_entry_text(entry: tk.Entry, value: int) -> None:
-        # Table cells are readonly; temporarily unlock to update generated values.
+        # Table cells can be readonly or disabled; temporarily unlock to update generated values.
+        original_state = str(entry.cget("state"))
         entry.config(state="normal")
         entry.delete(0, tk.END)
         entry.insert(0, f"{int(value):02d}")
-        entry.config(state="readonly")
+        entry.config(state=original_state)
 
     def populate_starting_values_table(self, plan: LoadedPIDTuningPlan) -> None:
         app = self.app
@@ -140,18 +139,18 @@ class PidPlanWorkflow:
 
         first_d = int(plan.d_sweep[0]) if plan.d_sweep else 0
         rows = [
-            [int(plan.start_p.get("roll", 0)), first_d, int(plan.start_i.get("roll", 0)), 0],
-            [int(plan.start_p.get("pitch", 0)), first_d, int(plan.start_i.get("pitch", 0)), 0],
+            [int(plan.start_p.get("roll", 0)), int(plan.start_i.get("roll", 0)), first_d, 0],
+            [int(plan.start_p.get("pitch", 0)), int(plan.start_i.get("pitch", 0)), first_d, 0],
             [int(plan.start_p.get("yaw", 0)), 0, 0, 0],
             [
                 int(plan.yaw_final_pid_ff.get("p", 0)),
-                int(plan.yaw_final_pid_ff.get("d", 0)),
                 int(plan.yaw_final_pid_ff.get("i", 0)),
+                int(plan.yaw_final_pid_ff.get("d", 0)),
                 int(plan.yaw_final_pid_ff.get("ff", 0)),
             ],
         ]
 
-        # Grid columns: 0 is label, 1..4 are P/D/I/FF values. Data rows start at grid row 1.
+        # Grid columns: 0 is label, 1..4 are P/I/D/FF values. Data rows start at grid row 1.
         for row_index, values in enumerate(rows, start=1):
             for col_index, value in enumerate(values, start=1):
                 widgets = app.starting_values_table.grid_slaves(row=row_index, column=col_index)
@@ -168,8 +167,8 @@ class PidPlanWorkflow:
 
         rows = [
             [int(value) for value in plan.p_sweep.get("roll", ())],
-            [int(value) for value in plan.d_sweep],
             [int(item.get("roll", 0)) for item in plan.i_sweep],
+            [int(value) for value in plan.d_sweep],
             [int(item.get("roll", 0)) for item in plan.ff_sweep],
         ]
 
@@ -191,8 +190,8 @@ class PidPlanWorkflow:
 
         rows = [
             [int(value) for value in plan.p_sweep.get("pitch", ())],
-            [int(value) for value in plan.d_sweep],
             [int(item.get("pitch", 0)) for item in plan.i_sweep],
+            [int(value) for value in plan.d_sweep],
             [int(item.get("pitch", 0)) for item in plan.ff_sweep],
         ]
 
@@ -255,7 +254,7 @@ class PidPlanWorkflow:
             app.status.set(
                 f"PID tuning plan generated: {report.report_dir}. "
                 f"Shared test throttle set to {recommendation.throttle_estimate.level_test_throttle_us}us; "
-                f"Fly/Log pulse +/-{recommendation.test_pulse_profile.main_force_us}us for "
+                f"Fly/Log pulse +/-{recommendation.test_pulse_profile.main_force_us}us, board-fixed "
                 f"{recommendation.test_pulse_profile.main_hold_s:.2f}s."
             )
         except Exception as exc:
@@ -899,8 +898,6 @@ class PidPlanWorkflow:
 
     def start_session(self) -> None:
         app = self.app
-        if app.sim_active or app.sim_fly_log_active or app.sim_waiting_for_fly_log or app.sim_plan is not None:
-            self.stop_simulated_auto_session("", restore_display=True, clear_walkthrough=True)
         plan_path = self.locate_plan_file()
         app.pid_plan = load_pid_tuning_plan(plan_path)
         self.set_test_throttle_us(app.pid_plan.level_test_throttle_us, "loaded PID plan")

@@ -1,19 +1,11 @@
 """Deterministic Fly/Log one-axis paired-pulse workflow.
 
-This gives PID-plan Fly/Log a simple, repeatable path that is closer to the
-old exact-pulse exciter, but avoids the oversized one-way pulse that pushed the
-stand into the hard stop. The sequence uses measured doses in both directions:
+The Fly/Log path keeps the test narrow and repeatable:
 
-    marker on -> ten one-axis pulse pairs -> marker off
+    CH8 marker on -> 10 pulses positive -> 10 pulses negative -> CH8 marker off
 
-Each sample pair is:
-
-    selected axis +, selected axis - -> center check/slow adjust
-
-Attitude feedback is used only as a safety/quality check and for slow centering
-between sample sections. It is not used to stop the main test pulses. The
-adaptive/random engine remains available elsewhere, but PID-plan Fly/Log can use
-this as a safer default while debugging.
+Only the selected axis is driven. Attitude is watched for safety stops, but no
+other axis is commanded during the pulse sequence.
 """
 
 from __future__ import annotations
@@ -25,15 +17,16 @@ from dataclasses import dataclass
 from ..adaptive_session import AdaptiveSessionState
 from ..ch8_marker import channels_with_pid_test_ch8
 from ..constants import (
-    LEVEL_CENTER_US,
     PITCH_CHANNEL_INDEX,
     PID_TEST_CH8_SPINUP_DELAY_MS,
     ROLL_CHANNEL_INDEX,
     PULSE_STATUS_REJECTED,
     THROTTLE_CHANNEL_INDEX,
+    ARDUINO_FIXED_PULSE_HOLD_S,
+    ARDUINO_FIXED_PULSE_HOLD_MS,
 )
 from ..pid_tuning_workflow import PStartInputs, TestPulseProfile, estimate_test_pulse_profile
-from ..tasks.worker_tasks import hold_channel_until_stop as worker_hold_channel_until_stop
+from ..tasks.worker_tasks import pulse_channel_force as worker_pulse_channel_force
 
 
 @dataclass(frozen=True)
@@ -63,16 +56,8 @@ class DeterministicFlyLogWorkflow:
     MARKER_SETTLE_MS = 150
     EMERGENCY_ATTITUDE_DEG = 45.0
 
-    # Center checks between pitch/roll and between groups. Below the warning
-    # value, the test continues. Above the abort value, it stops before the next
-    # axis/group. Between those values, it performs small fixed center nudges and
-    # then continues.
-    CENTER_CHECK_WARNING_DEG = 8.0
+    # Safety stop threshold for attitude excursions during the pulse sequence.
     CENTER_CHECK_ABORT_DEG = 25.0
-    CENTER_ADJUST_FORCE_US = 55
-    CENTER_ADJUST_HOLD_S = 0.06
-    CENTER_ADJUST_SETTLE_MS = 245
-    CENTER_ADJUST_MAX_PULSES = 12
 
     def __init__(
         self,
@@ -176,7 +161,7 @@ class DeterministicFlyLogWorkflow:
         axis = self._fly_log_axis()
         channel_index = self._axis_channel_index(axis)
         force_us = int(profile.main_force_us)
-        hold_s = float(profile.main_hold_s)
+        hold_s = ARDUINO_FIXED_PULSE_HOLD_S
         return [
             _FlyLogPulseStep(axis, channel_index, force_us, hold_s),
             _FlyLogPulseStep(axis, channel_index, -force_us, hold_s),
@@ -221,17 +206,14 @@ class DeterministicFlyLogWorkflow:
             f"Mode: one-axis {axis} test, {self.PULSE_PAIR_COUNT} positive and "
             f"{self.PULSE_PAIR_COUNT} negative main pulses, "
             f"shared test throttle {test_throttle_us}us, {pulse_profile.aircraft_name} pulse profile, "
-            f"{axis} +/-{pulse_profile.main_force_us}us for {pulse_profile.main_hold_s:.2f}s each\n"
+            f"{axis} +/-{pulse_profile.main_force_us}us for board-fixed {ARDUINO_FIXED_PULSE_HOLD_S:.2f}s each\n"
             f"Start probe reference: {axis} +/-{pulse_profile.probe_force_us}us "
-            f"for {pulse_profile.probe_hold_s:.2f}s\n"
+            f"for board-fixed {ARDUINO_FIXED_PULSE_HOLD_S:.2f}s\n"
             f"Neutral wait after every pulse: {self._neutral_wait_after_pulse_ms()}ms\n"
-            f"Slow center adjust when 8-25 deg off: +/-{self.CENTER_ADJUST_FORCE_US}us for "
-            f"{self.CENTER_ADJUST_HOLD_S:.3g}s, up to {self.CENTER_ADJUST_MAX_PULSES} nudges\n"
             f"Settle wait between pulse pairs: {self.GROUP_SETTLE_WAIT_MS}ms\n"
             f"Spin-up before CH8 marker: {spinup_delay_s:.1f}s\n"
-            f"Sequence per pair: {axis} + -> {axis} - -> center adjust/check.\n"
-            "Attitude is checked only as safety/center quality, not used to stop the main pulses.\n"
-            "The adaptive/random movement engine is bypassed for this Fly/Log run.\n\n"
+            f"Sequence per pair: {axis} + -> {axis} -.\n"
+            "Attitude is checked only as a safety stop, not used to command the other axis.\n\n"
         )
         self.open_pid_progress_window()
         self.update_pid_progress_window()
@@ -266,7 +248,7 @@ class DeterministicFlyLogWorkflow:
         axis = self._fly_log_axis()
         channel_index = self._axis_channel_index(axis)
         force_us = max(0, int(profile.probe_force_us))
-        hold_s = max(0.01, float(profile.probe_hold_s))
+        hold_s = ARDUINO_FIXED_PULSE_HOLD_S
         if force_us <= 0:
             return []
         return [
@@ -331,10 +313,7 @@ class DeterministicFlyLogWorkflow:
         self._run_step_list(
             self._axis_pair_steps(),
             0,
-            next_callback=lambda: self._center_or_adjust(
-                context=f"{axis} pair {pair_index + 1}",
-                next_callback=lambda: self._finish_pair(pair_index),
-            ),
+            next_callback=lambda: self._finish_pair(pair_index),
         )
 
     def _finish_pair(self, pair_index: int) -> None:
@@ -365,182 +344,6 @@ class DeterministicFlyLogWorkflow:
             next_callback=lambda: self._run_step_list(steps, step_index + 1, next_callback=next_callback),
         )
 
-    def _center_or_adjust(self, *, context: str, next_callback: Callable[[], None]) -> None:
-        app = self.app
-        app.fly_log_marker_after_id = None
-        if not app.pid_plan_fly_log_active or not self.auto_is_running():
-            return
-        emergency, reason = self._sample_is_emergency()
-        if emergency:
-            self.auto_abort(reason, continue_pipeline=False)
-            return
-
-        sample = app.attitude_service.latest_attitude()
-        if sample is None:
-            self._trace(f"Center check {context}: no attitude sample available; continuing.")
-            next_callback()
-            return
-
-        roll = float(sample.roll_deg)
-        pitch = float(sample.pitch_deg)
-        max_abs = max(abs(roll), abs(pitch))
-        if max_abs >= self.CENTER_CHECK_ABORT_DEG:
-            self.auto_abort(
-                f"Center check {context} failed; drone is too far from center "
-                f"(roll={roll:+.1f}, pitch={pitch:+.1f}).",
-                continue_pipeline=False,
-            )
-            return
-        if max_abs < self.CENTER_CHECK_WARNING_DEG:
-            self._trace(f"Center check {context} OK (roll={roll:+.1f}, pitch={pitch:+.1f}).")
-            next_callback()
-            return
-
-        self._trace(
-            f"Center check {context}: roll={roll:+.1f}, pitch={pitch:+.1f}; "
-            "running slow center adjustment before continuing."
-        )
-        self._run_center_adjustment(context=context, pulse_index=1, next_callback=next_callback)
-
-    def _run_center_adjustment(
-        self,
-        *,
-        context: str,
-        pulse_index: int,
-        next_callback: Callable[[], None],
-    ) -> None:
-        app = self.app
-        app.fly_log_marker_after_id = None
-        if not app.pid_plan_fly_log_active or not self.auto_is_running():
-            return
-        emergency, reason = self._sample_is_emergency()
-        if emergency:
-            self.auto_abort(reason, continue_pipeline=False)
-            return
-
-        sample = app.attitude_service.latest_attitude()
-        if sample is None:
-            self._trace(f"Center adjust {context}: no attitude sample available; continuing.")
-            next_callback()
-            return
-        roll = float(sample.roll_deg)
-        pitch = float(sample.pitch_deg)
-        max_abs = max(abs(roll), abs(pitch))
-        if max_abs >= self.CENTER_CHECK_ABORT_DEG:
-            self.auto_abort(
-                f"Center adjust {context} stopped; drone is too far from center "
-                f"(roll={roll:+.1f}, pitch={pitch:+.1f}).",
-                continue_pipeline=False,
-            )
-            return
-        if max_abs < self.CENTER_CHECK_WARNING_DEG:
-            self._trace(
-                f"Center adjust {context} complete (roll={roll:+.1f}, pitch={pitch:+.1f}); continuing test."
-            )
-            next_callback()
-            return
-        if pulse_index > self.CENTER_ADJUST_MAX_PULSES:
-            self._trace(
-                f"Center adjust {context} used {self.CENTER_ADJUST_MAX_PULSES} nudges and is still off-center "
-                f"(roll={roll:+.1f}, pitch={pitch:+.1f}); continuing because it is under "
-                f"{self.CENTER_CHECK_ABORT_DEG:.0f} deg."
-            )
-            next_callback()
-            return
-
-        if abs(roll) >= abs(pitch):
-            channel_index = ROLL_CHANNEL_INDEX
-            axis_name = "roll"
-            angle = roll
-        else:
-            channel_index = PITCH_CHANNEL_INDEX
-            axis_name = "pitch"
-            angle = pitch
-
-        center_us = LEVEL_CENTER_US
-        if len(app.base_channel_outputs) > channel_index:
-            try:
-                center_us = int(app.base_channel_outputs[channel_index])
-            except Exception:
-                center_us = LEVEL_CENTER_US
-        signed_force_us = -self.CENTER_ADJUST_FORCE_US if angle > 0 else self.CENTER_ADJUST_FORCE_US
-        target = max(1000, min(2000, center_us + signed_force_us))
-
-        try:
-            offsets = self.parse_offset_values_with_defaults()
-        except Exception as exc:
-            self.auto_abort("Could not parse offsets for deterministic Fly/Log center adjust.", warning=str(exc))
-            return
-        if len(offsets) <= channel_index:
-            self.auto_abort("Offset list is too short for deterministic Fly/Log center adjust.")
-            return
-
-        active_outputs = app.base_channel_outputs.copy()
-        active_outputs[channel_index] = target
-        self.set_live_channel_outputs(active_outputs)
-        app.auto_pulse_inflight = True
-        direction_text = "+" if signed_force_us >= 0 else ""
-        hold_ms = max(1, round(self.CENTER_ADJUST_HOLD_S * 1000))
-        total_wait_ms = hold_ms + max(0, int(self.CENTER_ADJUST_SETTLE_MS))
-        self._trace(
-            f"Center adjust {context} nudge {pulse_index}/{self.CENTER_ADJUST_MAX_PULSES}: "
-            f"{axis_name} CH{channel_index + 1} {center_us}->{target} "
-            f"({direction_text}{signed_force_us}us) for {self.CENTER_ADJUST_HOLD_S:.3g}s; "
-            f"roll={roll:+.1f}, pitch={pitch:+.1f}."
-        )
-
-        def on_center_pulse_done(ok: bool, res: object) -> None:
-            if not app.pid_plan_fly_log_active:
-                return
-            if not ok:
-                self.auto_abort(
-                    "Deterministic Fly/Log center-adjust command failed.",
-                    warning=str(res) if not isinstance(res, Exception) else str(res),
-                )
-                return
-            if not isinstance(res, int):
-                self.auto_abort("Unexpected deterministic Fly/Log center-adjust result from worker.")
-                return
-            if res == PULSE_STATUS_REJECTED:
-                self.auto_abort("Firmware rejected deterministic Fly/Log center-adjust command.")
-                return
-            self._schedule(
-                total_wait_ms,
-                lambda: self._complete_center_adjust_delay(
-                    context=context,
-                    pulse_index=pulse_index,
-                    next_callback=next_callback,
-                ),
-            )
-
-        app.worker.submit(
-            worker_hold_channel_until_stop,
-            channel_index,
-            target,
-            offsets[channel_index],
-            self.CENTER_ADJUST_HOLD_S,
-            callback=on_center_pulse_done,
-        )
-
-    def _complete_center_adjust_delay(
-        self,
-        *,
-        context: str,
-        pulse_index: int,
-        next_callback: Callable[[], None],
-    ) -> None:
-        app = self.app
-        app.fly_log_marker_after_id = None
-        if not app.pid_plan_fly_log_active or not self.auto_is_running():
-            return
-        app.auto_pulse_inflight = False
-        self.set_live_channel_outputs(app.base_channel_outputs.copy())
-        self._run_center_adjustment(
-            context=context,
-            pulse_index=pulse_index + 1,
-            next_callback=next_callback,
-        )
-
     def _issue_axis_pulse(
         self,
         *,
@@ -562,27 +365,18 @@ class DeterministicFlyLogWorkflow:
             self.auto_abort("Base channel output list is too short for deterministic Fly/Log pulse.")
             return
         target = max(1000, min(2000, int(app.base_channel_outputs[channel_index]) + int(step.signed_force_us)))
-        try:
-            offsets = self.parse_offset_values_with_defaults()
-        except Exception as exc:
-            self.auto_abort("Could not parse offsets for deterministic Fly/Log pulse.", warning=str(exc))
-            return
-        if len(offsets) <= channel_index:
-            self.auto_abort("Offset list is too short for deterministic Fly/Log pulse.")
-            return
-
         active_outputs = app.base_channel_outputs.copy()
         active_outputs[channel_index] = target
         self.set_live_channel_outputs(active_outputs)
         app.auto_pulse_inflight = True
         direction_text = "+" if step.signed_force_us >= 0 else ""
-        hold_ms = max(1, round(step.hold_s * 1000))
+        hold_ms = ARDUINO_FIXED_PULSE_HOLD_MS
         wait_ms = self._neutral_wait_after_pulse_ms()
         next_total_delay_ms = hold_ms + wait_ms
         self._trace(
             f"Issuing {label} pulse: CH{channel_index + 1} "
             f"{app.base_channel_outputs[channel_index]} -> {target} "
-            f"({direction_text}{step.signed_force_us}us) for {step.hold_s:.3g}s; "
+            f"({direction_text}{step.signed_force_us}us) for board-fixed {ARDUINO_FIXED_PULSE_HOLD_S:.2f}s; "
             f"then {wait_ms}ms neutral wait."
         )
 
@@ -611,11 +405,9 @@ class DeterministicFlyLogWorkflow:
             )
 
         app.worker.submit(
-            worker_hold_channel_until_stop,
+            worker_pulse_channel_force,
             channel_index,
-            target,
-            offsets[channel_index],
-            step.hold_s,
+            step.signed_force_us,
             callback=on_pulse_done,
         )
 

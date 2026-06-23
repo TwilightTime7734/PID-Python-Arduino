@@ -27,7 +27,6 @@ class ConnectionWorkflow:
         arduino_baud: Callable[[], int],
         fc_port: Callable[[], str],
         fc_baud: Callable[[], int],
-        simulation_mode_enabled: Callable[[], bool],
         auto_is_running: Callable[[], bool],
         refresh_level_button_state: Callable[[bool], None],
         refresh_fly_log_button_state: Callable[[], None],
@@ -44,7 +43,6 @@ class ConnectionWorkflow:
         self.arduino_baud = arduino_baud
         self.fc_port = fc_port
         self.fc_baud = fc_baud
-        self.simulation_mode_enabled = simulation_mode_enabled
         self.auto_is_running = auto_is_running
         self.refresh_level_button_state = refresh_level_button_state
         self.refresh_fly_log_button_state = refresh_fly_log_button_state
@@ -100,7 +98,6 @@ class ConnectionWorkflow:
 
     def update_link_indicators(self) -> None:
         app = self.app
-        sim_mode = self.simulation_mode_enabled()
         arduino_connected = app.controller.is_connected
         fc_connected = app.fc_service.is_connected
 
@@ -108,11 +105,6 @@ class ConnectionWorkflow:
         app.port_baud_entry.config(state="disabled" if arduino_connected or app.start_pending else "readonly")
         app.fc_port_entry.config(state="disabled" if fc_connected else "normal")
         app.fc_baud_entry.config(state="disabled" if fc_connected else "readonly")
-
-        if app.controller.is_connected:
-            app.pc_link_box.config(text="PC-ARD OPEN", bg="#2E7D32", fg="white")
-        else:
-            app.pc_link_box.config(text="PC-ARD CLOSED", bg="#8B1E1E", fg="white")
 
         if fc_connected:
             app.connect_fc_button.config(
@@ -132,10 +124,7 @@ class ConnectionWorkflow:
                 fg="#3A1111",
                 activeforeground="#3A1111",
             )
-        if sim_mode:
-            app.connect_fc_button.config(state="disabled")
-
-        pid_save_state = "normal" if fc_connected and not sim_mode else "disabled"
+        pid_save_state = "normal" if fc_connected else "disabled"
         app.load_pid_ff_button.config(state=pid_save_state)
         app.save_pid_ff_button.config(state=pid_save_state)
 
@@ -166,19 +155,12 @@ class ConnectionWorkflow:
                 fg="#3A1111",
                 activeforeground="#3A1111",
             )
-        if sim_mode:
-            app.arduino_button.config(state="disabled")
-
-        simulation_blocked = app.start_pending or arduino_connected or fc_connected
-        app.simulation_mode_checkbutton.config(state="normal" if sim_mode or not simulation_blocked else "disabled")
         self.refresh_level_button_state(app.attitude_service.is_connected)
         self.refresh_fly_log_button_state()
 
     def connect_fc(self) -> None:
         app = self.app
         try:
-            if self.simulation_mode_enabled():
-                raise RuntimeError("Turn off Simulate before connecting FC.")
             if app.fc_service.is_connected:
                 return
             selected_port = self.fc_port()
@@ -207,9 +189,6 @@ class ConnectionWorkflow:
 
     def toggle_fc(self) -> None:
         app = self.app
-        if self.simulation_mode_enabled():
-            app.status.set("Turn off Simulate before connecting FC.")
-            return
         if app.fc_service.is_connected:
             self.disconnect_fc()
         else:
@@ -217,9 +196,6 @@ class ConnectionWorkflow:
 
     def toggle_arduino(self) -> None:
         app = self.app
-        if self.simulation_mode_enabled():
-            app.status.set("Turn off Simulate before connecting Arduino.")
-            return
         if app.start_pending:
             return
         if app.controller.is_connected:
@@ -230,8 +206,6 @@ class ConnectionWorkflow:
     def start_arduino(self) -> None:
         app = self.app
         try:
-            if self.simulation_mode_enabled():
-                raise RuntimeError("Turn off Simulate before connecting Arduino.")
             if app.start_pending:
                 raise RuntimeError("Start is already in progress.")
             channels = self.parse_channel_values_with_defaults()
