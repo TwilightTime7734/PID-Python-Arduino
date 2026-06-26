@@ -126,25 +126,27 @@ def import_blackbox_logs_from_msc(destination_dir: str | Path) -> BlackboxImport
             analysis_source="",
         )
 
+    warnings.extend(_delete_local_log_files(destination))
+
     for root in roots:
         candidates = _discover_blackbox_files(root)
         for src in candidates:
             try:
-                copied = _copy_with_dedup(src, destination)
-                if copied is None:
+                moved = _move_log_file(src, destination)
+                if moved is None:
                     skipped += 1
                     continue
-                stat = copied.stat()
+                stat = moved.stat()
                 imported.append(
                     ImportedLogFile(
                         source_path=str(src),
-                        local_path=str(copied),
+                        local_path=str(moved),
                         file_size_bytes=int(stat.st_size),
                         modified_epoch_s=float(stat.st_mtime),
                     )
                 )
             except Exception as exc:
-                warnings.append(f"Copy failed for '{src}': {exc}")
+                warnings.append(f"Move failed for '{src}': {exc}")
 
     analysis_candidates = [Path(item.local_path) for item in imported]
     if not analysis_candidates:
@@ -183,11 +185,11 @@ def import_blackbox_logs_from_msc(destination_dir: str | Path) -> BlackboxImport
         else:
             if imported:
                 warnings.append(
-                    "Raw Blackbox logs were imported. To enable CSV fallback analysis, decode/export to CSV then re-import."
+                    "Raw Blackbox logs were moved. To enable CSV fallback analysis, decode/export to CSV then re-import."
                 )
             elif skipped > 0:
                 warnings.append(
-                    "No new files were copied (duplicates skipped). Existing local logs were checked for analysis."
+                    "No new files were moved. Existing local logs were checked for analysis."
                 )
             else:
                 warnings.append("No Blackbox log files were found on detected MSC volumes.")
@@ -905,27 +907,35 @@ def _walk_for_logs(folder: Path) -> list[Path]:
     return found
 
 
-def _copy_with_dedup(src: Path, destination: Path) -> Path | None:
+def _delete_local_log_files(destination: Path) -> list[str]:
+    warnings: list[str] = []
+    try:
+        candidates = list(destination.iterdir())
+    except Exception as exc:
+        return [f"Could not scan existing local Blackbox logs for deletion: {exc}"]
+
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        if candidate.suffix.lower() not in TOOLKIT_ANALYZE_EXTENSIONS:
+            continue
+        try:
+            candidate.unlink()
+        except Exception as exc:
+            warnings.append(f"Could not delete existing local Blackbox log '{candidate}': {exc}")
+    return warnings
+
+
+def _move_log_file(src: Path, destination: Path) -> Path | None:
     if not src.exists() or not src.is_file():
         return None
 
     safe_name = _sanitize_filename(src.name)
     target = destination / safe_name
-    src_size = src.stat().st_size
-
     if target.exists():
-        try:
-            dst_stat = target.stat()
-            if dst_stat.st_size == src_size:
-                src_crc32 = _crc32_file(src)
-                dst_crc32 = _crc32_file(target)
-                if src_crc32 == dst_crc32:
-                    return None
-        except Exception:
-            pass
         target = _next_available_filename(destination, safe_name)
 
-    shutil.copy2(src, target)
+    shutil.move(str(src), str(target))
     return target
 
 
@@ -1013,11 +1023,11 @@ def _decode_raw_logs(raw_paths: list[Path], destination: Path) -> tuple[list[Pat
         if has_explorer_decoder_js:
             return [], [
                 "INAV Blackbox Explorer is installed, but it does not ship blackbox_decode.exe; "
-                "raw logs were copied only."
+                "raw logs are available locally but were not decoded."
             ]
         return [], [
             "No usable blackbox decoder was found (PATH or PIDtoolbox fallback paths); "
-            "raw logs were copied only."
+            "raw logs are available locally but were not decoded."
         ]
 
     warnings: list[str] = []

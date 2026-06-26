@@ -47,4 +47,3 @@ class WidgetBindings:
         app.pulse_negative_button = ui.pulse_negative_button
         app.step_response_button = ui.step_response_button
         app.pid_tuning_plan_button = ui.pid_tuning_plan_button
-        app.mixer_debug_button = ui.mixer_debug_button

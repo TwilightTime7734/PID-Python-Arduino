@@ -2,7 +2,7 @@
 
 This module owns the guided PID plan progression: generating/loading a plan,
 staging candidate values, asking the user to choose winners, and advancing from
-safe start through P/D/I/FF sweeps to the final values.
+safe start through P/I/D/FF sweeps to the final values.
 
 The live Fly/Log hardware routine still lives in app.py for now. This workflow
 only prepares/stages candidates and tells the existing app when Fly/Log is
@@ -87,26 +87,26 @@ class PidPlanWorkflow:
 
         lines = [
             "Starting point",
-            f"- Roll:  P {int(plan.start_p.get('roll', 0))}, D {first_d}, I {roll_i_start}, FF 0",
-            f"- Pitch: P {int(plan.start_p.get('pitch', 0))}, D {first_d}, I {pitch_i_start}, FF 0",
-            f"- Yaw:   P {yaw_start_p}, D 0, I 0, FF 0",
+            f"- Roll:  P {int(plan.start_p.get('roll', 0))}, I {roll_i_start}, D {first_d}, FF 0",
+            f"- Pitch: P {int(plan.start_p.get('pitch', 0))}, I {pitch_i_start}, D {first_d}, FF 0",
+            f"- Yaw:   P {yaw_start_p}, I 0, D 0, FF 0",
             "",
             "Roll",
             f"P:  {self._format_series(roll_p)}",
-            f"D:  {self._format_series(d_values)}",
             f"I:  {self._format_series(roll_i)}",
+            f"D:  {self._format_series(d_values)}",
             f"FF: {self._format_series(roll_ff)}",
             "",
             "Pitch",
             f"P:  {self._format_series(pitch_p)}",
-            f"D:  {self._format_series(d_values)}",
             f"I:  {self._format_series(pitch_i)}",
+            f"D:  {self._format_series(d_values)}",
             f"FF: {self._format_series(pitch_ff)}",
             "",
             "Yaw recommendation",
             f"P:  {yaw_reco_p:02d}",
-            f"D:  {yaw_reco_d:02d}",
             f"I:  {yaw_reco_i:02d}",
+            f"D:  {yaw_reco_d:02d}",
             f"FF: {yaw_reco_ff:02d}",
         ]
         if pulse is not None:
@@ -790,10 +790,11 @@ class PidPlanWorkflow:
             messagebox.showinfo(
                 "Fly/Log Needed",
                 f"{app.pid_plan_current_candidate_title or 'The current candidate'} is ready.\n\n"
-                "Arm the drone, press Fly/Log, then disarm the drone before pressing Next PID Plan Step.",
+                "Press Fly/Log while disarmed to prepare PID isolation, then arm and press Fly/Log again. "
+                "Disarm after the pulse sequence so the app can restore the isolated PID/FF values.",
                 parent=app.root,
             )
-            app.status.set("Press Fly/Log for the current candidate before moving to the next step.")
+            app.status.set("Prepare and run Fly/Log for the current candidate before moving to the next step.")
             self.update_progress_window()
             return
         if not self.prepare_next_step():
@@ -827,12 +828,13 @@ class PidPlanWorkflow:
             app.pid_plan_current_candidate_phase = step_phase
             app.pid_plan_current_candidate_target = target
             self.refresh_fly_log_button_state()
-            app.status.set("Safe-start PID/FF values staged for the first P log. Press Save before Fly/Log.")
+            app.status.set("Safe-start PID/FF values staged. Press Save, then Prepare Fly/Log while disarmed.")
             self.update_progress_window()
             messagebox.showinfo(
                 "Safe Start Ready",
                 "Safe-start PID/FF values are staged in the FC / INAV boxes.\n\n"
-                "Press Save while disarmed, then arm the drone, press Fly/Log, and disarm before pressing Next PID Plan Step.",
+                "Press Save while disarmed, press Fly/Log to prepare PID isolation, then arm and press Fly/Log again. "
+                "Disarm after the pulse sequence so the app can restore the isolated PID/FF values.",
                 parent=app.root,
             )
             return
@@ -844,8 +846,9 @@ class PidPlanWorkflow:
             "Required sequence for this candidate:\n"
             "1. DISARM the drone.\n"
             "2. Either stage/save the target values, or use Already Saved if the FC already has them.\n"
-            "3. Arm, then press Fly/Log for this candidate.\n"
-            "4. Land and DISARM before pressing Next PID Plan Step.\n\n"
+            "3. Press Fly/Log once to zero the locked axis and yaw PID/FF for this test.\n"
+            "4. Arm, then press Fly/Log again for this candidate.\n"
+            "5. Land and DISARM so the app can restore the isolated PID/FF before the next step.\n\n"
             "Button choices:\n"
             "Stage Values: copy target values into the FC / INAV boxes.\n"
             "Already Saved - Enable Fly/Log: do not rewrite values; enable Fly/Log for this candidate.\n"
@@ -864,13 +867,13 @@ class PidPlanWorkflow:
             app.pid_plan_current_candidate_title = title
             app.pid_plan_current_candidate_phase = step_phase
             app.pid_plan_current_candidate_target = target
-            app.status.set(f"PID plan step staged: {title}. Press Save before Fly/Log.")
+            app.status.set(f"PID plan step staged: {title}. Press Save, then Prepare Fly/Log while disarmed.")
         elif action == "already_saved":
             app.pid_plan_waiting_for_fly_log = True
             app.pid_plan_current_candidate_title = title
             app.pid_plan_current_candidate_phase = step_phase
             app.pid_plan_current_candidate_target = target
-            app.status.set(f"PID plan step enabled without staging: {title}. Press Fly/Log when armed.")
+            app.status.set(f"PID plan step enabled without staging: {title}. Prepare Fly/Log while disarmed.")
         else:
             app.pid_plan_waiting_for_fly_log = False
             app.pid_plan_current_candidate_title = ""
@@ -884,11 +887,13 @@ class PidPlanWorkflow:
             "PID Plan Step Ready",
             (
                 "Values are staged for this candidate.\n\n"
-                "Press Save while disarmed, then arm the drone, press Fly/Log, and disarm before pressing Next PID Plan Step."
+                "Press Save while disarmed, press Fly/Log to prepare PID isolation, then arm and press Fly/Log again. "
+                "Disarm after the pulse sequence so the app can restore the isolated PID/FF values."
                 if action == "stage"
                 else (
                     "Fly/Log is enabled without staging values.\n\n"
-                    "Use this only when the FC already has the correct PID/FF values saved. Arm, press Fly/Log, then disarm before pressing Next PID Plan Step."
+                    "Use this only when the FC already has the correct PID/FF values saved. Press Fly/Log while disarmed "
+                    "to prepare PID isolation, then arm and press Fly/Log again."
                     if action == "already_saved"
                     else "This candidate was skipped. Press Next PID Plan Step when ready for the next candidate."
                 )

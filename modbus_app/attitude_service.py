@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from datetime import datetime
 
 
 @dataclass(frozen=True)
@@ -12,8 +11,8 @@ class AttitudeSample:
     roll_deg: float
     pitch_deg: float
     yaw_deg: float
-    timestamp_local: datetime
-    movement_millis: int | None = None
+    movement_millis: int
+    movement_seq: int
 
 
 class AttitudeService:
@@ -31,6 +30,7 @@ class AttitudeService:
         self._reference_roll_sum = 0.0
         self._reference_pitch_sum = 0.0
         self._movement_millis: int | None = None
+        self._movement_seq: int | None = None
 
     @property
     def is_connected(self) -> bool:
@@ -46,6 +46,7 @@ class AttitudeService:
         self._reference_roll_sum = 0.0
         self._reference_pitch_sum = 0.0
         self._movement_millis = None
+        self._movement_seq = None
 
     def disconnect(self) -> None:
         self._connected = False
@@ -57,23 +58,31 @@ class AttitudeService:
         self._reference_roll_sum = 0.0
         self._reference_pitch_sum = 0.0
         self._movement_millis = None
+        self._movement_seq = None
 
-    def ingest_sample(self, sample: AttitudeSample) -> None:
+    def ingest_sample(self, sample: AttitudeSample) -> bool:
         if not self._connected:
-            return
+            return False
+        if sample.movement_millis is None or sample.movement_seq is None:
+            raise ValueError("Attitude samples must include Arduino movement_millis and movement_seq.")
+        if self._is_duplicate_sample(sample):
+            return False
+        self._movement_millis = sample.movement_millis
+        self._movement_seq = sample.movement_seq
         self._latest_absolute = sample
         self._maybe_update_reference(sample)
 
         reference = self._reference
         if reference is None:
-            return
+            return True
         self._latest_relative = AttitudeSample(
             roll_deg=float(sample.roll_deg - reference.roll_deg),
             pitch_deg=float(sample.pitch_deg - reference.pitch_deg),
             yaw_deg=float(sample.yaw_deg - reference.yaw_deg),
-            timestamp_local=sample.timestamp_local,
             movement_millis=sample.movement_millis,
+            movement_seq=sample.movement_seq,
         )
+        return True
         
 
     def latest_attitude(self) -> AttitudeSample | None:
@@ -87,6 +96,11 @@ class AttitudeService:
 
     def attitude_reference_ready(self) -> bool:
         return self._reference is not None
+
+    def _is_duplicate_sample(self, sample: AttitudeSample) -> bool:
+        if self._movement_seq is None or self._movement_millis is None:
+            return False
+        return sample.movement_seq == self._movement_seq and sample.movement_millis == self._movement_millis
 
     def _maybe_update_reference(self, sample: AttitudeSample) -> None:
         if self._reference is not None:
@@ -110,7 +124,8 @@ class AttitudeService:
                 roll_deg=float(sample.roll_deg),
                 pitch_deg=float(sample.pitch_deg),
                 yaw_deg=float(sample.yaw_deg),
-                timestamp_local=sample.timestamp_local,
+                movement_millis=sample.movement_millis,
+                movement_seq=sample.movement_seq,
             )
             return
 
@@ -118,5 +133,6 @@ class AttitudeService:
             roll_deg=self._reference_roll_sum / float(self._reference_count),
             pitch_deg=self._reference_pitch_sum / float(self._reference_count),
             yaw_deg=0.0,
-            timestamp_local=sample.timestamp_local,
+            movement_millis=sample.movement_millis,
+            movement_seq=sample.movement_seq,
         )

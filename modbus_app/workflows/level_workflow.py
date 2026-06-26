@@ -24,8 +24,8 @@ class LevelWorkflow:
     # direction, choose coarse vs fine mode, and decide whether to continue.
     # It is never used to scale into a big pulse, which avoids the overshoot
     # seen with the older angle-chasing level logic.
-    COARSE_FORCE_US = 70
-    FINE_FORCE_US = 27
+    COARSE_FORCE_US = 35
+    FINE_FORCE_US = 14
     FINE_TUNE_ENTER_DEG = 4.0
     CORRECTION_SETTLE_MS = 250
     EMERGENCY_ATTITUDE_DEG = 70.0

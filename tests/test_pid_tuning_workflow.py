@@ -28,8 +28,8 @@ class PIDTuningWorkflowTests(unittest.TestCase):
 
         plan = format_pid_tuning_plan(recommendation)
         self.assertIn("D tuning, roll/pitch only", plan)
-        self.assertIn("- Roll:  P 45, D 17, I 30, FF 0", plan)
-        self.assertIn("- Pitch: P 47, D 17, I 35, FF 0", plan)
+        self.assertIn("- Roll:  P 45, I 30, D 17, FF 0", plan)
+        self.assertIn("- Pitch: P 47, I 35, D 17, FF 0", plan)
         self.assertIn("Yaw final recommendation, not tested", plan)
         self.assertNotIn("Yaw P candidates", plan)
         self.assertNotIn("Write values while disarmed", plan)
@@ -125,6 +125,21 @@ class PIDTuningWorkflowTests(unittest.TestCase):
             latest = find_latest_pid_tuning_plan(tmp_dir)
 
             self.assertEqual(latest, Path(second.text_path))
+
+    def test_load_old_pid_tuning_plan_order_keeps_start_i(self) -> None:
+        recommendation = suggest_starting_p(PStartInputs())
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            report = generate_pid_tuning_plan_report(tmp_dir, recommendation)
+            plan_path = Path(report.text_path)
+            plan_text = plan_path.read_text(encoding="utf-8")
+            plan_text = plan_text.replace("- Roll:  P 45, I 30, D 17, FF 0", "- Roll:  P 45, D 17, I 30, FF 0")
+            plan_text = plan_text.replace("- Pitch: P 47, I 35, D 17, FF 0", "- Pitch: P 47, D 17, I 35, FF 0")
+            plan_path.write_text(plan_text, encoding="utf-8")
+            Path(report.summary_json).unlink()
+
+            loaded = load_pid_tuning_plan(plan_path)
+
+            self.assertEqual(loaded.start_i, {"roll": 30, "pitch": 35})
 
 
 if __name__ == "__main__":

@@ -146,22 +146,28 @@ class BlackboxWorkflow:
                 if imported_count == 0:
                     if res.skipped_count > 0:
                         app.status.set(
-                            f"No new Blackbox logs were copied ({res.skipped_count} duplicate file(s) skipped)."
+                            f"No new Blackbox logs were moved ({res.skipped_count} file(s) skipped)."
                         )
                     else:
-                        app.status.set("No new Blackbox logs were imported from MSC volumes.")
+                        app.status.set("No Blackbox logs were moved from MSC volumes.")
                 else:
                     if res.skipped_count > 0:
                         app.status.set(
-                            f"Imported {imported_count} Blackbox file(s) to {app.blackbox_import_dir} "
-                            f"({res.skipped_count} duplicate file(s) skipped)."
+                            f"Moved {imported_count} Blackbox file(s) to {app.blackbox_import_dir} "
+                            f"({res.skipped_count} file(s) skipped)."
                         )
                     else:
-                        app.status.set(f"Imported {imported_count} Blackbox file(s) to {app.blackbox_import_dir}.")
+                        app.status.set(f"Moved {imported_count} Blackbox file(s) to {app.blackbox_import_dir}.")
 
                 self.publish_auto_report(self.format_blackbox_report(res))
+                messagebox.showinfo(
+                    "Reconnect FC",
+                    "MSC log pull is complete.\n\n"
+                    "Disconnect and reconnect the flight controller now to leave storage mode.",
+                    parent=app.root,
+                )
 
-            app.worker.submit(
+            app.fc_worker.submit(
                 worker_enter_msc_and_import_blackbox_logs,
                 selected_port,
                 selected_baud,
@@ -256,16 +262,16 @@ class BlackboxWorkflow:
                     self.publish_auto_report(report_text)
                     app.status.set(f"Blackbox report generated: {res2.report_dir}")
 
-                app.worker.submit(
-                    worker_generate_auto_report,
-                    res,
-                    session_payload,
+                    app.fc_worker.submit(
+                        worker_generate_auto_report,
+                        res,
+                        session_payload,
                     selected_log,
                     app.blackbox_import_dir,
                     callback=on_report_done,
                 )
 
-            app.worker.submit(
+            app.fc_worker.submit(
                 worker_analyze_specific_blackbox_log,
                 selected_log,
                 app.blackbox_import_dir,
@@ -322,7 +328,7 @@ class BlackboxWorkflow:
                 self.publish_auto_report(format_step_response_report(res))
                 app.status.set(f"Step response report generated: {res.report_dir}")
 
-            app.worker.submit(
+            app.fc_worker.submit(
                 worker_generate_step_response_report,
                 list(selected_logs),
                 app.blackbox_import_dir,

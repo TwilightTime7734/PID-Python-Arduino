@@ -55,15 +55,19 @@ from .workflows.auto_session_workflow import AutoSessionWorkflow
 from .workflows.auto_session_completion_workflow import AutoSessionCompletionWorkflow
 from .workflows.auto_session_engine import AutoSessionEngine
 from .workflows.deterministic_fly_log_workflow import DeterministicFlyLogWorkflow
-from .workflows.fly_log_mixer_workflow import FlyLogMixerWorkflow
-from .workflows.mixer_debug_workflow import MixerDebugWorkflow
+from .workflows.fly_log_pid_isolation_workflow import (
+    FlyLogPidIsolationResult,
+    restore_fly_log_pid_isolation as restore_fly_log_pid_isolation_direct,
+)
 from .tasks.worker_tasks import (
     analyze_blackbox_logs as worker_analyze_blackbox_logs,
     analyze_specific_blackbox_log as worker_analyze_specific_blackbox_log,
     enter_msc_and_import_blackbox_logs as worker_enter_msc_and_import_blackbox_logs,
     generate_auto_report as worker_generate_auto_report,
+    prepare_fly_log_pid_isolation as worker_prepare_fly_log_pid_isolation,
     pulse_channel_force as worker_pulse_channel_force,
     read_movement_attitude as worker_read_movement_attitude,
+    restore_fly_log_pid_isolation as worker_restore_fly_log_pid_isolation,
 )
 
 
@@ -586,6 +590,9 @@ class ModbusApp(HardwareStateMixin):
                 set_test_pulse_buttons_state("disabled")
                 hold_ms = ARDUINO_FIXED_PULSE_HOLD_MS
                 direction_text = "+" if signed_force_us >= 0 else ""
+                complete_status = (
+                    f"Test pulse complete: {axis} {direction_text}{signed_force_us}us for board-fixed {hold_s:.2f}s."
+                )
                 self.status.set(
                     f"Testing {axis} pulse: CH{channel_index + 1} {base_value}->{target} "
                     f"({direction_text}{signed_force_us}us) for board-fixed {hold_s:.2f}s."
@@ -598,9 +605,7 @@ class ModbusApp(HardwareStateMixin):
                     self.status.set(status_text)
 
                 def complete_test_pulse() -> None:
-                    finish_test_pulse(
-                        f"Test pulse complete: {axis} {direction_text}{signed_force_us}us for board-fixed {hold_s:.2f}s."
-                    )
+                    finish_test_pulse(complete_status)
 
                 def on_test_pulse_done(ok: bool, res: object) -> None:
                     if not ok:
@@ -646,47 +651,153 @@ class ModbusApp(HardwareStateMixin):
         ) -> None:
             auto_session_completion.complete(next_state, reason, warning, lower_throttle)
 
-        def auto_abort(reason: str, warning: str = "", continue_pipeline: bool = False) -> None:
-            if fly_log_mixer_workflow.is_active():
+        def clear_fly_log_pid_isolation_state() -> None:
+            self.fly_log_pid_isolation_snapshot = None
+            self.fly_log_pid_isolation_restoring = False
+            self.fly_log_pid_isolation_run_complete = False
+            if self.fly_log_pid_restore_after_id is not None:
                 try:
-                    fly_log_mixer_workflow.restore_after_test()
-                    self.fly_log_mixer_snapshot_path = fly_log_mixer_workflow.snapshot_path
-                except Exception as restore_exc:
-                    merged_warning = warning.strip()
-                    restore_warning = f"Motor mixer restore also failed: {restore_exc}"
-                    warning = f"{merged_warning}\n{restore_warning}".strip() if merged_warning else restore_warning
+                    self.root.after_cancel(self.fly_log_pid_restore_after_id)
+                except Exception:
+                    pass
+                finally:
+                    self.fly_log_pid_restore_after_id = None
+
+        def format_fly_log_pid_isolation_axes(snapshot) -> str:
+            axes = tuple(getattr(snapshot, "isolated_axes", ()) or ())
+            if not axes:
+                fallback_axis = getattr(snapshot, "isolated_axis", "")
+                axes = (fallback_axis,) if fallback_axis else ()
+            names = [str(axis).strip().title() for axis in axes if str(axis).strip()]
+            return "/".join(names) if names else "isolated axes"
+
+        def finalize_pid_plan_fly_log_complete(
+            completed_title: str,
+            reason: str,
+            *,
+            restored_axis: str = "",
+        ) -> None:
+            self.pid_plan_waiting_for_fly_log = False
+            self.pid_plan_current_candidate_title = ""
+            self.pid_plan_current_candidate_phase = ""
+            self.pid_plan_current_candidate_target = None
+            refresh_fly_log_button_state()
+            suffix = f" Restored {restored_axis} PID/FF." if restored_axis else ""
+            self.status.set(f"Fly/Log complete: {completed_title or reason}.{suffix}".strip())
+            update_pid_progress_window()
+            lines = [
+                "Fly/Log is complete. The CH8 PID test marker bracketed the calibration probes in Blackbox."
+            ]
+            if restored_axis:
+                lines.append(f"Restored {restored_axis} PID/FF.")
+            lines.append("Press Next PID Plan Step when ready.")
+            messagebox.showinfo(
+                "Fly/Log Complete",
+                "\n\n".join(lines),
+                parent=self.root,
+            )
+
+        def schedule_pid_isolation_restore_after_disarm(completed_title: str, reason: str) -> None:
+            snapshot = self.fly_log_pid_isolation_snapshot
+            if snapshot is None:
+                finalize_pid_plan_fly_log_complete(completed_title, reason)
+                return
+            if self.fly_log_pid_isolation_restoring:
+                return
+
+            def check_disarmed() -> None:
+                self.fly_log_pid_restore_after_id = None
+                if self.is_closing:
+                    return
+                snapshot_inner = self.fly_log_pid_isolation_snapshot
+                if snapshot_inner is None:
+                    finalize_pid_plan_fly_log_complete(completed_title, reason)
+                    return
+                if not self.fc_service.is_connected:
+                    self.status.set("Reconnect FC while disarmed to restore Fly/Log PID/FF isolation.")
+                    self.fly_log_pid_restore_after_id = self.root.after(1000, check_disarmed)
+                    return
+                try:
+                    is_armed = self.fc_service.is_armed(timeout_seconds=0.8)
+                except Exception as exc:
+                    self.status.set(f"Waiting to restore PID/FF isolation; arm check failed: {exc}")
+                    self.fly_log_pid_restore_after_id = self.root.after(1000, check_disarmed)
+                    return
+                if is_armed:
+                    axes_text = format_fly_log_pid_isolation_axes(snapshot_inner)
+                    self.status.set(
+                        f"Fly/Log complete. Disarm to restore {axes_text} PID/FF."
+                    )
+                    self.fly_log_pid_restore_after_id = self.root.after(1000, check_disarmed)
+                    return
+
+                self.fly_log_pid_isolation_restoring = True
+                refresh_fly_log_button_state()
+                axes_text = format_fly_log_pid_isolation_axes(snapshot_inner)
+                self.status.set(f"Restoring {axes_text} PID/FF after Fly/Log...")
+
+                def on_restore_done(ok: bool, res: object) -> None:
+                    self.fly_log_pid_isolation_restoring = False
+                    refresh_fly_log_button_state()
+                    if not ok:
+                        set_error(
+                            "Fly/Log PID/FF restore error",
+                            res if isinstance(res, Exception) else RuntimeError(str(res)),
+                        )
+                        self.fly_log_pid_restore_after_id = self.root.after(1000, check_disarmed)
+                        return
+                    if not isinstance(res, FlyLogPidIsolationResult):
+                        set_error("Fly/Log PID/FF restore error", RuntimeError("Unexpected restore result."))
+                        self.fly_log_pid_restore_after_id = self.root.after(1000, check_disarmed)
+                        return
+                    set_pid_ff_displays(res.roll_values, res.pitch_values)
+                    restored_axis = format_fly_log_pid_isolation_axes(res.snapshot)
+                    clear_fly_log_pid_isolation_state()
+                    finalize_pid_plan_fly_log_complete(completed_title, reason, restored_axis=restored_axis)
+
+                self.fc_worker.submit(
+                    worker_restore_fly_log_pid_isolation,
+                    self.fc_service,
+                    snapshot_inner,
+                    callback=on_restore_done,
+                )
+
+            check_disarmed()
+
+        def auto_abort(reason: str, warning: str = "", continue_pipeline: bool = False) -> None:
+            was_fly_log = self.pid_plan_fly_log_active
+            completed_title = self.pid_plan_current_candidate_title
             auto_session_workflow.abort(reason, warning, continue_pipeline)
+            if was_fly_log and self.fly_log_pid_isolation_snapshot is not None:
+                self.fly_log_pid_isolation_run_complete = True
+                refresh_fly_log_button_state()
+                schedule_pid_isolation_restore_after_disarm(completed_title, reason)
 
         def finish_pid_plan_fly_log(reason: str = "Fly/Log calibration complete.") -> None:
             if not self.pid_plan_fly_log_active:
                 return
             self.fly_log_finishing = False
-            if fly_log_mixer_workflow.is_active():
-                try:
-                    fly_log_mixer_workflow.restore_after_test()
-                    self.fly_log_mixer_snapshot_path = fly_log_mixer_workflow.snapshot_path
-                except Exception as exc:
-                    auto_abort(
-                        "Unable to restore the INAV motor mixer after Fly/Log.",
-                        warning=str(exc),
-                    )
-                    return
             complete_auto_session(AdaptiveSessionState.report_ready, reason)
             self.pid_plan_fly_log_active = False
-            self.pid_plan_waiting_for_fly_log = False
             completed_title = self.pid_plan_current_candidate_title
-            self.pid_plan_current_candidate_title = ""
-            self.pid_plan_current_candidate_phase = ""
-            self.pid_plan_current_candidate_target = None
             refresh_fly_log_button_state()
-            self.status.set(f"Fly/Log complete: {completed_title or reason}")
             update_pid_progress_window()
-            messagebox.showinfo(
-                "Fly/Log Complete",
-                "Fly/Log is complete. The CH8 PID test marker bracketed the calibration probes in Blackbox.\n\n"
-                "Disarm the drone now. After it is disarmed, press Next PID Plan Step.",
-                parent=self.root,
-            )
+            if self.fly_log_pid_isolation_snapshot is not None:
+                self.fly_log_pid_isolation_run_complete = True
+                axes_text = format_fly_log_pid_isolation_axes(self.fly_log_pid_isolation_snapshot)
+                refresh_fly_log_button_state()
+                self.status.set(f"Fly/Log complete: {completed_title or reason}. Disarm to restore {axes_text} PID/FF.")
+                messagebox.showinfo(
+                    "Fly/Log Complete",
+                    "Fly/Log pulses are complete. The CH8 PID test marker bracketed the calibration probes in Blackbox.\n\n"
+                    f"Disarm the drone now. After the FC reports disarmed, the app will restore {axes_text} PID/FF automatically.",
+                    parent=self.root,
+                )
+                schedule_pid_isolation_restore_after_disarm(completed_title, reason)
+                return
+
+            finalize_pid_plan_fly_log_complete(completed_title, reason)
+            return
 
         def begin_fly_log_marker_off_and_complete() -> None:
             if not self.pid_plan_fly_log_active or self.fly_log_finishing:
@@ -745,8 +856,8 @@ class ModbusApp(HardwareStateMixin):
                 "- FC is connected and attitude-board telemetry is live\n"
                 "- Drone is disarmed before pressing Save for PID/FF values\n"
                 "- Guided plan steps only stage PID/FF values in the boxes\n"
-                "- You are ready to arm and press Fly/Log for one candidate at a time\n"
-                "- You will land and disarm before pressing Next PID Plan Step\n\n"
+                "- You are ready to prepare Fly/Log while disarmed, then arm and run one candidate at a time\n"
+                "- You will land and disarm so the app can restore isolated PID/FF before pressing Next PID Plan Step\n\n"
                 "The app will load pid_tuning_plan.txt, compare the current FC PID/FF values "
                 "to the next plan target, and ask before staging each step in the PID boxes.\n\n"
                 "It will not run randomized stick pulses and it will not write or save PID/FF values automatically.\n\n"
@@ -771,9 +882,6 @@ class ModbusApp(HardwareStateMixin):
 
         def begin_auto_pipeline() -> None:
             auto_session_completion.begin_pipeline()
-
-        fly_log_mixer_workflow = FlyLogMixerWorkflow(self)
-        mixer_debug_workflow = MixerDebugWorkflow(self)
 
         def fc_is_armed_for_fly_log() -> bool:
             try:
@@ -808,33 +916,108 @@ class ModbusApp(HardwareStateMixin):
                 raise RuntimeError("Stop auto-level before Fly/Log.")
             if self.attitude_service.latest_attitude() is None:
                 raise RuntimeError("No attitude-board sample yet. Wait for movement telemetry then retry.")
-            if not fc_is_armed_for_fly_log():
-                return
 
             self.auto_config = replace(read_auto_tune_config(), max_runtime_s=FLY_LOG_SAFETY_TIMEOUT_S)
             pulse = current_test_pulse_profile()
+            test_axis = str(pulse.test_axis).strip().lower()
+            snapshot = self.fly_log_pid_isolation_snapshot
+            if snapshot is None:
+                if not ensure_disarmed_before_pid_write():
+                    self.status.set("Fly/Log PID/FF isolation canceled; disarm before preparing.")
+                    return
+                isolated_axis = "pitch" if test_axis == "roll" else "roll"
+                axes_text = "/".join(axis.title() for axis in (isolated_axis, "yaw"))
+                prompt = (
+                    f"Prepare Fly/Log candidate: {self.pid_plan_current_candidate_title or 'current PID plan step'}\n\n"
+                    f"This will save the current Roll/Pitch/Yaw PID/FF values, then write and save {axes_text} "
+                    "P/I/D/FF = 0 for this test only.\n\n"
+                    f"The tested axis remains active: {test_axis.title()}.\n\n"
+                    "After preparation finishes, arm the drone and press Fly/Log again to run the pulse sequence. "
+                    "After the sequence, disarm and the app will restore the zeroed PID/FF values automatically.\n\n"
+                    "INAV motor configuration will not be changed."
+                )
+                if not messagebox.askokcancel("Prepare Fly/Log", prompt, icon="warning", parent=self.root):
+                    self.status.set("Fly/Log preparation canceled.")
+                    return
+
+                self.fly_log_button.config(state="disabled")
+                self.status.set(f"Preparing Fly/Log PID isolation: zeroing {axes_text} P/I/D/FF...")
+
+                def on_prepare_done(ok: bool, res: object) -> None:
+                    if not ok:
+                        clear_fly_log_pid_isolation_state()
+                        refresh_fly_log_button_state()
+                        set_error(
+                            "Fly/Log PID/FF preparation error",
+                            res if isinstance(res, Exception) else RuntimeError(str(res)),
+                        )
+                        return
+                    if not isinstance(res, FlyLogPidIsolationResult):
+                        clear_fly_log_pid_isolation_state()
+                        refresh_fly_log_button_state()
+                        set_error("Fly/Log PID/FF preparation error", RuntimeError("Unexpected preparation result."))
+                        return
+                    self.fly_log_pid_isolation_snapshot = res.snapshot
+                    self.fly_log_pid_isolation_run_complete = False
+                    set_pid_ff_displays(res.roll_values, res.pitch_values)
+                    prepared_axes_text = format_fly_log_pid_isolation_axes(res.snapshot)
+                    refresh_fly_log_button_state()
+                    self.status.set(
+                        f"Fly/Log prepared: {prepared_axes_text} P/I/D/FF are zeroed. Arm, then press Fly/Log again."
+                    )
+                    messagebox.showinfo(
+                        "Fly/Log Prepared",
+                        f"{prepared_axes_text} P/I/D/FF are zeroed and saved for this Fly/Log test.\n\n"
+                        "Arm the drone, press Fly/Log again, then disarm after the pulse sequence so the app can restore them.",
+                        parent=self.root,
+                    )
+
+                self.fc_worker.submit(
+                    worker_prepare_fly_log_pid_isolation,
+                    self.fc_service,
+                    test_axis,
+                    callback=on_prepare_done,
+                )
+                return
+
+            if self.fly_log_pid_isolation_run_complete:
+                axes_text = format_fly_log_pid_isolation_axes(snapshot)
+                self.status.set(f"Fly/Log already ran. Disarm to restore {axes_text} PID/FF.")
+                return
+            if str(snapshot.test_axis).strip().lower() != test_axis:
+                self.status.set("Fly/Log prepared for a different test axis. Restore or reconnect before changing axis.")
+                messagebox.showwarning(
+                    "Fly/Log Axis Changed",
+                    f"PID isolation was prepared for {snapshot.test_axis.title()}, but the current pulse axis is "
+                    f"{test_axis.title()}.\n\n"
+                    "Restore the current isolation before changing the test axis.",
+                    parent=self.root,
+                )
+                return
+            if not fc_is_armed_for_fly_log():
+                return
+
             pulse_text = (
                 f"{pulse.aircraft_name}: {pulse.test_axis} start probe +/-{pulse.probe_force_us}us; "
                 f"main sequence 10 positive and 10 negative {pulse.test_axis} pulses at "
                 f"dropdown-selected +/-{pulse.main_force_us}us; board pulse duration fixed at "
                 f"{ARDUINO_FIXED_PULSE_HOLD_S:.2f}s; neutral wait {pulse.neutral_wait_ms}ms."
             )
+            axes_text = format_fly_log_pid_isolation_axes(snapshot)
             prompt = (
                 f"Fly/Log candidate: {self.pid_plan_current_candidate_title or 'current PID plan step'}\n\n"
                 "The FC reports ARMED.\n\n"
+                f"PID isolation is active: {axes_text} P/I/D/FF are zeroed until this run is complete and the FC is disarmed.\n\n"
                 "Pressing OK will run this sequence:\n"
-                "0. Snapshot the current INAV motor mixer to a permanent file\n"
-                "1. Zero the unused axis and yaw in INAV, then save and confirm\n"
-                "2. Brief spin-up on the current outputs\n"
-                "3. Small pre-marker start probes\n"
-                "4. CH8 PID test marker ON (BEEPERON in Blackbox)\n"
-                "5. Marked deterministic one-axis pulse pairs\n"
-                "6. CH8 PID test marker OFF (BEEPEROFF in Blackbox)\n"
-                "7. Restore the original mixer and confirm it in INAV\n\n"
+                "1. Brief spin-up on the current outputs\n"
+                "2. Small pre-marker start probes\n"
+                "3. CH8 PID test marker ON (BEEPERON in Blackbox)\n"
+                "4. Marked deterministic one-axis pulse pairs\n"
+                "5. CH8 PID test marker OFF (BEEPEROFF in Blackbox)\n\n"
                 f"Pulse profile: {pulse_text}\n\n"
                 "Chart Step Response analyzes the marker bracket, not a fixed time window. "
                 "You can also bracket your own logs of any length with CH8 markers.\n\n"
-                "The snapshot file is never deleted automatically.\n"
+                "INAV motor configuration will not be changed.\n"
                 "No PID/FF values will be written while armed.\n\n"
                 "Keep the drone secured, keep the area clear, and be ready to disarm."
             )
@@ -842,25 +1025,7 @@ class ModbusApp(HardwareStateMixin):
                 self.status.set("Fly/Log canceled.")
                 return
 
-            snapshot_path = fly_log_mixer_workflow.prepare_for_test(pulse.test_axis)
-            self.fly_log_mixer_snapshot_path = snapshot_path
             deterministic_fly_log_workflow.start()
-
-        def do_mixer_debug() -> None:
-            if self.blackbox_import_inflight:
-                self.status.set("Blackbox/report task already in progress.")
-                return
-            if auto_is_running():
-                self.status.set("Wait for the active Auto/FlyLog task to finish first.")
-                return
-            if not self.fc_service.is_connected:
-                raise RuntimeError("Connect FC before running mixer debug.")
-            out_path = mixer_debug_workflow.capture_reference()
-            messagebox.showinfo(
-                "Mixer Debug",
-                f"Recorded mixer debug capture:\n\n{out_path}",
-                parent=self.root,
-            )
         def do_auto_session_toggle() -> None:
             auto_session_workflow.toggle()
 
@@ -997,13 +1162,16 @@ class ModbusApp(HardwareStateMixin):
                             return
                         if res is None:
                             return
-                        self.attitude_service.ingest_sample(res)
+                        if self.attitude_service.ingest_sample(res):
+                            self.attitude_sample_updated = True
 
                     self.worker.submit(worker_read_movement_attitude, callback=on_attitude_sample)
 
                 sample = self.attitude_service.latest_attitude()
                 if sample is not None:
-                    record_auto_session_sample(sample)
+                    if self.attitude_sample_updated:
+                        record_auto_session_sample(sample)
+                        self.attitude_sample_updated = False
                     self.horizon.set_attitude(sample.roll_deg, sample.pitch_deg)
                     self.roll_text.set(f"Roll: {sample.roll_deg:6.1f} deg")
                     self.pitch_text.set(f"Pitch: {sample.pitch_deg:6.1f} deg")
@@ -1012,16 +1180,17 @@ class ModbusApp(HardwareStateMixin):
             self.fc_poll_after_id = self.root.after(60, poll_attitude)
 
         def poll_results() -> None:
-            while True:
-                try:
-                    cb, ok, res = self.worker.results.get_nowait()
-                except queue.Empty:
-                    break
-                if cb:
+            for worker in (self.worker, self.fc_worker):
+                while True:
                     try:
-                        cb(ok, res)
-                    except Exception as e:
-                        set_error("Callback error", e)
+                        cb, ok, res = worker.results.get_nowait()
+                    except queue.Empty:
+                        break
+                    if cb:
+                        try:
+                            cb(ok, res)
+                        except Exception as e:
+                            set_error("Callback error", e)
             self.root.after(50, poll_results)
 
         def on_close() -> None:
@@ -1032,10 +1201,17 @@ class ModbusApp(HardwareStateMixin):
                 stop_auto_session_runtime(restore_outputs=False)
             else:
                 stop_auto_session_runtime()
-            if fly_log_mixer_workflow.is_active():
+            snapshot = self.fly_log_pid_isolation_snapshot
+            if (
+                snapshot is not None
+                and not self.fly_log_pid_isolation_restoring
+                and self.fc_service.is_connected
+            ):
                 try:
-                    fly_log_mixer_workflow.restore_after_test()
-                    self.fly_log_mixer_snapshot_path = fly_log_mixer_workflow.snapshot_path
+                    if not self.fc_service.is_armed(timeout_seconds=0.8):
+                        res = restore_fly_log_pid_isolation_direct(self.fc_service, snapshot)
+                        set_pid_ff_displays(res.roll_values, res.pitch_values)
+                        clear_fly_log_pid_isolation_state()
                 except Exception:
                     pass
             if self.fc_poll_after_id is not None:
@@ -1046,12 +1222,17 @@ class ModbusApp(HardwareStateMixin):
                 finally:
                     self.fc_poll_after_id = None
             self.attitude_service.disconnect()
+            self.attitude_sample_updated = False
             self.attitude_poll_inflight = False
 
             def on_stop_and_close(ok: bool, res: object) -> None:
                 do_fc_disconnect(update_status=False)
                 try:
                     self.worker.stop()
+                except Exception:
+                    pass
+                try:
+                    self.fc_worker.stop()
                 except Exception:
                     pass
                 self.root.destroy()
@@ -1074,7 +1255,6 @@ class ModbusApp(HardwareStateMixin):
         self.fly_log_button.config(command=fly_log_workflow.toggle)
         self.pulse_positive_button.config(command=lambda: do_test_pulse(1))
         self.pulse_negative_button.config(command=lambda: do_test_pulse(-1))
-        self.mixer_debug_button.config(command=do_mixer_debug)
         self.load_pid_ff_button.config(command=do_load_pid_ff_from_fc)
         self.save_pid_ff_button.config(command=do_save_pid_ff_to_fc)
         self.step_response_button.config(command=do_step_response_report)

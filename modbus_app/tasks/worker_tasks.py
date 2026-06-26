@@ -6,7 +6,6 @@ can run safely through SerialWorker and report back through callbacks.
 
 from __future__ import annotations
 
-from datetime import datetime
 from pathlib import Path
 import time
 
@@ -29,6 +28,11 @@ from ..serial_protocol import (
 )
 from ..step_response_report import generate_step_response_report as generate_step_response_report_impl
 from ..worker import SerialWorker
+from ..workflows.fly_log_pid_isolation_workflow import (
+    FlyLogPidIsolationSnapshot,
+    prepare_fly_log_pid_isolation as prepare_fly_log_pid_isolation_impl,
+    restore_fly_log_pid_isolation as restore_fly_log_pid_isolation_impl,
+)
 
 
 def pulse_channel_force(
@@ -69,6 +73,7 @@ def read_movement_attitude(worker_self: SerialWorker):
     if movement_status != 2:
         return None
 
+    movement_seq = int(regs[1]) & 0xFFFF
     roll_deg = float(_as_signed_i16(int(regs[4])))
     pitch_deg = float(_as_signed_i16(int(regs[5])))
     movement_millis = (int(regs[2]) & 0xFFFF) | ((int(regs[3]) & 0xFFFF) << 16)
@@ -76,13 +81,25 @@ def read_movement_attitude(worker_self: SerialWorker):
         roll_deg=roll_deg,
         pitch_deg=pitch_deg,
         yaw_deg=0.0,
-        timestamp_local=datetime.now(),
         movement_millis=movement_millis,
+        movement_seq=movement_seq,
     )
 
 
 def read_fc_pid_ff(_worker_self: SerialWorker, fc_service: InavSerialService):
     return fc_service.read_roll_pitch_pid_ff(timeout_seconds=1.2)
+
+
+def prepare_fly_log_pid_isolation(_worker_self: SerialWorker, fc_service: InavSerialService, test_axis: str):
+    return prepare_fly_log_pid_isolation_impl(fc_service, test_axis)
+
+
+def restore_fly_log_pid_isolation(
+    _worker_self: SerialWorker,
+    fc_service: InavSerialService,
+    snapshot: FlyLogPidIsolationSnapshot,
+):
+    return restore_fly_log_pid_isolation_impl(fc_service, snapshot)
 
 
 def enter_msc_and_import_blackbox_logs(

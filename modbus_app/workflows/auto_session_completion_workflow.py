@@ -145,14 +145,14 @@ class AutoSessionCompletionWorkflow:
                 elif res.analysis_source:
                     app.auto_latest_imported_log = res.analysis_source
                 if app.auto_latest_imported_log:
-                    app.worker.submit(
+                    app.fc_worker.submit(
                         self.worker_analyze_specific_blackbox_log,
                         app.auto_latest_imported_log,
                         app.blackbox_import_dir,
                         callback=on_auto_analyze_done,
                     )
                 else:
-                    app.worker.submit(
+                    app.fc_worker.submit(
                         self.worker_analyze_blackbox_logs,
                         app.blackbox_import_dir,
                         callback=on_auto_analyze_done,
@@ -172,7 +172,7 @@ class AutoSessionCompletionWorkflow:
                     return
                 app.auto_import_result = res
                 self.publish_auto_report(self.format_blackbox_report(res))
-                app.worker.submit(
+                app.fc_worker.submit(
                     self.worker_generate_auto_report,
                     res,
                     self.auto_session_payload(),
@@ -201,7 +201,7 @@ class AutoSessionCompletionWorkflow:
                 self.set_auto_state(AdaptiveSessionState.report_ready, "Ready")
                 app.status.set(f"Auto report ready: {res.report_dir}")
 
-            app.worker.submit(
+            app.fc_worker.submit(
                 self.worker_enter_msc_and_import_blackbox_logs,
                 selected_port,
                 selected_baud,

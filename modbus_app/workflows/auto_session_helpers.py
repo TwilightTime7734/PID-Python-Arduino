@@ -12,6 +12,8 @@ from ..tasks.worker_tasks import cancel_active_pulse as worker_cancel_active_pul
 
 
 class AutoSessionHelpers:
+    ARDUINO_MILLIS_WRAP = 1 << 32
+
     def __init__(
         self,
         app,
@@ -40,6 +42,13 @@ class AutoSessionHelpers:
         if axis == "roll":
             return float(sample.roll_deg)
         return float(sample.pitch_deg)
+
+    @classmethod
+    def arduino_elapsed_s(cls, start_millis: int, current_millis: int) -> float:
+        if start_millis is None or current_millis is None:
+            raise ValueError("Arduino movement_millis is required for attitude timing.")
+        delta_ms = (int(current_millis) - int(start_millis)) % cls.ARDUINO_MILLIS_WRAP
+        return max(0.0, float(delta_ms) / 1000.0)
 
     def elapsed_s(self, now_s: float | None = None) -> float:
         app = self.app
@@ -107,7 +116,11 @@ class AutoSessionHelpers:
         directed_delta = signed_delta * float(command.direction)
         if directed_delta > app.auto_event_peak_delta:
             app.auto_event_peak_delta = float(directed_delta)
-        within_hold_window = (time.monotonic() - app.auto_event_start_s) <= command.hold_s
+        start_millis = app.auto_event_start_millis
+        if start_millis is None:
+            raise RuntimeError("Auto attitude timing requires Arduino movement_millis at command start.")
+        sample_elapsed_s = self.arduino_elapsed_s(start_millis, sample.movement_millis)
+        within_hold_window = sample_elapsed_s <= command.hold_s
         target_peak_deg = command.target_peak_deg
         if target_peak_deg <= 0 and app.auto_controller is not None:
             target_peak_deg = app.auto_controller.config.axis_target_peak_max_deg(command.axis)
@@ -135,7 +148,7 @@ class AutoSessionHelpers:
         if app.auto_event_response_delay_s is None:
             threshold_deg = max(2.0, (command.force_us / 15.0) * 0.35)
             if directed_delta >= threshold_deg:
-                app.auto_event_response_delay_s = max(0.0, time.monotonic() - app.auto_event_start_s)
+                app.auto_event_response_delay_s = sample_elapsed_s
 
     def cancel_hold_timer(self) -> None:
         app = self.app

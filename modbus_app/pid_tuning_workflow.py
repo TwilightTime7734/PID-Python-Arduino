@@ -410,7 +410,7 @@ def estimate_test_pulse_profile(inputs: PStartInputs) -> TestPulseProfile:
     )
 
 def format_pid_tuning_plan(recommendation: PStartRecommendation) -> str:
-    """Format the supervised P/D/I/FF plan as plain text."""
+    """Format the supervised P/I/D/FF plan as plain text."""
 
     start_p = recommendation.start_p
     start_i = recommendation.start_i
@@ -466,10 +466,10 @@ def format_pid_tuning_plan(recommendation: PStartRecommendation) -> str:
         _format_throttle_lift_target(throttle),
         "",
         "Safe starting point / first P log",
-        "- This first log uses the generated starting P values with starting D, starting I, and FF 0.",
-        f"- Roll:  P {start_p['roll']}, D {start_d}, I {start_i['roll']}, FF 0",
-        f"- Pitch: P {start_p['pitch']}, D {start_d}, I {start_i['pitch']}, FF 0",
-        f"- Yaw:   P {yaw['p']}, D {yaw['d']:2d}, I 0, FF 0",
+        "- This first log uses the generated starting P values with starting I, starting D, and FF 0.",
+        f"- Roll:  P {start_p['roll']}, I {start_i['roll']}, D {start_d}, FF 0",
+        f"- Pitch: P {start_p['pitch']}, I {start_i['pitch']}, D {start_d}, FF 0",
+        f"- Yaw:   P {yaw['p']}, I 0, D {yaw['d']:2d}, FF 0",
         "-   Confirm the drone is not armed.",
         "-   Stage/save the safe-start values if needed.",
         "-   Arm the drone and hit the 'Fly/Log' button.",
@@ -631,8 +631,8 @@ def _recommendation_json(recommendation: PStartRecommendation, plan_text: str) -
 
 
 def _load_pid_tuning_plan_from_text(text_path: Path, text: str) -> LoadedPIDTuningPlan:
-    roll_start = _line_ints(text, r"-\s*Roll:\s*P\s*(\d+),\s*D\s*(\d+),\s*I\s*(\d+),\s*FF\s*(\d+)")
-    pitch_start = _line_ints(text, r"-\s*Pitch:\s*P\s*(\d+),\s*D\s*(\d+),\s*I\s*(\d+),\s*FF\s*(\d+)")
+    roll_start = _starting_pid_line_ints(text, "Roll")
+    pitch_start = _starting_pid_line_ints(text, "Pitch")
     d_sweep = _line_ints(text, r"-\s*Log D values:\s*([0-9,\s]+)")
     roll_p = _line_ints(text, r"-\s*Roll\s+P candidates:\s*([0-9,\s]+)")
     pitch_p = _line_ints(text, r"-\s*Pitch\s+P candidates:\s*([0-9,\s]+)")
@@ -675,8 +675,8 @@ def _load_pid_tuning_plan_from_text(text_path: Path, text: str) -> LoadedPIDTuni
             "pitch": pitch_start[0] if pitch_start else START_P_DEFAULTS["pitch"],
         },
         start_i={
-            "roll": roll_start[2] if len(roll_start) >= 3 else START_I_DEFAULTS["roll"],
-            "pitch": pitch_start[2] if len(pitch_start) >= 3 else START_I_DEFAULTS["pitch"],
+            "roll": roll_start[1] if len(roll_start) >= 2 else START_I_DEFAULTS["roll"],
+            "pitch": pitch_start[1] if len(pitch_start) >= 2 else START_I_DEFAULTS["pitch"],
         },
         p_sweep={
             "roll": tuple(roll_p) if roll_p else _p_sweep(START_P_DEFAULTS["roll"]),
@@ -702,6 +702,24 @@ def _line_ints(text: str, pattern: str) -> tuple[int, ...]:
     if not match:
         return ()
     return tuple(int(value) for value in re.findall(r"\d+", match.group(0)))
+
+
+def _starting_pid_line_ints(text: str, axis: str) -> tuple[int, ...]:
+    current_order = _line_ints(
+        text,
+        rf"-\s*{axis}:\s*P\s*(\d+),\s*I\s*(\d+),\s*D\s*(\d+),\s*FF\s*(\d+)",
+    )
+    if current_order:
+        return current_order
+
+    previous_order = _line_ints(
+        text,
+        rf"-\s*{axis}:\s*P\s*(\d+),\s*D\s*(\d+),\s*I\s*(\d+),\s*FF\s*(\d+)",
+    )
+    if previous_order:
+        p_value, d_value, i_value, ff_value = previous_order
+        return (p_value, i_value, d_value, ff_value)
+    return ()
 
 
 def _int_dict(payload: object, keys: tuple[str, ...]) -> dict[str, int]:

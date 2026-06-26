@@ -226,6 +226,7 @@ class ConnectionWorkflow:
                 app.start_pending = False
                 if not ok:
                     app.attitude_service.disconnect()
+                    app.attitude_sample_updated = False
                     self.update_link_indicators()
                     self.set_error("Start error", res if isinstance(res, Exception) else RuntimeError(res))
                     return
@@ -241,6 +242,7 @@ class ConnectionWorkflow:
                     return
                 app.base_channel_outputs = channels.copy()
                 app.attitude_service.connect()
+                app.attitude_sample_updated = False
                 self.set_live_channel_outputs(app.base_channel_outputs)
                 self.update_link_indicators()
                 version_warning = res[2]
@@ -276,6 +278,7 @@ class ConnectionWorkflow:
                     self.set_error("Stop error", RuntimeError("Unexpected worker result from stop task"))
                     return
                 app.attitude_service.disconnect()
+                app.attitude_sample_updated = False
                 self.set_live_channel_outputs(self.parse_channel_values_with_defaults())
                 self.update_link_indicators()
                 app.status.set("PPM output stopped.")

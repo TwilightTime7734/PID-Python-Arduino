@@ -37,8 +37,15 @@ class FlyLogWorkflow:
 
         if app.pid_plan_fly_log_active:
             app.fly_log_button.config(text="Fly / Log Active", state="normal")
+        elif getattr(app, "fly_log_pid_isolation_restoring", False):
+            app.fly_log_button.config(text="Restoring PID/FF", state="disabled")
+        elif getattr(app, "fly_log_pid_isolation_snapshot", None) is not None:
+            if getattr(app, "fly_log_pid_isolation_run_complete", False):
+                app.fly_log_button.config(text="Disarm to Restore", state="disabled")
+            else:
+                app.fly_log_button.config(text="Start Fly / Log", state="normal")
         elif app.pid_plan_active and app.pid_plan_waiting_for_fly_log:
-            app.fly_log_button.config(text=self.READY_LABEL, state="normal")
+            app.fly_log_button.config(text="Prepare Fly / Log", state="normal")
         else:
             app.fly_log_button.config(text=self.READY_LABEL, state="normal")
 

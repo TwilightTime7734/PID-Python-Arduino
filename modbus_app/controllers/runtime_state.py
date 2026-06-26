@@ -25,6 +25,7 @@ from ..auto_tune_report import AutoTuneReport
 from ..blackbox_import import BlackboxImportResult
 from ..constants import CHANNEL_DEFAULTS, PORT_DEFAULT, THROTTLE_CHANNEL_INDEX
 from ..hardware_controller import HardwareController
+from ..worker import SerialWorker
 from .timer_registry import TimerRegistry
 
 
@@ -55,10 +56,12 @@ class RuntimeStateController:
         self_.base_channel_outputs = CHANNEL_DEFAULTS.copy()
         self_.live_channel_outputs = self_.base_channel_outputs.copy()
         self_.worker = self_.controller.worker
+        self_.fc_worker = SerialWorker()
         self_.fc_service = InavSerialService()
         self_.attitude_service = AttitudeService()
         self_.fc_poll_after_id: str | None = None
         self_.attitude_poll_inflight = False
+        self_.attitude_sample_updated = False
 
         # Centralized `after_cancel()` bookkeeping.
         self_.timer_registry = TimerRegistry(self_.root.after_cancel)
@@ -91,6 +94,7 @@ class RuntimeStateController:
         self_.auto_event_response_delay_s: float | None = None
         self_.auto_event_baseline = 0.0
         self_.auto_event_start_s = 0.0
+        self_.auto_event_start_millis: int | None = None
         self_.auto_axis_output_sign: dict[str, int] = {"roll": 1, "pitch": 1}
         self_.auto_probe_axes_pending: list[str] = []
         self_.auto_original_base_outputs: list[int] | None = None
@@ -118,7 +122,10 @@ class RuntimeStateController:
         self_.pid_plan_current_candidate_target: dict[str, dict[str, int]] | None = None
         self_.pid_plan_fly_log_active = False
         self_.fly_log_finishing = False
-        self_.fly_log_mixer_snapshot_path: Path | None = None
+        self_.fly_log_pid_isolation_snapshot = None
+        self_.fly_log_pid_isolation_restoring = False
+        self_.fly_log_pid_isolation_run_complete = False
+        self_.fly_log_pid_restore_after_id: str | None = None
         self_.pid_progress_window: tk.Toplevel | None = None
         self_.pid_progress_phase_labels: dict[str, tk.Label] = {}
         self_.pid_progress_current_var = tk.StringVar(value="No PID tuning plan is active.")

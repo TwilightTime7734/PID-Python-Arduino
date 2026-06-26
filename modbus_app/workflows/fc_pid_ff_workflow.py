@@ -67,9 +67,9 @@ class FcPidFfWorkflow:
         roll_series = {"p": roll_values.p, "i": roll_values.i, "d": roll_values.d, "ff": roll_values.ff}
         pitch_series = {"p": pitch_values.p, "i": pitch_values.i, "d": pitch_values.d, "ff": pitch_values.ff}
         for gain, value in roll_series.items():
-            self.set_var("roll", gain, int(round(float(value))))
+            self.set_raw_var("roll", gain, value)
         for gain, value in pitch_series.items():
-            self.set_var("pitch", gain, int(round(float(value))))
+            self.set_raw_var("pitch", gain, value)
 
     def var(self, axis: str, gain: str) -> tk.StringVar:
         app = self.app
@@ -94,6 +94,10 @@ class FcPidFfWorkflow:
     def set_var(self, axis: str, gain: str, value: int) -> None:
         label = gain.upper()
         self.var(axis, gain).set(f"{label}: {self.clamp_gain_value(gain, value)}")
+
+    def set_raw_var(self, axis: str, gain: str, value: int | float) -> None:
+        label = gain.upper()
+        self.var(axis, gain).set(f"{label}: {self.format_value(float(value))}")
 
     def staged_roll_pitch_values(self) -> PidValues:
         return {
@@ -139,7 +143,7 @@ class FcPidFfWorkflow:
             self.set_displays(res[0], res[1])
             app.status.set(f"FC connected: {connected_port} @ {connected_baud}. PID/FF loaded.")
 
-        app.worker.submit(worker_read_fc_pid_ff, app.fc_service, callback=on_pid_ff_read_done)
+        app.fc_worker.submit(worker_read_fc_pid_ff, app.fc_service, callback=on_pid_ff_read_done)
 
     def load_from_fc(self) -> None:
         app = self.app
@@ -161,7 +165,7 @@ class FcPidFfWorkflow:
                 self.set_displays(res[0], res[1])
                 app.status.set("PID/FF loaded from FC.")
 
-            app.worker.submit(worker_read_fc_pid_ff, app.fc_service, callback=on_pid_ff_load_done)
+            app.fc_worker.submit(worker_read_fc_pid_ff, app.fc_service, callback=on_pid_ff_load_done)
         except Exception as exc:
             app.load_pid_ff_button.config(state="normal")
             self.set_error("PID/FF load error", exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
@@ -212,7 +216,7 @@ class FcPidFfWorkflow:
                     return
                 app.status.set("PID/FF written and saved to FC.")
 
-            app.worker.submit(
+            app.fc_worker.submit(
                 lambda _worker_self: self.write_staged_values_to_fc(target),
                 callback=on_pid_ff_save_done,
             )

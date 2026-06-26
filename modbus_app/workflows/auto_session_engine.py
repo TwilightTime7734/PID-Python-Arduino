@@ -91,6 +91,7 @@ class AutoSessionEngine:
             app.auto_event_response_delay_s = None
             app.auto_event_baseline = 0.0
             app.auto_event_start_s = 0.0
+            app.auto_event_start_millis = None
             if app.pid_plan_fly_log_active and not app.auto_probe_axes_pending:
                 self.begin_fly_log_marker_off_and_complete()
             return
@@ -117,6 +118,7 @@ class AutoSessionEngine:
         app.auto_event_response_delay_s = None
         app.auto_event_baseline = 0.0
         app.auto_event_start_s = 0.0
+        app.auto_event_start_millis = None
 
     def issue_command(self, command: AdaptiveCommand) -> None:
         app = self.app
@@ -149,6 +151,7 @@ class AutoSessionEngine:
         app.auto_event_response_delay_s = None
         app.auto_event_baseline = self.pulse_axis_value(sample, command.axis)
         app.auto_event_start_s = time.monotonic()
+        app.auto_event_start_millis = sample.movement_millis
 
         def on_auto_hold_elapsed() -> None:
             app.auto_hold_after_id = None

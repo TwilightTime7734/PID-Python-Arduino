@@ -320,7 +320,6 @@ class MainUi:
     pulse_negative_button: tk.Button
     step_response_button: tk.Button
     pid_tuning_plan_button: tk.Button
-    mixer_debug_button: tk.Button
 
 def build_main_gui(root: tk.Tk) -> MainUi:
     root.title("PPM Modbus")
@@ -383,25 +382,23 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         channel_output_canvases.append(canvas)
         channel_output_fill_ids.append(fill_id)
 
-    main_button_grid = tk.Frame(main_frame)
-    main_button_grid.grid(row=6, column=0, columnspan=5, sticky="we", pady=(6, 0))
-    for col in range(4):
+    main_bottom_frame = tk.Frame(main_frame)
+    main_bottom_frame.grid(row=6, column=0, columnspan=5, sticky="we", pady=(6, 0))
+    main_button_grid = tk.Frame(main_bottom_frame)
+    main_button_grid.grid(row=0, column=0, sticky="nw")
+    for col in range(2):
         main_button_grid.grid_columnconfigure(col, weight=1, uniform="main_buttons")
 
-    main_button_width = 17
+    main_button_width = 15
     arduino_button = tk.Button(main_button_grid, text="Connect Arduino", width=main_button_width)
     arduino_button.grid(row=0, column=0, padx=2, pady=2, sticky="we")
     connect_fc_button = tk.Button(main_button_grid, text="Connect FC", width=main_button_width)
     connect_fc_button.grid(row=0, column=1, padx=2, pady=2, sticky="we")
-    scan_fc_button = tk.Button(main_button_grid, text="Scan Ports", width=main_button_width)
-    scan_fc_button.grid(row=0, column=2, padx=2, pady=2, sticky="we")
 
     import_blackbox_button = tk.Button(main_button_grid, text="Pull MSC Logs", width=main_button_width)
     import_blackbox_button.grid(row=1, column=0, padx=2, pady=2, sticky="we")
     analyze_blackbox_button = tk.Button(main_button_grid, text="Analyze Logs", width=main_button_width)
     analyze_blackbox_button.grid(row=1, column=1, padx=2, pady=2, sticky="we")
-    level_button = tk.Button(main_button_grid, text="Level", width=main_button_width, state="disabled")
-    level_button.grid(row=1, column=2, padx=2, pady=2, sticky="we")
 
     status = tk.StringVar(value="Idle")
 
@@ -493,6 +490,14 @@ def build_main_gui(root: tk.Tk) -> MainUi:
     fc_baud_entry = ttk.Combobox(port_fields_frame, width=8, values=BAUD_OPTIONS, state="readonly")
     fc_baud_entry.set(str(FC_BAUD_DEFAULT))
     fc_baud_entry.grid(row=1, column=3, sticky="w", pady=(4, 0))
+    fc_action_frame = tk.Frame(port_fields_frame)
+    fc_action_frame.grid(row=2, column=0, columnspan=4, sticky="we", pady=(6, 0))
+    fc_action_frame.grid_columnconfigure(0, weight=1, uniform="fc_actions")
+    fc_action_frame.grid_columnconfigure(1, weight=1, uniform="fc_actions")
+    scan_fc_button = tk.Button(fc_action_frame, text="Scan Ports", width=12)
+    scan_fc_button.grid(row=0, column=0, padx=(0, 2), sticky="we")
+    level_button = tk.Button(fc_action_frame, text="Level", width=12, state="disabled")
+    level_button.grid(row=0, column=1, padx=(2, 0), sticky="we")
 
     auto_frame = tk.LabelFrame(layout_grid, text="Tune Layout / Progress", padx=8, pady=8)
     auto_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(6, 0))
@@ -552,9 +557,7 @@ def build_main_gui(root: tk.Tk) -> MainUi:
     step_response_button = tk.Button(auto_action_frame, text="Chart Step Response", width=18)
     step_response_button.pack(side="left", padx=(0, 4))
     pid_tuning_plan_button = tk.Button(auto_action_frame, text="PID Tuning Plan", width=16)
-    pid_tuning_plan_button.pack(side="left", padx=(0, 4))
-    mixer_debug_button = tk.Button(auto_action_frame, text="Mixer Debug", width=13)
-    mixer_debug_button.pack(side="left")
+    pid_tuning_plan_button.pack(side="left")
 
     pid_table_frame = tk.Frame(auto_frame)
     pid_table_frame.grid(row=1, column=0, sticky="we", pady=(8, 0))
@@ -649,5 +652,4 @@ def build_main_gui(root: tk.Tk) -> MainUi:
         pulse_negative_button=pulse_negative_button,
         step_response_button=step_response_button,
         pid_tuning_plan_button=pid_tuning_plan_button,
-        mixer_debug_button=mixer_debug_button,
     )
